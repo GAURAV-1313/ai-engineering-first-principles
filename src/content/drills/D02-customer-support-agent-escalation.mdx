@@ -1,0 +1,133 @@
+---
+id: "D02"
+title: "Customer-support agent with escalation"
+prompt: "Design an AI agent that handles customer support chats for an e-commerce company: it answers policy questions, looks up orders, can issue small refunds, and hands off to a human when it should. How do you build it and how do you know it is safe to ship?"
+sections: ["21.12", "21.13", "22.06", "22.08", "29.09", "20.10", "34.06"]
+minutes: 45
+---
+
+The interviewer is grading two things above all: whether the agent's authority is decided by code rather than by the model, and whether you can define and measure "should have escalated". A support agent that answers well but issues a refund it should not have is a failed design.
+
+## Clarify and scope
+
+- **Volume and channels.** Assume 50K conversations a day on web chat, about 6 user turns each, English and Hindi. Peak hour carries about 15% of the day.
+- **What can the agent do?** Read: help-centre articles, order status, shipment tracking. Write: cancel an unshipped order, issue a refund up to a limit (say Rs 2,000) on eligible orders, create a ticket. Everything else goes to a human.
+- **What is success?** Resolution without a human (containment) is the business metric, but only counted when the customer did not come back within 72 hours and policy was followed. Wrong refunds and missed escalations are the costly errors.
+- **Humans in the loop.** Is there a staffed queue, and what are its hours? Assume yes, with an SLA of minutes during business hours and a ticket outside them.
+- **Latency.** First token within about 2 s for a chat turn; tool calls may add a few seconds with a visible status.
+
+## Baseline architecture
+
+A workflow wraps a small agent. Code decides who the customer is, what the agent may do and when it must stop; the model decides how to answer and which read tools to call.
+
+```text
+ customer msg ─► auth (logged-in customer id) ─► rate limit
+   ─► pre-router (code + small classifier):
+        explicit "human" / legal / safety / abuse ─────────────► HANDOFF
+        small talk ─► template
+        else ─► agent turn
+ agent turn (bounded loop, max 6 steps, 20 s, token budget):
+   context = system rules (cached) + customer profile + last N turns
+             + running summary + retrieved help articles
+   tools:  search_help(q)            read
+           get_order(order_id)       read, scoped to this customer
+           cancel_order(order_id)    write, idempotency key, policy check in code
+           refund(order_id, amount)  write, policy engine decides:
+                                       ≤ limit & eligible → execute
+                                       else → approval queue / HANDOFF
+           escalate(reason, summary) always allowed
+   ─► output guard (policy claims, promised amounts, tone, PII)
+   ─► reply (streamed) ─► trace + metrics
+ HANDOFF ─► ticket with summary, intent, actions taken, sources ─► human queue
+```
+
+The key move: the model never decides eligibility. `refund` is a tool whose implementation calls a policy function over stored facts (order status, delivery date, prior refunds, amount). The model can ask; code answers. The [tool-use chapter](/21-tool-use/#idempotency-retries-side-effects) covers why every write tool needs an idempotency key: a retried loop step must not refund twice.
+
+## Key choices and trade-offs
+
+**Agent or workflow?** Policy questions alone are RAG, a workflow. Order actions need multi-step reasoning ("which order? is it shipped? then cancel"), so a bounded agent loop earns its cost there. Keep the tool list short (five tools) so selection stays reliable and definitions stay cheap.
+
+**Escalation triggers.** Escalate in code, not only when the model calls `escalate`:
+- the customer asks for a human (detected by classifier and regex, honoured immediately);
+- the policy engine refuses or the amount is over the limit;
+- the loop hits its step or time budget, or the same tool fails twice;
+- the output guard fails twice on one turn;
+- sentiment or frustration crosses a threshold over several turns;
+- topics on a deny list: legal threats, injury, fraud, account takeover.
+
+**Handoff quality.** A human who must re-read 20 turns is slower than no bot. The handoff packet is a structured summary: intent, order ids, what was checked, what the agent did, what the customer wants, and the sources it cited. Generate it with a cheap model under a schema; validate order ids against the session.
+
+**Memory.** Last 8 to 10 turns verbatim plus a running summary of older turns. Customer profile and order list come from the database each turn, not from chat memory, so they are never stale.
+
+**Model choice.** A mid-size model for the agent turn; a small model for routing, summaries and the handoff packet. Route to a stronger model only when the first attempt fails a guard.
+
+## Evals
+
+Support agents need trajectory evals, not just answer grading.
+
+- **Scenario suite.** 200 to 400 scenarios built from real transcripts: each has a customer persona and goal, seeded database state (orders, refund history), and expected outcomes: which tools must and must not be called, final database state, and whether escalation was required.
+- **Simulated customers.** A second model plays the customer from the persona for up to N turns. This is the tau-bench pattern (Yao et al., 2024). Grade the final database state in code: was the right order cancelled, no refund over the limit, no duplicate action.
+- **Reliability, not luck.** Run each scenario k times and report pass^k, the share where all k runs pass. A design that passes 90% once may pass far fewer at k = 4.
+- **Escalation as a classifier.** Label each scenario "should escalate" or not. Report escalation recall (missed escalations are the worst error) and precision (false escalations cost staff time). Pick the operating point with the support team.
+- **Adversarial slice.** Customers who claim a wrong price or a promise that was never made, refund-farming attempts, and injection in free-text fields such as order notes.
+- **Online.** Containment, 72-hour recontact rate, CSAT, handoff rate by reason, refund amount per 1K conversations, and a weekly human review of a sample of contained chats.
+
+## Guardrails and fallbacks
+
+- **Authority in code.** Tools are scoped to the authenticated customer id from the session, never from the model's arguments. Writes go through the policy engine and carry idempotency keys.
+- **Human approval** for refunds above the limit: the agent tells the customer it has been sent for review, and a human approves in the console. See [human approval](/21-tool-use/#human-approval).
+- **Output guard.** Block replies that promise money, dates or exceptions not returned by a tool; check that quoted policy text matches a retrieved article; redact card numbers and phone numbers.
+- **Budgets.** Step, token, wall-time and per-conversation cost caps. On breach, escalate with the summary instead of failing silently. See [stop conditions and budgets](/22-agent-loop/#stop-conditions-and-budgets).
+- **Fallbacks.** Provider down: a template that offers a ticket. Kill switch per tool (turn off refunds in one config change) and for the whole agent.
+- **Injection.** Order notes, product reviews and email text are data. The worst an injected instruction can do is ask for a tool the policy engine will refuse.
+
+## Observability and cost
+
+One trace per conversation with spans per turn, tool call (arguments, result, latency, policy verdict) and guard result. Dashboards: containment, escalation rate by trigger, policy refusals, tool error rate, guard retries, p95 turn latency, tokens and cost per conversation, refunds issued per hour (alert on spikes: it is a fraud and bug signal).
+
+## The numbers
+
+**Load.**
+
+```text
+conversations/day         50,000
+peak hour (15%)           7,500 conversations ≈ 2 new per second
+turns at peak             7,500 × 6 / 3,600 ≈ 12.5 turns/s
+LLM calls per turn        ~1.5 (tool round-trips) → ~19 calls/s at peak
+```
+
+**Tokens per call.** System rules and tool definitions about 2,500 (stable, cacheable), profile and orders 500, summary plus recent turns 1,500, retrieved articles 1,500: about 6,000 input, 250 output.
+
+**Cost per 1K conversations** (P in dollars per million tokens; check current prices):
+
+```text
+calls per conversation = 6 turns × 1.5 = 9
+input  = 9 × 6,000 = 54K tokens → 54 × P_in per 1K conversations
+output = 9 × 250   = 2.25K      → 2.25 × P_out per 1K conversations
+with the 2,500-token prefix cached at fraction c of P_in:
+input cost = 9 × (3,500 + 2,500 × c) / 1,000 × P_in = (31.5 + 22.5 × c) × P_in
+plus handoff summaries on escalated chats (~3K in, 300 out each)
+```
+
+Compare against the human cost per conversation to decide where the agent pays off; the right comparison is cost per resolved conversation, including recontacts.
+
+**Latency budget per turn (targets).** Pre-router 20 to 50 ms, retrieval 100 to 200 ms, first model call to first token about 1 s, each tool round-trip 0.2 to 1 s plus another model call. Stream text and show "Checking your order..." while tools run.
+
+## Follow-ups they will ask
+
+- **"The agent promised a refund it could not give. What failed?"** The output guard should have blocked a money promise without a matching tool result; add the transcript to the eval set and check whether the policy engine or the guard missed.
+- **"How do you stop a customer talking the agent into a refund?"** The model has no authority to decide eligibility; persuasion can change what it asks for, never what the policy function returns.
+- **"How do you measure a missed escalation in production?"** Sample contained chats with a recontact or a low CSAT and have humans label whether escalation was needed; that gives a recall estimate and new eval cases.
+- **"Why not let a human approve every action?"** Approval fatigue makes humans rubber-stamp; approve by risk (amount, account age, history), auto-execute the low-risk band.
+- **"How do you roll it out?"** Shadow mode drafting replies for agents first, then a small traffic slice for read-only intents, then write tools behind the policy limits.
+
+## How to bring in your own work
+
+You have not shipped a support agent or a tool-calling loop with write tools. You have shipped the patterns that make one safe, so lead with those.
+
+- **Authority decided by code.** In LeetCode Coach, `decideRung()` in `backend/src/lc/domain/policy.js` (lines 8 to 37) is a pure function over stored facts that decides how much help the model may give; its docstring says it never reads the student's message text (lines 5 to 6). Rung 4 needs two submissions and is allowed once per problem. That is the refund policy engine in another domain. The line to say: the model is told its contract; it does not choose it.
+- **Bounded generate, guard, retry, fallback.** `produceReply` in `backend/src/lc/services/chatService.js` (lines 66 to 113) generates, runs `guardReply` (`backend/src/lc/domain/guard.js`) and retries once with the violations listed. On a kill switch, a provider error or a hard guard failure it returns a rung-aware template reply marked `degraded`. A kill switch (`backend/src/lc/config.js` lines 30 to 31) and an atomic daily cap (`chatService.js` lines 152 to 154) bound spend.
+- **Feedback and error UX.** Thumbs and reasons stored per message (`chatService.js` lines 218 to 226) and distinct user messages per failure (`extension-leetcode/sidepanel.js` lines 3301 to 3312).
+- **Simulated users and pushback.** Memory Agent's eval drives a Sonnet-simulated persona for up to 4 turns (`eval/run.ts` lines 178 to 190), and a scenario where the user pushes a wrong price checks that the agent holds with a source (`eval/cases.ts` lines 164 to 171). That is the "customer claims a promise was made" slice.
+- **A retried request must not run twice.** In Scheme Assistant (a team project; this path is your commit), a resent chat message whose answer is still pending waits for it, and one already answered is replayed from the stored row rather than answered again (`src/app_api/chat.py` lines 249 to 262). It is the same idea as an idempotency key on a refund tool, applied to a read path.
+- **Honest gaps.** No client-side tool loop, no write tools, no idempotency keys on side effects, no human handoff queue or approval console, no pass^k measurement. Memory Agent's only tool is read-only search (`src/answer.ts` lines 47 to 60), so idempotency on writes and approval never came up. Say you would build the loop in Memory Agent first, with one fake write tool and a scenario suite graded on database state.

@@ -1,0 +1,27 @@
+---
+import { getCollection, render } from 'astro:content';
+import Page from '../../layouts/Page.astro';
+import Callout from '../../components/Callout.astro';
+import { sectionById, sectionHref } from '../../lib/outline';
+
+export async function getStaticPaths() {
+  const drills = (await getCollection('drills')).sort((a, b) => a.data.id.localeCompare(b.data.id));
+  return drills.map((d, i) => ({ params: { drill: d.data.id.toLowerCase() }, props: { d, prev: drills[i - 1], next: drills[i + 1] } }));
+}
+const { d, prev, next } = Astro.props;
+const { Content } = await render(d);
+---
+<Page title={`${d.data.title}: LLM System-Design Interview Drill`} description={`System-design interview drill: ${d.data.prompt}`.slice(0, 300)} ogType="article" crumb="Interview" current="interview">
+  <header class="view-head">
+    <p class="view-crumbs"><a href="/interview/#drills-h">Drills</a> <span aria-hidden="true">/</span> {d.data.id}</p>
+    <h1 class="view-title">{d.data.title}</h1>
+    <p class="view-lede">{d.data.prompt}</p>
+    <p class="drill-meta">{d.data.minutes} minutes · revise {d.data.sections.map((s, i) => <>{i > 0 && ' · '}<a href={sectionHref(s)} title={sectionById[s]?.title}>{s}</a></>)}</p>
+  </header>
+  <Callout type="tip" title="How to use this">Talk through your own design for the full time before you scroll. Then read the model answer and score yourself on the rubric (a) to (h).</Callout>
+  <article class="prose drill-prose"><Content components={{ Callout }} /></article>
+  <nav class="chapter-nav" aria-label="Drill navigation">
+    {prev ? <a class="nav-card" href={`/interview/${prev.data.id.toLowerCase()}/`} rel="prev"><span class="nav-dir">← {prev.data.id}</span><span class="nav-title">{prev.data.title}</span></a> : <span></span>}
+    {next ? <a class="nav-card is-next" href={`/interview/${next.data.id.toLowerCase()}/`} rel="next"><span class="nav-dir">{next.data.id} →</span><span class="nav-title">{next.data.title}</span></a> : <span></span>}
+  </nav>
+</Page>

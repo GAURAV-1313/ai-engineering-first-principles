@@ -1,0 +1,747 @@
+---
+id: "29"
+title: "Guardrails and Safety"
+summary: "Put the right checks around every model call: deterministic code first, then classifiers, then LLM judges, each with a defined action, a latency budget, a fail mode and a measured precision and recall, so the product blocks what it must without refusing the users it exists for."
+readingTime: "36 min"
+---
+
+The first version of Memory Agent's number guard was correct and useless. It compared every price in an answer with the source excerpt the answer cited and warned when a number could not be found. Replayed over 545 stored turns, it put a warning on 36% of them, and almost every warning was a false alarm: the provider caps cited excerpts at about 150 characters, and 55% of them were cut off mid-sentence. A guard that cries wolf on one turn in three gets ignored by users and switched off by the team. The version that shipped raises 8 flags, on 1.3% of those turns, and every one of the 8 was fair on hand review.
+
+That story contains most of this chapter. A **guardrail** is a check that runs around a model call, on what goes in or what comes out, and decides what happens next: pass, block, rewrite, ask again, warn, fall back or hand to a human. The check itself is usually the easy part. The hard parts are choosing *what kind* of check (a regex, a classifier, another model), deciding what the system does when the check fires, keeping the check off the latency path, and measuring how often it is wrong in both directions. A guard that blocks 2% of innocent users is a product bug with a safety label on it.
+
+Neighbours own adjacent ground: schema repair loops are in [Structured Output](/13-structured-output/#retry-and-repair-loops), serving-time faithfulness checks in [RAG Pipelines](/17-rag-pipelines/#grounding-faithfulness), and prompt injection, a security problem rather than a content one, in [chapter 33](/33-security-prompt-injection/#why-classifiers-are-insufficient). Here the question is operational: what runs around each call, what it costs, and how you know it works.
+
+## Taxonomy (input/output, sync/async)
+
+### Where guards sit
+
+A model call is a function with an untrusted input and an unreliable output. Guards attach at each boundary:
+
+```text
+user ──► [ input guards ] ──► [ retrieval guards ] ──► MODEL ──► [ output guards ] ──► user
+           moderation           ACL filter,                        schema (ch 13)
+           PII redaction        trusted-source filter              grounding, citations
+           scope check          (ch 18)                            policy rules, PII leak
+           injection (ch 33)                                       moderation of output
+                                               │
+                                               └──► [ action guards ] ──► tools
+                                                     argument checks, approval (ch 21, 33)
+
+         sync: on the request path, can block    async: after the fact, can flag, review, retract
+```
+
+Input guards decide whether a request reaches the model and in what form; retrieval guards decide which documents it may see; output guards decide whether the answer may reach the user. Action guards decide whether a tool call may execute, and in agents they are the most dangerous boundary: they belong with [human approval](/21-tool-use/#human-approval) and [least privilege](/33-security-prompt-injection/#least-privilege-tools-and-scoped-credentials).
+
+### Three ways to implement a check
+
+| Kind | Examples | Latency | Cost | Strength | Weakness |
+|---|---|---|---|---|---|
+| **Deterministic code** | regex, checksum, schema, string match against sources | microseconds to milliseconds | free | exact, testable, explainable | only catches what you can specify |
+| **Classifier** | moderation model, PII NER model, topic classifier | 10 to 200 ms (roughly) | small | handles fuzzy categories cheaply | fixed taxonomy, weak on your domain and on code-mixed text |
+| **LLM judge** | "is each claim supported?", "is this medical advice?" | hundreds of ms to seconds | one more model call | understands nuance and context | slow, costly, itself unreliable, injectable |
+
+The rule that falls out of this table: **use the cheapest check that can decide the case.** Code decides what code can decide (is this cited number in the cited text?). A classifier handles fuzzy but common categories (is this hate speech?). An LLM judge is reserved for what needs reading comprehension, and it should be validated like any other judge ([chapter 20](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans)). Memory Agent's decision record says this directly: an earlier LLM judge panel passed six numbers that were all wrong, so the number check became plain code.
+
+### Every guard needs an action
+
+A detector without a defined action is a log line. The actions, gentlest first: **flag** (log, maybe warn), **fix** (rewrite deterministically: redact, delete a sentence, clamp a score), **re-ask** (once, with the violation list), **fall back** (a safe template), **refuse** (with copy that says what the product can do) and **escalate** (to a human).
+
+### Sync versus async
+
+A **synchronous** guard sits on the request path: it can block, and every millisecond it takes is user-visible. An **asynchronous** guard runs after the response, or on a sample; it cannot prevent harm on that request, but it can flag for review, retract, or feed the eval set. Use sync for harms you must prevent (another user's data, dangerous instructions) and async for harms you can tolerate briefly and must learn from.
+
+```python
+from dataclasses import dataclass
+from typing import Callable, Literal
+
+Action = Literal["pass", "flag", "fix", "reask", "fallback", "refuse", "escalate"]
+
+@dataclass
+class Verdict:
+    guard: str
+    action: Action
+    detail: str = ""
+    text: str | None = None          # rewritten text when action == "fix"
+
+Guard = Callable[[str], Verdict]
+SEVERITY = ["pass", "flag", "fix", "reask", "fallback", "refuse", "escalate"]
+
+def run_guards(text: str, guards: list[Guard]) -> tuple[str, list[Verdict]]:
+    """Cheapest first. Fixes chain; anything at or above 'reask' stops the chain."""
+    verdicts = []
+    for g in guards:
+        v = g(text)
+        verdicts.append(v)
+        if v.action == "fix" and v.text is not None:
+            text = v.text
+        elif SEVERITY.index(v.action) >= SEVERITY.index("reask"):
+            break                     # no point paying for the judge after a hard stop
+    return text, verdicts             # log every verdict: they are your guard metrics
+```
+
+<Callout type="warn">
+
+Guardrails are defence in depth, not a security boundary. A determined attacker can phrase around any content classifier, and [chapter 33](/33-security-prompt-injection/#why-classifiers-are-insufficient) shows why a 99% detector is a failing grade against someone with unlimited retries. What actually bounds damage is what the system is *able* to do: scoped data access, narrow tools, approval on writes.
+
+</Callout>
+
+## Moderation classifiers
+
+### The problem
+
+Users send abuse, sexual content, self-harm disclosures and requests for weapons, and models steered by users can produce the same. The model's [safety training](/07-post-training-and-alignment/#safety-training-and-refusals) follows the provider's policy, not yours: a children's study app and an adult fiction tool need different lines. You need a check whose categories and thresholds you choose.
+
+### How it works underneath
+
+A moderation classifier is a **multi-label** classifier over a **harm taxonomy**. Multi-label means one text can be "harassment" and "violence" at once, so each category gets its own score, usually a probability, and you threshold each separately. Two architectures dominate:
+
+1. **A fine-tuned encoder with a classification head.** Text in, a vector of per-category probabilities out. Small, fast, cheap to run on CPU or a small GPU.
+2. **A fine-tuned LLM that outputs a verdict as text.** The prompt contains the taxonomy and the conversation; the model generates "safe" or "unsafe" followed by the violated category codes. You can read a probability from the logit of the first token. The Llama Guard paper (Inan et al. 2023) introduced this pattern; because the taxonomy is in the prompt, you can adapt the categories without retraining, within limits.
+
+The products, once you know the mechanism:
+
+- **Provider moderation endpoints.** OpenAI's moderation endpoint (model `omni-moderation-latest`) scores text and images per category and is free to call at the time of writing; Azure AI Content Safety and Amazon Bedrock Guardrails offer configurable content filters; Gemini applies safety settings on the generation call itself and reports a block in the response. Check each provider's current docs for categories and limits.
+- **Open-weight guard models.** Meta's Llama Guard 4 (a 12B multimodal model, April 2025) classifies prompts and responses against 14 hazard categories, S1 to S14, the first thirteen from the MLCommons hazard taxonomy and S14 for code-interpreter abuse. Earlier Llama Guard versions came in smaller sizes, and Google's ShieldGemma is another open family. You host these yourself, which matters when the text must not leave your network.
+
+### Thresholds are product decisions
+
+A per-category score is not a decision. You choose a threshold and an action per category, per surface:
+
+```python
+POLICY = {   # category: (threshold, action) — reviewed by a person, versioned with the code
+    "self-harm":       (0.30, "escalate"),   # low threshold, and never a bare refusal
+    "sexual/minors":   (0.05, "refuse"),     # near-zero tolerance
+    "violence":        (0.70, "flag"),       # "kill the process" is common in a coding app
+    "harassment":      (0.60, "refuse"),
+    "hate":            (0.50, "refuse"),
+}
+
+def moderate(scores: dict[str, float]) -> tuple[str, list[str]]:
+    hits = [(c, POLICY[c][1]) for c, s in scores.items() if c in POLICY and s >= POLICY[c][0]]
+    if not hits:
+        return "pass", []
+    order = ["flag", "refuse", "escalate"]
+    worst = max(hits, key=lambda h: order.index(h[1]))[1]
+    return worst, [c for c, _ in hits]
+
+print(moderate({"violence": 0.82, "harassment": 0.12}))   # ('flag', ['violence'])
+```
+
+Self-harm is the category most often handled wrong. A user who writes "I don't see the point any more" to a study app should get a warm reply with a helpline for their country (an Indian one, not a US number; keep the list in config) and a route to a person, not "I can't help with that."
+
+### The base-rate problem
+
+Suppose 0.5% of requests are genuinely harmful, and your classifier has 95% recall and a 2% false-positive rate (FPR). Per 10,000 requests:
+
+```text
+harmful:  50 × 0.95  = 47.5 caught,   2.5 missed
+benign: 9,950 × 0.02 = 199 wrongly blocked
+precision = 47.5 / (47.5 + 199) ≈ 19%
+```
+
+Four of every five blocks hit an innocent user. At a low base rate, a "98% accurate" classifier mostly blocks the wrong people, so tune thresholds on your own traffic, prefer flag or escalate for borderline categories, and measure FPR as carefully as recall.
+
+### How it fails in production
+
+- **Language coverage.** Training data is mostly English; Devanagari Hindi, romanised Hindi and Hinglish get lower recall and odd false positives. Test on your users' languages.
+- **Domain mismatch.** "Kill the child process" in a coding app, "overdose on caffeine" in a health-literacy one.
+- **Jailbreak wording.** Role-play and obfuscation lower scores ([chapter 33](/33-security-prompt-injection/#direct-injection-and-jailbreaks)); moderation is one layer, not the wall.
+- **None at all.** Neither Scheme Assistant nor Memory Agent moderates input or output. Scheme Assistant's scope regex screens off-topic subjects, not abuse.
+
+## PII detection and redaction
+
+### Why it exists
+
+Personal data leaks out of LLM systems through four doors: the prompt you send to a third-party provider, the logs and traces you keep, the memory you write, and the model's output repeating something from its context to the wrong person. **PII** (personally identifiable information) detection finds it; **redaction** removes or replaces it before it passes a door.
+
+In India the legal frame is the Digital Personal Data Protection Act 2023, whose Rules were notified in November 2025 with most obligations phased in over 18 months (to around May 2027). The engineering reading: don't collect what you don't need, don't send it where it need not go, don't keep it longer than the purpose requires.
+
+### Layered detection
+
+PII comes in two shapes, and each wants a different detector:
+
+1. **Structured identifiers** have a format and often a checksum: Aadhaar (12 digits, first digit 2 to 9, last digit a Verhoeff check digit), PAN (10 characters: five letters, four digits, a letter, where the fourth letter encodes the holder type, P for an individual), Indian mobile numbers (10 digits starting 6 to 9, optional +91), email, card numbers (Luhn check), IFSC codes, UPI ids. Regex plus checksum plus context words ("aadhaar", "PAN", "आधार") is precise and fast.
+2. **Free-text PII** has no format: names, addresses, medical conditions, a family situation. This needs a named-entity recognition (NER) model or a small LLM, with lower precision and recall.
+
+The checksum is what makes structured detection precise. Verhoeff accepts exactly one check digit out of ten, so a random 12-digit number (an order id, a phone number with a prefix) passes only 10% of the time. Adding the checksum cuts false positives on random digit strings by about ten times at no cost.
+
+```python
+import re, hmac, hashlib
+
+D = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],
+     [3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],
+     [6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],
+     [9,8,7,6,5,4,3,2,1,0]]                       # Verhoeff multiplication (group D5)
+P = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],
+     [8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],
+     [2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]]   # Verhoeff permutation
+
+def verhoeff_ok(digits: str) -> bool:
+    c = 0
+    for i, ch in enumerate(reversed(digits)):
+        c = D[c][P[i % 8][int(ch)]]
+    return c == 0
+
+AADHAAR = re.compile(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b")
+PAN = re.compile(r"\b[A-Z]{3}[ABCFGHJLPT][A-Z]\d{4}[A-Z]\b")
+PHONE = re.compile(r"(?<!\d)(?:\+91[ -]?|0)?[6-9]\d{9}(?!\d)")
+
+def redact(text: str, key: bytes, vault: dict) -> str:
+    def sub_for(kind):
+        def sub(m):
+            raw = m.group(0)
+            if kind == "AADHAAR" and not verhoeff_ok(re.sub(r"\D", "", raw)):
+                return raw                         # 12 digits, bad checksum: not an Aadhaar
+            tok = f"[{kind}_{hmac.new(key, raw.encode(), hashlib.sha256).hexdigest()[:6]}]"
+            vault[tok] = raw                       # reversible only for code holding the vault
+            return tok
+        return sub
+    for kind, rx in (("AADHAAR", AADHAAR), ("PAN", PAN), ("PHONE", PHONE)):
+        text = rx.sub(sub_for(kind), text)
+    return text
+
+v = {}
+print(redact("Aadhaar 2345 6789 0124, order 234567890123, PAN ABCPE1234F, +91 9876543210", b"k", v))
+# Aadhaar [AADHAAR_…], order 234567890123, PAN [PAN_…], [PHONE_…]
+```
+
+### Redaction strategies
+
+- **Mask** (`XXXX XXXX 0124`): simple, irreversible, loses meaning for the model.
+- **Typed placeholder** (`[PHONE]`): the model still knows a phone number was there and can reason about it ("I've noted your number").
+- **Reversible pseudonym** (`[PHONE_d1e90c]` plus a vault): the model sees a stable token; your code swaps the real value back into the output after the call, so the provider never sees it. Keyed hashing (HMAC) means the same value gets the same token within a conversation, so "call me on that number" still resolves.
+- **Keyed hash at rest:** store only an HMAC of the identifier. Scheme Assistant's API keys each citizen by `phone_hmac(pepper, phone)` and its docstring says the raw number is never stored (a teammate's code in `src/app_api/ids.py`).
+
+### Where to put it
+
+Redact locally, before each door: the provider call, logs and traces ([chapter 30](/30-observability/#log-privacy-and-retention)), memory writes ([chapter 23](/23-memory/#privacy)), and the output, to catch the model echoing someone else's data.
+
+The products, after the mechanism: Presidio (open source, from Microsoft) combines regex, checksum, context words and NER, and ships India recognizers including `IN_AADHAAR` (with a Verhoeff check), `IN_PAN`, `IN_VOTER`, `IN_PASSPORT` and `IN_GSTIN`. All of them are disabled (`enabled: false`) in its default recognizer config, so a stock analyzer finds no Aadhaar at all: enable them explicitly and test on your own samples. Bedrock Guardrails and Azure offer managed PII filters.
+
+### How it fails in production
+
+- **Redaction breaks the task.** A user filling a PAN form wants help *with their PAN*. Decide per feature whether the model needs the value; often it needs only the type.
+- **Format drift.** OCR'd text with stray spaces ("2345 67 89 0124"), Devanagari digits (२३४५), numbers split across lines. Normalise before matching, and measure recall on real samples.
+- **The gap between prompt and code.** Answer Grader's transcription prompt tells the vision model to leave out "any name or roll number" (`backend/vision.py`), but no code checks the transcript before it is stored. A prompt instruction is a request, not redaction.
+- **Logs are the real leak.** Scheme Assistant writes the citizen's question text into `query_log`, so an Aadhaar number typed into a question stays in that table; Memory Agent stores full user and answer text per turn. Both are where a redaction pass pays for itself.
+
+## Scope restriction
+
+### The problem
+
+A rural-employment assistant will be asked about cricket, horoscopes and income tax. Answering costs money, carries liability in domains you have not validated, and turns your brand into a free general-purpose chatbot. **Scope restriction** keeps the system to its job.
+
+### Mechanisms, cheapest first
+
+1. **Instructions in the system prompt** ("answer only about X"). Necessary, cheap, and weak on its own: the model drifts, and users push.
+2. **A model-reported scope flag.** Ask for `in_scope` as a field in the structured output and branch on it in code. Scheme Assistant's prompt defines `in_scope` as being about the *topic*, not about whether the passages answer it.
+3. **A cheap pre-filter** for unmistakable cases: a short keyword list or regex. Scheme Assistant's `src/app/core/scope.py` (a teammate's code) is explicit about its role: its docstring calls it "a latency optimisation, NOT the safety layer", and the list is "kept deliberately short: a false positive here is a wrongly refused citizen".
+4. **An embedding or classifier router:** embed the query, compare with in-scope and out-of-scope exemplars, threshold the margin. Handles paraphrase that a keyword list misses, at the cost of an embedding call.
+5. **An input-type gate** for non-text inputs. Answer Grader's vision prompt begins with "TASK 0 — IS THIS AN ANSWER AT ALL?" and rejects selfies, memes and blank pages with a reason before anything else runs, because "guessing a plausible UPSC question from an unrelated photo produces a confident, entirely fictitious evaluation". Health Triage's medical-image flow (a teammate's code) does the same with an `is_medical` field and raises a typed rejection unless it is true.
+
+```python
+import re
+
+UNMISTAKABLE_OOS = re.compile(r"\b(ipl|cricket score|horoscope|lottery)\b", re.I)
+DOMAIN_VOCAB = re.compile(r"\b(rozgar|yojana|panchayat|wage|job card)\b", re.I)
+
+def scope_decision(query: str, embed_margin: float, llm_in_scope: bool | None) -> str:
+    """Return 'out_of_scope', 'in_scope' or 'abstain' (in scope, not answered)."""
+    if UNMISTAKABLE_OOS.search(query) and not DOMAIN_VOCAB.search(query):
+        return "out_of_scope"                 # free, decided before any model call
+    if embed_margin < -0.15:
+        return "out_of_scope"                 # clearly nearer the out-of-scope exemplars
+    if llm_in_scope is False and DOMAIN_VOCAB.search(query):
+        return "abstain"                      # "not answered" is not "off-topic"
+    return "in_scope" if llm_in_scope is not False else "out_of_scope"
+```
+
+The third branch mirrors a real fix in Scheme Assistant's `answer_query.py`: when the model reports out-of-scope but the question contains the department's own vocabulary, the pipeline overrides to abstain, because a weak model conflating "not answered" with "off-topic" must not refuse a citizen. These are different outcomes with different copy ([no-answer handling](/17-rag-pipelines/#no-answer-handling)): "I only cover these schemes" versus "the documents don't state this; contact the Gram Panchayat".
+
+### Scope as an output check
+
+Scope also applies to what the model *says*. Chat Insights's tutor gives hints in rungs, and at rung 1 the reply must not name the technique (no "Dijkstra" when the student has not yet been nudged that far). `backend/src/lc/domain/guard.js` scans the reply against a term list and, separately, for any 8-word window copied verbatim from the problem's official hints. Either is a retry-class violation. That is scope restriction in a teaching product: the boundary is not the topic but how much to reveal.
+
+### How it fails in production
+
+- **Follow-ups.** "And for my mother?" is out of scope on its own and in scope in context. Run scope on the rewritten, standalone query, not the raw turn.
+- **Multi-intent messages.** Answer the in-scope part and say what you skipped.
+- **Over-tight lists.** Every block-list word is a future false positive (Scheme Assistant's includes "film"). Leave anything not unmistakable to the model flag.
+
+## Output validation and fact-checking
+
+### The problem
+
+Output guards check three things, in cost order: **shape**, **policy** and **facts**. Shape is [chapter 13's validation](/13-structured-output/#pydantic-zod-validation). Policy rules are product-specific and almost always code: Chat Insights's guard checks that a reply ends with exactly one question, stays under a per-rung word cap, never calls a step "easy", and deletes sentences like "that's the only bug" so the model cannot imply false certainty. Facts are where the design gets interesting.
+
+### Checking facts against a source
+
+If the claim has a source in the context, compare in code first:
+
+- **Citation ids** must be in the set the model was shown.
+- **Numbers, ids and names** in the claim must appear in the cited text or the source record.
+
+Certificate Assistant's `check_entities` in `app/backend/messages.py` (Gaurav's) does the second for generated citizen messages: every number, certificate id and name-like word must be in the template's fixed wording or the source record; anything else is returned as an unsupported entity. Its test feeds a message with an invented certificate number and a fee of 500 and asserts both are caught.
+
+The most important design idea in this section is from Memory Agent's `src/guard.ts`: **a check has three outcomes, not two.**
+
+```text
+for each number in a cited sentence:
+  found in the cited excerpts                         → verified
+  not found, and every cited excerpt is complete     → flagged     (shown to the user)
+  not found, but some excerpt is cut off ("…")       → unverifiable (counted, not shown)
+```
+
+"I could not confirm this" is not the same as "this is wrong". Treating them as one is what put warnings on 36% of turns. Separating them took the rate to 1.3% without losing a single fair flag, because the missing evidence was the guard's problem, not the answer's.
+
+### When there is no source: a claim-level judge
+
+Some claims come from the model's own knowledge. Answer Grader's model answers name cases, committees, Articles and schemes; an audit of 82 specific additions found 16 wrong and 9 stale. `backend/verify.py` (Gaurav's) adds one call that lists every named claim and judges it, with the hand-verified fact register in the prompt; then **code** acts: `remove_flagged` touches only "wrong" or "stale" verdicts, substitutes the register's wording where a verified fact settles the claim, otherwise removes the smallest piece carrying it, and skips any edit that would take the answer below 60% of its word limit. The judge labels; code edits, within bounds. A judge that rewrites text can add new errors; one that only labels cannot. Judge design is [chapter 20's](/20-evals-judges-and-ci/#faithfulness-checks) subject.
+
+### What to do with a violation: fix, re-ask once, fall back
+
+Chat Insights's tutor (`backend/src/lc/services/chatService.js`, Gaurav's) is a clean, bounded loop:
+
+```python
+def produce_reply(llm, ctx, guard, template):
+    try:
+        r1 = llm(ctx.prompt)
+    except Exception:
+        return template(ctx, reason="llm_error")             # model down: degrade, don't hang
+    g1 = guard(r1, ctx, pass_no=1)                           # each rule: fix / retry / flag
+    if g1.action == "accept":
+        return g1.reply                                      # fixes already applied in code
+    if g1.action == "fallback":
+        return template(ctx, reason="guard")
+    revised = ctx.prompt + "\n\nREVISION REQUIRED: " + "; ".join(g1.violations)
+    try:
+        r2 = llm(revised)                                    # exactly one re-ask
+    except Exception:
+        return template(ctx, reason="llm_error_retry")
+    g2 = guard(r2, ctx, pass_no=2)                           # on pass 2, retry rules become flags
+    return template(ctx, reason="guard") if g2.action == "fallback" else g2.reply
+```
+
+The re-ask carries the *specific* violations ("technique names at rung 1: dijkstra"), not "try again", because a model given the same prompt at a low temperature tends to return the same text. Chat Insights's code goes further for verbatim repeats: it shows the model its previous reply, asks for a different angle and samples hotter.
+
+If a fraction f of first passes need a re-ask, expected calls per turn are 1 + f: at f = 0.15, 15% more tokens, and two model calls of latency for the turns that retry. Cap at one re-ask; a second rarely fixes what the first did not.
+
+## Hallucination mitigation
+
+### Why it happens, in one paragraph
+
+A language model generates the most plausible continuation, and plausible is not true. [Chapter 4](/04-language-modeling-and-sampling/#hallucination-as-a-training-sampling-property) covers the mechanism. Kalai et al. 2025 ("Why Language Models Hallucinate") add an incentive argument: training and benchmark grading that score a confident guess above "I don't know" teach models to guess. Lower temperature reduces variance, not error: a model that does not know a wage rate will state a wrong one deterministically.
+
+So you do not "fix" hallucination. You lower the rate and catch more of what remains, in layers.
+
+### The layers
+
+| Layer | Mechanism | Cost | Catches | Misses |
+|---|---|---|---|---|
+| **Ground** | put the facts in context (RAG, a verified facts register) | retrieval | model memory errors | retrieval misses, stale sources |
+| **Constrain** | "cite or omit", structured claims with source ids, at most two numbers per sentence | prompt tokens | uncited assertions | confident misreadings |
+| **Abstain** | score floor before generation; abstain if no claim survives | free | unanswerable questions | answerable questions below the floor |
+| **Verify in code** | citation ids, numbers, entities against sources | free | fabricated citations, changed numbers | wrong-row numbers, paraphrase errors |
+| **Verify with a model** | NLI or a claim-level judge; self-consistency | one or more calls | unsupported paraphrase, knowledge errors | what the judge also gets wrong |
+| **Show** | sources and quotes beside each claim | UI | lets users catch the rest | users who don't click |
+
+Three of these are worth unpacking.
+
+**Grounding with a register.** Answer Grader's `backend/facts.py` renders matched entries under "VERIFIED FACTS (checked by a person against the official source named; they override your own memory…)", and for a changed fact prints the old value as "Superseded, never state as current". That last line matters: for a changed policy, the value the model saw most in training is the old one, and naming it as superseded gives the model something to contrast against.
+
+**Constraining the writer.** Memory Agent's prompt rule: "Every number, price, date or version you state must come from a search result you cite in that same sentence, or from MEMORY. If you can't cite it, leave it out", plus at most two numbers per sentence "so each citation clearly covers what it supports." The second rule exists for the guard: one number per citation makes the check unambiguous. Write prompts so their outputs are checkable.
+
+**Sampling-based detection.** SelfCheckGPT (Manakul et al. 2023) samples several answers and treats claims that vary across samples as likely hallucinated, since facts the model knows tend to be stable and invented ones drift. Chain-of-Verification (Dhuliawala et al. 2023) has the model plan verification questions, answer them independently and revise. Both cost several calls per answer: worth it for offline content generation, rarely for chat latency.
+
+### What remains after all layers
+
+Memory Agent's number guard catches a made-up price only when every excerpt behind the sentence is complete, which holds for 508 of 1,630 prices (31.2%). It never catches a **wrong-row** error ($150 quoted where the right plan costs $90, both on the same page), because the wrong number *is* in the excerpt; the decision record names label-aware matching as the next step. Every layer has a blind spot like this; the engineering is knowing where yours are.
+
+<Callout type="interview">
+
+"How do you reduce hallucinations?" A strong answer is layered and measured: ground, constrain the output so it is checkable, abstain on a calibrated floor, verify in code, then a validated judge where code cannot reach, and track faithfulness and abstain rate in production. "Lower the temperature and tell it not to make things up" is the weak answer.
+
+</Callout>
+
+## Refusals and fallbacks
+
+### Five kinds of non-answer
+
+When the system does not give the user what they asked for, there are five different reasons, and each needs its own status, copy and metric:
+
+| Kind | Cause | What the user should hear |
+|---|---|---|
+| **Refusal** | policy says no | what you can't do, briefly, and what you can |
+| **Out of scope** | not this product's job | what the product covers |
+| **Abstain** | in scope, no grounded answer | "the documents don't say this", and where to go |
+| **Degraded fallback** | model down, timed out, guard failed twice | a safe template, marked as degraded |
+| **Escalation** | a human should handle it | who, how, and how long |
+
+Collapsing these into one "Sorry, I can't help with that" hides the system's state from the user and from your dashboards. Scheme Assistant keeps them separate in Hindi and English: the out-of-scope text lists the schemes it covers; the abstain text says "rather than risk telling you something wrong, it's better to speak to a person."
+
+### Detecting provider refusals
+
+The provider can refuse too. Treat that as a typed outcome, not a generic error: Chat Insights's Gemini adapter maps errors matching `blocked|SAFETY|RECITATION|PROHIBITED` to `LlmError('refusal')`, separate from HTTP and config errors, so refusals are counted and fall back to the template. Some APIs return an explicit refusal stop reason or field; branch on it rather than parsing prose.
+
+### Fallback design
+
+Good fallbacks share four properties:
+
+- **Safe by construction.** Chat Insights's `fallback.js` header states its template is schema-valid, ends with a question and has no technique names at rung 1: it passes the same guard as a model reply.
+- **Marked.** The reply carries `provider: 'template'`, `degraded: true` and the reason (`kill_switch`, `guard`, `llm_timeout`, `llm_refusal` and so on), so dashboards can count degraded turns.
+- **Never empty.** Memory Agent substitutes a short apology and a rephrase hint if the writer returns no text.
+- **No internals.** Answer Grader's `public_failure` maps an exception to one of six fixed sentences (billing, retrieval, rate limit, credentials, timeout, generic) and copies nothing from the exception text, because it goes back to the student through the API.
+
+A **kill switch** turns the model off without a deploy: Chat Insights reads `LC_KILL_LLM` per request and short-circuits to the template. When a provider incident or bad prompt change hits at 2 a.m., that flag separates a degraded product from a broken one. Provider failover is [chapter 32's](/32-deployment-and-llmops/#fallbacks-and-failover) topic.
+
+### Fail-open versus fail-closed
+
+Guards fail too (timeouts, invalid JSON). Decide in advance:
+
+- **Fail-closed:** if the guard cannot decide, block (or fall back). Right when a miss is severe and irreversible: an agent about to send money, medical dosing, another user's data.
+- **Fail-open:** if the guard cannot decide, let the response through and log it. Right when the guard is a quality check and blocking hurts more than a rare miss: Memory Agent's number warning, a tone check.
+
+```python
+import asyncio, logging
+
+def log_guard_error(guard, error, fail_closed):
+    logging.warning("guard_error %s %s fail_closed=%s", guard, error, fail_closed)
+
+async def guarded(check, text: str, timeout_s: float, fail_closed: bool) -> bool:
+    """True if the text may pass. The fail mode is a per-guard config value, not an accident."""
+    try:
+        return await asyncio.wait_for(check(text), timeout_s)
+    except (asyncio.TimeoutError, ValueError) as e:
+        log_guard_error(check.__name__, type(e).__name__, fail_closed)   # count these
+        return not fail_closed
+```
+
+Count guard errors per guard: a fail-open guard that times out 10% of the time is off 10% of the time.
+
+### Over-refusal
+
+Over-refusal is refusing what you should have answered: "how do I kill a Python process" declined, a citizen's in-scope question blocked by a keyword. XSTest (Röttger et al. 2024) measures it with prompts that look unsafe but are not. The cost is invisible: users don't file bugs, they leave. [Chapter 7](/07-post-training-and-alignment/#sycophancy-reward-hacking-over-refusal) covers why models over-refuse; your job is to give the rate on your traffic an SLO, like missed harm.
+
+## Guardrail latency
+
+### The arithmetic
+
+Sequential guards add up; parallel guards cost the slowest one. Illustrative numbers for one chat turn (measure your own):
+
+```text
+sequential:  moderation 150 ms + PII 20 ms + scope classifier 100 ms + model TTFT 800 ms
+             = 1,070 ms to first token
+parallel:    PII (20 ms, must finish first: it changes the prompt)
+             then  max(moderation 150, scope 100, model TTFT 800) = 820 ms to first token
+```
+
+The second line uses **optimistic execution**: start generation alongside the input checks, hold the output until they pass, cancel if one fails. You pay guard latency only when it exceeds time to first token, and wasted tokens only on (rare) blocked requests.
+
+```python
+import asyncio
+
+async def answer(query: str, moderate, in_scope, generate):
+    gen = asyncio.create_task(generate(query))          # start the expensive part now
+    ok_mod, ok_scope = await asyncio.gather(moderate(query), in_scope(query))
+    if not (ok_mod and ok_scope):
+        gen.cancel()                                     # pay for a few tokens, not a full answer
+        return "refused: moderation" if not ok_mod else "refused: out of scope"
+    return await gen
+```
+
+Two caveats. The input must be safe to *send* before the guard decides, so redaction for a third-party provider finishes first. And tails compound: if each of two parallel calls misses a deadline 5% of the time independently, the slower misses it 1 − 0.95² ≈ 9.75% of the time.
+
+### Output guards and streaming
+
+If you stream tokens and check the full text at the end, the check is a post-mortem: the user has already read it. That is the "guardrails bypassed by streaming" failure. Three designs:
+
+1. **Buffer, check, release.** Hold the full answer, check, then send. Safe; loses all perceived-latency benefit of streaming.
+2. **Sentence holdback.** Release text one sentence behind generation, checking each sentence before release. At 50 output tokens per second, a 25-token sentence is about 0.5 s of extra delay, and a 400-token answer costs about 16 guard calls, so this only works with cheap guards (code, a small local classifier).
+3. **Stream, check incrementally, retract.** Show text immediately, check every N tokens or each sentence in the background, and replace the message if a check fails. Some chat products do this. Acceptable only for harms where a few seconds of exposure is tolerable.
+
+Memory Agent runs its number guard after the stream and sends a `guard` event the UI shows as a warning on the specific numbers: right for a *warning*, wrong for content that must never be shown.
+
+### Cost
+
+An LLM-judge guard is one more call per request. Per 1,000 requests:
+
+```text
+cost per 1K = 1,000 × (input_tokens × price_in + output_tokens × price_out) / 1,000,000
+e.g. judge reads answer 500 + context 2,000 + prompt 300 = 2,800 tokens, writes 100:
+     = 2.8 × price_in + 0.1 × price_out     (prices per million tokens; check the current page)
+```
+
+At an illustrative $0.10 in and $0.40 out per million tokens (a small model), that is about $0.32 per 1,000 requests; a frontier model costs one to two orders of magnitude more. Answer Grader's claim check runs alongside the evaluation in `backend/pipeline.py` (a two-worker thread pool): about Rs 0.2 a run and "no wait", per its docstring. Memory Agent's number guard is code: zero calls, zero time.
+
+## Human escalation
+
+### When a machine should hand off
+
+Some situations should reach a person: high stakes, low confidence, a user who asks, repeated failure, and sensitive disclosures (self-harm, abuse, an emergency). An **escalation** is a guard whose action is "route to a human", with a trigger, a threshold and a measured rate.
+
+```python
+def should_escalate(turn) -> str | None:
+    if turn.moderation.get("self-harm", 0) >= 0.30:
+        return "crisis"                        # immediate resources + priority queue
+    if turn.user_asked_for_human:
+        return "requested"                     # never make people argue with the bot
+    if turn.consecutive_abstains >= 2:
+        return "stuck"                         # the bot has failed twice; stop trying
+    if turn.domain == "medical" and turn.mentions_dosage:
+        return "high_stakes"
+    return None
+```
+
+### The handoff is a product
+
+Escalating to nobody is worse than not escalating. A handoff needs a **context packet** (transcript, sources, guard verdicts, reason) so the human does not re-ask everything; a **staffed queue with an SLA** and honest copy about the wait; and a **route when nobody is available**. Scheme Assistant's abstain path says "Contact the Gram Panchayat or the department", a real route for a rural citizen, though it is one constant string rather than the specific office for each scheme.
+
+### Capacity arithmetic
+
+Escalation rate times volume is a staffing number:
+
+```text
+50,000 conversations/day × 2% escalated = 1,000 handoffs/day
+1,000 × 6 minutes handling             = 6,000 minutes ≈ 100 hours/day
+100 hours ÷ 7.5 productive hours/agent ≈ 13 agents, before breaks and peaks
+```
+
+Each extra point of escalation rate adds about six or seven people, so the threshold is a business decision made with the support team.
+
+### Review queues
+
+The asynchronous form is a **review queue**: flagged outputs, thumbs-downs and sampled traces go to a person who labels them, which is your best guardrail eval data. Keep an **appeal log** where users can contest a block; the overturn rate measures false positives directly.
+
+## Policies and responsible scaling
+
+### A guard implements a policy
+
+Every guardrail encodes a decision about what the product should do. If it lives only in a regex and a prompt, nobody can review it. Write the **policy** down, then implement it:
+
+```json
+{
+  "policy_version": "2026-11-01",
+  "surface": "citizen-chat",
+  "categories": {
+    "self-harm":        { "threshold": 0.30, "action": "escalate", "owner": "trust-safety" },
+    "eligibility_verdict": { "detector": "code", "action": "drop_claim", "owner": "product",
+                          "why": "only an officer can decide eligibility" },
+    "pii_in_logs":      { "detector": "regex+checksum", "action": "redact", "owner": "platform" }
+  },
+  "fail_mode": { "moderation": "closed", "number_guard": "open" }
+}
+```
+
+The middle entry is real: Scheme Assistant's verifier drops any claim that reads as an eligibility verdict, because the system can quote the rules but only an officer decides a case. Version the policy with the code and log its version with every verdict, so when the block rate jumps you can tell whether users changed or the policy did.
+
+### The layers above you
+
+Your policy sits inside others:
+
+- **Provider usage policies** say what you may build on their models at all.
+- **Model-level safety** comes from post-training: the provider's line, not yours.
+- **Lab-level frontier frameworks** govern when a lab will train or deploy more capable models. Anthropic's Responsible Scaling Policy (first published 2023; version 3.0 in February 2026, with point revisions since, so read the current one) ties required safeguards to AI Safety Levels, and Anthropic activated ASL-3 protections for relevant models in May 2025. OpenAI's Preparedness Framework and Google DeepMind's Frontier Safety Framework play similar roles. They constrain the model you call, not your application.
+- **Law:** in India, the DPDP Act and Rules for personal data, plus sector rules (health, finance) where they apply; the EU AI Act if you serve EU users.
+
+### Proportionality
+
+Not every feature needs every guard. Tier features by risk: a grammar fixer needs little beyond output moderation; a citizen-information bot needs grounding, abstention, PII handling and escalation; an agent that moves money needs approval gates and fail-closed checks on every action.
+
+## Bias checks
+
+### What bias means in an application
+
+At the application level, **bias** is treating otherwise identical requests differently because of a group attribute: gender, caste, religion, region, language. In India surnames carry caste and religion signals, and language carries class and region. A grader that scores the same answer lower in Hindi is biased whatever its intent. Bias is mostly an **eval**, not a runtime guard: you detect it across matched pairs, not in a single response.
+
+### Counterfactual testing
+
+Hold everything constant, change one attribute, compare outputs.
+
+```python
+import itertools, statistics
+
+NAMES = {"group_a": ["Rahul Sharma", "Amit Verma"], "group_b": ["Ramesh Paswan", "Suresh Jatav"]}
+
+def counterfactual_gap(template: str, score) -> dict:
+    """score(text) -> float, e.g. a grade or a helpfulness rating from your pipeline."""
+    pairs = []
+    for a, b in itertools.product(NAMES["group_a"], NAMES["group_b"]):
+        pairs.append(score(template.format(name=a)) - score(template.format(name=b)))
+    mean = statistics.mean(pairs)
+    sd = statistics.stdev(pairs) if len(pairs) > 1 else 0.0
+    return {"mean_gap": mean, "sd": sd, "n": len(pairs)}
+
+# Run over 50+ templates. A mean gap consistently on one side across templates is the
+# signal; a single pair is noise. Use a paired sign test across templates, as in ch 20.
+```
+
+Useful axes here: the same UPSC answer in Hindi and English (Answer Grader); the same citizen question in Devanagari, romanised Hindi and English (Scheme Assistant). Language parity is the likeliest failure: Scheme Assistant's critic eval found refusal copy chosen by the question's script, not the app's language, so Hinglish typers on a Hindi app got English refusals. Benchmarks such as BBQ (Parrish et al. 2022) test reliance on stereotypes in ambiguous contexts, but they are US-centric; for Indian attributes, build your own pairs.
+
+### How it fails in production
+
+- **Too few pairs.** A 0.3-point gap on 10 pairs is noise; report intervals.
+- **The judge is biased too.** An LLM judge can introduce the gap you are measuring; test it with the same pairs.
+- **Prompt-only fixes.** "Treat all users equally" changes little. Structural fixes work: rubric scoring in code, names removed from what the grader sees, one template for every language.
+
+## Evaluating guardrails
+
+### A guard is a classifier
+
+Every guard makes a binary decision (fire or not), so it has a confusion matrix:
+
+```text
+                   should fire        should not fire
+guard fires        true positive      false positive   → precision = TP / (TP + FP)
+guard silent       false negative     true negative    → recall = TP / (TP + FN)
+                                                          FPR = FP / (FP + TN)
+```
+
+**Recall** needs examples the guard should catch; real ones are rare, so you construct them. **FPR** needs benign traffic, ideally sampled from production, because constructed benign sets are too clean.
+
+### Four ways to get the data
+
+1. **Unit tests per rule.** Chat Insights's `guard.test.js` runs clean replies for every rung in English and Hinglish and asserts zero violations, then tests each rule. Answer Grader's `tests/test_question_guard.py` checks that real UPSC questions starting with "Evaluate", "Critically examine" or "Analyse" are kept, not stripped as chatbot instructions. These catch regressions, not rates.
+2. **Replay over stored traffic.** Memory Agent's `eval/replay-guard.ts` re-runs every guard version over all stored turns, offline, and counts flags and turns with a warning: 543 flags on 36% of turns for v1, 8 on 1.3% for v2.1. Hand-review the flags for precision.
+3. **Synthetic corruption for recall.** Memory Agent's `eval/guard-recall.ts` corrupts every stored cited price two ways (made-up, wrong-row) and runs the real guard. Its header is unusually honest: it reports what follows from the guard's rules by design separately from what was measured (31.2% of prices sit behind complete excerpts).
+4. **Adversarial probes.** Scheme Assistant's `scripts/stress_rag.py` (a teammate's code) has injection probes with forbidden substrings; see [chapter 33's red-teaming](/33-security-prompt-injection/#owasp-llm-top-10-and-red-teaming).
+
+### Small samples need intervals
+
+The Apply-it asks for a false-positive rate on 200 benign queries. With small counts, report an interval, not a point:
+
+```python
+from math import sqrt
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+print(wilson(4, 200))   # (0.0078, 0.0503): "2% FPR" means somewhere from 0.8% to 5%
+print(wilson(0, 200))   # zero blocks still allows up to about 1.9%; rule of three: 3/200 = 1.5%
+```
+
+If your SLO is "under 1% over-blocking", 200 queries cannot prove it; you need on the order of a thousand.
+
+### Online metrics
+
+In production, track per guard, surface and language:
+
+block and flag rates (a jump means traffic, policy or the guard changed); appeal and overturn rates (overturns are confirmed false positives); guard latency p95 and error rate by fail mode; and degraded-turn rate by reason.
+
+<Callout type="tip">
+
+Report a guard the way Memory Agent's decision record does: what it catches by design, what was measured, what it cannot see, and the next step. "The guard is precise and narrow: every warning was fair, it misses about two thirds of made-up prices and every wrong-row error" is a stronger engineering statement than any single accuracy number.
+
+</Callout>
+
+<Production>
+
+**Failure modes.**
+
+- False positives blocking real users, made worse by low base rates: at 0.5% harmful traffic, a 2% FPR classifier with 95% recall is wrong in about four of every five blocks. Stacked guards compound: four independent guards at 2% FPR each block 1 − 0.98⁴ ≈ 7.8% of benign requests.
+- Guardrails bypassed by streaming: a check after the stream warns about text already read. Hold back per sentence, or retract only for low-severity harms.
+- Two-state guards that call "could not verify" a failure (Memory Agent v1: warnings on 36% of turns).
+- Guard errors silently failing open, and prompt-only "guards" with no code behind them (Answer Grader's name and roll-number instruction).
+
+**Cost.** Code guards are free, classifiers cheap; an LLM-judge guard is one extra call: per 1K requests, 1,000 × (input × price_in + output × price_out) / 1M. A re-ask loop costs 1 + f calls per turn. Optimistic execution wastes only the tokens generated before a rare block.
+
+**Latency.** Run input checks in parallel with generation and cancel on a block, except checks that change the prompt (PII redaction). Parallel calls compound the tail (two at 5% each: about 9.75%). Sentence holdback costs about one sentence of generation time.
+
+**Observability.** Block, flag, fix, re-ask and fallback rates per guard, per surface and per language; guard latency p95 and error rate by fail mode; appeal and overturn rates; the policy version on every verdict. Log the verdict and the reason, not the raw PII.
+
+**Security.** Guardrails are defence in depth, not a security boundary. Content classifiers can be phrased around; an LLM judge reads untrusted text and can be injected. The boundary is what the system can do: scoped data, narrow tools, approval and fail-closed checks on actions ([chapter 33](/33-security-prompt-injection/#the-lethal-trifecta)). Guard logs contain the very content you flagged: redact and restrict access.
+
+</Production>
+
+<Interview>
+
+<Q q="Design guardrails for a healthcare chatbot.">
+
+- **Scope and SLOs:** patient-facing symptom and medication information, not diagnosis. SLOs: zero dosing advice outside the formulary text, over-refusal on benign health questions at most 3%, guard p95 under 300 ms, crisis escalation within seconds.
+- **Input:** local PII redaction (names, phones, ABHA or Aadhaar numbers) before any third-party call; moderation with self-harm at a low threshold routed to escalation, not refusal; a scope classifier (information versus diagnosis request versus off-topic); an is-this-medical gate for images.
+- **Grounding:** RAG over vetted clinical sources only; cite-or-omit; abstain under a calibrated score floor with "talk to a doctor" copy.
+- **Output:** code checks that every dose, frequency and drug name appears in the cited source; a validated claim-level judge for the rest; a rule that drops anything that reads as a diagnosis; buffer or sentence holdback, never check-after-stream.
+- **Fallbacks and escalation:** fail-closed on dosing checks; emergency keywords trigger a fixed response with emergency numbers; staffed handoff with a context packet; kill switch.
+- **Observability and evals:** per-guard block and FP rates, appeal overturns, language slices; recall measured by corrupting stored answers (swap doses), FPR on sampled real questions with intervals.
+- **The trap:** "add a disclaimer and use a moderation API." Moderation does not catch a confidently wrong dose, and a disclaimer is not a control.
+
+</Q>
+
+<Q q="How do you guardrail streamed output?">
+
+- Name the problem: a check that runs on the finished text arrives after the user has read it.
+- Three designs: buffer fully then release (safe, loses streaming); **sentence holdback** (release one sentence behind generation, check each with a cheap guard); stream and retract (only for low-severity harms).
+- Cost of holdback: about one sentence of generation time (25 tokens at 50 tokens/s ≈ 0.5 s) and one guard call per sentence (about 16 for a 400-token answer), so the per-sentence guard must be code or a small local classifier.
+- Run the expensive judge on the full text after the stream, with its result attached as a warning or a retraction, as Memory Agent does with its number guard event.
+- Input checks do not have this problem: run them in parallel with generation and cancel on a block.
+- **The trap:** "we moderate the output", without saying when relative to the stream.
+
+</Q>
+
+<Q q="How do you reduce hallucinations in production?">
+
+- Ground: RAG, plus a hand-verified register of facts that change, with the superseded value named as superseded.
+- Constrain: structured claims with source ids, cite-or-omit, one or two numbers per sentence so citations are checkable.
+- Abstain: a score floor before generation calibrated on labelled answerable and unanswerable questions; abstain when no claim survives verification.
+- Verify cheapest first: citation ids, numbers and entities in code; then an NLI model or a validated claim-level judge; then code removes or replaces flagged claims within bounds.
+- Measure: faithfulness on a sample, abstain rate by reason, guard precision on replayed traffic and recall by corrupting stored answers. Name the blind spots (wrong-row numbers pass a string-match check).
+- **The trap:** "lower the temperature" (reduces variance, not error) or "tell the model not to hallucinate".
+
+</Q>
+
+<Q q="How do you measure guardrail false-positive rates?">
+
+- Treat the guard as a classifier: FPR = FP / (FP + TN), measured on benign traffic, ideally sampled from production and stratified by language and surface.
+- Label the sample by hand (or with a validated judge); every block on a benign item is a false positive.
+- Report intervals: 4 in 200 is 2% with a 95% interval of about 0.8% to 5%; zero in 200 still allows up to about 1.5 to 1.9%. Proving under 1% needs on the order of a thousand items.
+- Online: appeal and overturn rates, reviewer labels on a sample of blocks, and block-rate jumps per release.
+- Compute the precision implication with the base rate, and remember stacked guards compound FPR.
+- Replay new guard versions over stored traffic before shipping, as Memory Agent did (36% of turns warned to 1.3%).
+- **The trap:** quoting the vendor's accuracy number, or measuring only recall on a red-team set.
+
+</Q>
+
+<Q q="Should a guardrail fail open or fail closed?">
+
+- Decide per guard, in config, by harm asymmetry: fail-closed where a miss is severe and irreversible (money movement, dosing, other users' data); fail-open where the guard is a quality check and blocking hurts more than a rare miss.
+- Set an explicit timeout so "the guard is slow" becomes a decision, not a hang.
+- Count guard errors by fail mode: a fail-open guard that errors 10% of the time is off 10% of the time.
+- Fail-closed needs a good fallback (template, abstain, escalation), or it turns a guard outage into a product outage.
+- **The trap:** not having decided, so the behaviour is whatever the exception handler happens to do.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal.** Add input PII redaction and an output groundedness check to Scheme Assistant's RAG path, the check running in parallel with the rest of the response work, and measure added p95 latency and false-positive rate on 200 benign queries. Offline only: a scripted generator (Scheme Assistant's tests already script `LLMOutput`) and a local judge (a small instruct model in Ollama, or a small NLI cross-encoder from Hugging Face).
+
+**Where.** `~/scheme-assistant`, on a branch. The question text is written unredacted into `query_log` (`src/app/core/answer_query.py`), so this is a real fix. The core RAG is mostly Chiman's: keep your changes in a new module with small call sites.
+
+**Steps.**
+
+1. **Redactor.** `src/app/core/pii.py`: Aadhaar with the Verhoeff check, PAN, Indian mobile numbers, email, normalising Devanagari digits and stray spaces first. Typed, HMAC-keyed placeholders; no vault for the log path (it should never be reversible there).
+2. **Unit tests.** 30 positive cases (formats, spacing, Devanagari digits) and 30 near-misses (12-digit order ids with bad checksums, scheme codes, wage amounts, dates, Act section numbers). Precision and recall on these must be 100% before step 3.
+3. **Wire it in.** Redact before `query_log` and before the provider call; confirm the existing retrieval eval does not move.
+4. **Groundedness check.** For each surviving claim, ask the local judge or NLI model whether its cited passages entail it. Run it concurrently with the other post-generation work, fail-open with a 400 ms timeout, and record a `grounded` verdict per claim in the audit row (flag only, no blocking yet).
+5. **Benign set.** 200 citizen questions in Hindi, Hinglish and English (from the eval set and critic transcripts), 40 of them with legitimate numbers (wages, days, dates).
+6. **Measure.** Added p50 and p95 per guard (generator mocked with a realistic sleep, so you time the guards, not the provider), and the FPR of each guard with a Wilson interval.
+7. **Write it up.** `docs/guardrails.md`: what each guard catches by design, what you measured, each fail mode, the blind spots.
+
+**Definition of done.** No raw Aadhaar, PAN or phone number reaches `query_log` in the test suite; redactor tests pass; the report shows added p95 for each guard and both FPRs with intervals on 200 queries; one deliberately corrupted claim (a changed wage) is flagged by the groundedness check, and the existing tests still pass.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent, your best guardrail story (`src/guard.ts`, `DECISIONS.md` #7, all yours).** A deterministic number guard with three outcomes: verified, flagged, unverifiable. The v1 → v2.1 replay over 545 stored turns (`eval/replay-guard.ts`) took warnings from 36% of turns to 1.3%, with all 8 flags fair on hand review. Recall measured by corrupting 1,630 stored prices (`eval/guard-recall.ts`): 31.2% sit behind complete excerpts, and wrong-row errors are never caught by design. It runs after the stream as a warning, so it costs no time. Gaps: no moderation; full user text stored unredacted in `src/memory.ts`.
+- **Chat Insights, the bounded re-ask loop (`backend/src/lc/domain/guard.js`, `services/chatService.js`, yours).** A pure, ordered rule set where each rule is a fix, a retry or a flag; one re-ask carrying the violation list (hotter, with the previous reply shown, for verbatim repeats); a schema-valid template fallback marked `degraded`; a kill switch read per request; Gemini safety blocks typed as refusals. Gap: table-driven unit tests, but no measured false-positive rate on real model replies.
+- **Answer Grader, guards at both ends (yours).** Input: `TASK 0` in `backend/vision.py` rejects non-answer images, and `backend/question_guard.py` strips chatbot-style instructions typed into the question box, with a test that keeps real "Evaluate…" questions. Output: `backend/verify.py` runs a claim check in parallel with the evaluation (about Rs 0.2, no wait) and `remove_flagged` edits within a word-count floor, substituting register wording where a fact settles the claim (the module docstring still says it "never writes a replacement": fix that before someone reads it aloud to you); `backend/facts.py` names superseded values. Gap: PII exclusion is a prompt line only.
+- **Scheme Assistant, attribute carefully.** The citation-id check in `verify()` (`src/app/core/generate.py`), the scope pre-filter (`core/scope.py`) and `phone_hmac` are Chiman's code. Your lines in `verify()` (775 to 798 at the pin) add the untrusted-source number, amount and pay-word checks, and the numeric-support check below them is shared. Say "our pipeline drops any claim whose number is not in its cited clauses". Gaps: no moderation; question text unredacted in `query_log`.
+- **Certificate Assistant (`app/backend/messages.py`, yours).** `check_entities` requires every number, id and name-like token in a generated message to trace to the source record, with a test that catches an invented certificate number and fee.
+- **Health Triage (a teammate's code; known from the evidence file only, no local copy).** The medical-image flow raises a typed `NotMedicalImageError` unless the model's JSON says `is_medical` is true: an input-type scope gate. Cite it as team work.
+
+</YourProject>

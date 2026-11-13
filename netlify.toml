@@ -1,0 +1,32 @@
+# Built locally and deployed with the Netlify CLI (no git remote):
+#   npm run build && npx netlify-cli deploy --dir=dist --prod
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "SAMEORIGIN"
+
+# Hashed build assets never change: cache them for a year.
+[[headers]]
+  for = "/_astro/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Mirrored third-party library chapters stay out of search (the originals should rank).
+[[headers]]
+  for = "/library/*/*"
+  [headers.values]
+    X-Robots-Tag = "noindex, follow"
+
+[[headers]]
+  for = "/search-index.json"
+  [headers.values]
+    X-Robots-Tag = "noindex"

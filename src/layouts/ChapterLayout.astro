@@ -1,0 +1,100 @@
+---
+import Base from './Base.astro';
+import SiteHeader from '../components/SiteHeader.astro';
+import SiteNav from '../components/SiteNav.astro';
+import Palette from '../components/Palette.astro';
+import Toc from '../components/Toc.astro';
+import InYourCode from '../components/InYourCode.astro';
+import ReadAlongside from '../components/ReadAlongside.astro';
+import { evidenceForChapter } from '../lib/data';
+import { chapterHref, parts, stars, weightWord, type Chapter } from '../lib/outline';
+import { qaForChapter } from '../lib/questions';
+import { SITE_NAME, AUTHOR, abs, breadcrumbs, faqPage } from '../lib/seo';
+
+interface Props { chapter: Chapter; summary: string; readingTime?: string; written: boolean; prev?: Chapter; next?: Chapter }
+const { chapter, summary, readingTime, written, prev, next } = Astro.props;
+const order = Number(chapter.id);
+const part = parts.find((p) => p.id === chapter.part)!;
+const items = evidenceForChapter(order);
+const sections = chapter.sections.map((s) => ({ n: s.id.slice(3), slug: s.slug, title: s.title }));
+const orphans = items.filter((e) => e.section !== chapter.id && !chapter.sections.some((s) => s.id === e.section));
+if (orphans.length) console.warn(`[ch ${chapter.id}] ${orphans.length} evidence ids match no section: ${[...new Set(orphans.map((e) => e.conceptId))].join(', ')}`);
+const closing = [
+  { id: 'in-production', label: 'In production' }, { id: 'interview', label: 'Interview questions' },
+  { id: 'apply-it', label: 'Apply it' }, { id: 'your-project', label: 'Explain it through your projects' },
+  { id: 'read-alongside', label: 'Read alongside' },
+];
+const site = Astro.site;
+const url = abs(site, chapterHref(chapter));
+const qa = written ? qaForChapter(chapter.id) : [];
+const minutes = readingTime?.match(/\d+/)?.[0];
+const jsonLd: object[] = [
+  {
+    '@type': ['TechArticle', 'LearningResource'], '@id': `${url}#article`, url,
+    headline: chapter.title, name: `${chapter.id}. ${chapter.title}`, description: summary,
+    author: AUTHOR, publisher: AUTHOR, inLanguage: 'en',
+    image: abs(site, '/og.png'),
+    isPartOf: { '@type': 'Course', '@id': `${abs(site, '/')}#course`, name: SITE_NAME },
+    position: order,
+    learningResourceType: 'Chapter', educationalLevel: 'Intermediate',
+    teaches: chapter.sections.map((s) => s.title),
+    about: [{ '@type': 'Thing', name: 'AI engineering' }, { '@type': 'Thing', name: chapter.title }],
+    hasPart: chapter.sections.map((s) => ({ '@type': 'WebPageElement', name: s.title, url: `${url}#${s.slug}` })),
+    ...(minutes ? { timeRequired: `PT${minutes}M` } : {}),
+  },
+  breadcrumbs(site, [[SITE_NAME, '/'], [`Part ${chapter.part}: ${part.title}`, '/'], [chapter.title, chapterHref(chapter)]]),
+  ...(qa.length ? [{ ...faqPage(qa), '@id': `${url}#interview` }] : []),
+];
+---
+<Base title={`${chapter.id} ${chapter.title} · AI Engineering from First Principles`} description={summary} ogType="article" jsonLd={jsonLd}>
+  <SiteHeader crumb={`Part ${chapter.part} · Chapter ${chapter.id}`} />
+  <SiteNav current="chapter" />
+  <div class="progress" role="presentation"><span class="progress-fill"></span></div>
+
+  <div class="ann-shell" data-chapter={chapter.id}>
+    <aside class="rail">
+      <div class="rail-inner">
+        <a class="rail-back" href="/">← All chapters</a>
+        <div class="rail-scroll"><Toc chapter={chapter} closing={closing} /></div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <header class="chapter-head">
+        <p class="eyebrow">
+          <span class="eyebrow-num">Chapter {chapter.id}</span>
+          <span>Part {chapter.part}, {part.title}</span>
+        </p>
+        <h1 class="chapter-title">{chapter.title}</h1>
+        <p class="chapter-summary">{summary}</p>
+        <p class="chapter-meta">
+          <span title={`Interview and industry weight: ${weightWord(chapter.weight)}`}><span class="chapter-stars" aria-hidden="true">{stars(chapter.weight)}</span> {weightWord(chapter.weight)}</span>
+          {readingTime && <span>{readingTime} read</span>}
+          <span>{items.length} examples from your repos</span>
+        </p>
+        {!written && <p class="stub" style="margin-top: 20px">This chapter is not written yet. Below is its outline from the syllabus: sections, production concerns, interview questions and the exercise. Your code already shows in the margin.</p>}
+      </header>
+
+      <article class="prose" data-chapter-id={chapter.id}>
+        <slot />
+        <ReadAlongside chapter={chapter} />
+      </article>
+
+      <nav class="chapter-nav" aria-label="Chapter navigation">
+        {prev ? <a class="nav-card" href={chapterHref(prev)} rel="prev"><span class="nav-dir">← {prev.id}</span><span class="nav-title">{prev.title}</span></a> : <span></span>}
+        {next ? <a class="nav-card is-next" href={chapterHref(next)} rel="next"><span class="nav-dir">{next.id} →</span><span class="nav-title">{next.title}</span></a> : <span></span>}
+      </nav>
+    </main>
+
+    <InYourCode order={order} sections={sections} items={items} titles={{}} />
+  </div>
+  <div class="sheet-scrim" data-scrim hidden></div>
+  <Palette />
+</Base>
+
+<script>
+  import { initInYourCode } from '../lib/in-your-code';
+  import { initQuestions } from '../lib/progress';
+  initInYourCode();
+  initQuestions();
+</script>

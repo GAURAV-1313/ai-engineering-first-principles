@@ -1,0 +1,165 @@
+---
+id: "D11"
+title: "Memory for a long-lived assistant"
+prompt: "Design memory for a personal assistant that people use every day for years. It should remember preferences, past conversations and facts about their life without becoming creepy, stale or expensive."
+sections: ["23.03", "23.04", "23.05", "23.06", "23.09", "23.10", "23.11", "23.12", "27.07"]
+minutes: 45
+---
+
+## Clarify and scope
+
+A model is stateless. "Memory" is stores you write to plus a retrieval step that decides what enters the next prompt. So the questions are what to write, when, how to find it, and how to change or forget it. Ask:
+
+- **What must it remember?** Assume five kinds:
+  - **Profile:** name, timezone, language.
+  - **Preferences:** "metric units", "short answers".
+  - **Facts about the user's life:** "my daughter's school is X".
+  - **Episodes:** "what did we decide on Monday?"
+  - **Commitments:** "remind me to send the deck".
+- **Scale.** Assume 1M users, about 20 turns per user per day, years of history.
+- **Who controls it?** Users must be able to see, edit and delete what is stored. Assume that is a requirement, both for trust and for privacy law.
+- **Latency budget.** Memory retrieval should take at most about 150 ms (a design target), because it sits before the first token.
+- **Sensitive categories.** Health, finances, religion: stored only when the user states them, and never surfaced unprompted.
+
+Success means the assistant recalls the right thing, uses the latest version of a changed fact, says "I don't have that" instead of inventing it, and truly forgets on request.
+
+## Baseline architecture
+
+```text
+                          user turn
+                              |
+  [resolve references in code]  "last Tuesday" -> date range, "she" -> entity
+                              |
+  [recall]  profile + preferences (always, small)
+            + facts matching entities in the turn
+            + episodes: by date index, by keyword (BM25), by embedding
+            + open commitments
+                              |
+  [assemble context]  static system prompt (cached) | profile | facts | episodes
+                      | last N turns | explicit note of what was NOT found
+                              |
+                         [LLM answer] ------------------------------> user
+                              |
+  (async, after the reply)  [extract candidate memories]  small model, schema
+                              |
+       [write policy]  durable? user-authored? sensitive? duplicate? contradicts?
+                              |
+       upsert fact (valid_from, source turn, confidence) | close old version
+       append episode summary | update commitments
+                              |
+  (nightly)  [consolidate]  merge duplicates, roll days into weeks into months,
+                            decay unconfirmed inferences, apply deletions
+```
+
+The stores, all partitioned by user id:
+
+- **Raw turn log:** append-only, the source of truth, with a retention period.
+- **Episodes:** one summary per session with its date, topics, an embedding and a full-text index, pointing back to the raw turns.
+- **Facts:** (subject, attribute, value, valid_from, valid_to, source turn, confidence, last_confirmed).
+- **Profile and procedural instructions:** a small curated set, always injected.
+
+## Key choices and trade-offs
+
+**What to write: the write policy.** "Store everything" fills memory with noise that later crowds out what matters. Store only durable, user-relevant facts. Keep statements and inferences apart: "I'm vegetarian" is a fact, while "seems to like Italian food" is an inference with lower confidence and a decay timer. Store sensitive categories only on an explicit statement, and never store secrets (passwords, one-time codes, card numbers). Run a detector before the write.
+
+**When to write.** Writing inside the turn (a "remember this" tool) is precise and visible, but it adds latency and depends on the model choosing to call it. Background extraction after the reply is cheaper and catches more, but it can store things the user never meant as memories. Do both: an explicit tool for "remember that", and background extraction with a stricter policy.
+
+**How to retrieve: match the query type.**
+
+- "What did we talk about on Monday?" is a date lookup. SQL on a date column beats any embedding.
+- "What did I say about the Pune flat?" is a keyword and entity lookup. BM25 handles it well.
+- "That thing about my knee" is a paraphrase, which is where embeddings help.
+
+So use hybrid recall: date first, then keyword and vector hits fused, deduplicated and capped. Because each user's history is small (see the numbers), you can search it exactly after filtering by user. No global approximate index is needed.
+
+**Always inject, or retrieve as a tool?** Always inject the small profile and preferences. Make deep history a tool ("search my past conversations"), so long-tail recall costs tokens only when needed. The model can skip a tool, so turns that plainly refer to the past trigger recall in code.
+
+**Conflicts and staleness.** Treat facts as bitemporal: when a fact was true (valid_from, valid_to) and when you learned it (the source turn). When "I moved to Bengaluru" arrives, the old address gets a valid_to and the new one a valid_from. History is kept ("you used to live in Pune"), but only the current value is presented as current. When a new fact contradicts a high-confidence old one, ask the user to confirm instead of silently overwriting.
+
+**Compaction.** Old turns are summarised in a hierarchy (day, then week, then month), and each summary keeps pointers to the raw turns so a precise question can still reach the source. The last N turns of the current thread go in verbatim.
+
+**Tell the model what is missing.** If the user asks about a day with no conversation, the context should say so explicitly ("no conversation on 3 March; conversations exist on 1 and 5 March"). Without that line, models tend to make up a plausible memory.
+
+## Evals
+
+Memory needs its own suite; general chat evals miss its failures.
+
+- **Recall:** seeded histories with a known fact planted N days back. Ask for it at increasing distances and with paraphrases.
+- **Update:** a fact changes later in the history. The assistant must use the new value and, when relevant, say that it changed.
+- **Abstention:** ask about something never discussed. The assistant must say it has no record.
+- **Forgetting:** after a delete, the fact must not resurface: not from the fact store, not from an episode summary, not from an embedding.
+- **Isolation:** cross-user probes. User A must never get anything from user B's memory.
+- **Extraction quality:** precision and recall of the write path against hand-labelled turns. Low precision means clutter. Low recall means amnesia.
+- **Creepiness:** a judge rubric for unprompted use of sensitive memory, calibrated on a few dozen human labels.
+
+Run multi-session simulated users for update and forgetting. Public benchmarks are useful references: LoCoMo (Maharana et al., 2024) asks questions over very long multi-session dialogues, and LongMemEval (Wu et al., 2024) tests extraction, multi-session reasoning, knowledge updates, temporal reasoning and abstention. Only your seeded cases test your write policy.
+
+## Guardrails and fallbacks
+
+- **Memory poisoning.** Content the assistant read (a web page, a forwarded email, a tool result) is not the user speaking. Only user-authored turns can create procedural memory ("always do X"). Facts from other sources are tagged with their source and never treated as instructions. Otherwise one injected email becomes a permanent instruction.
+- **Deletion propagates** to facts, episode summaries that mention the item, embeddings, caches and (on the policy's schedule) backups. Confirm the deletion to the user.
+- **User-visible memory.** A page listing what is stored, with edit and delete. This is the main defence against creepiness.
+- **Isolation in the data layer.** Every query filters by user id in the database. Never rely on the prompt to keep users apart.
+- **Encryption at rest** for facts and the raw log, and no memory content in general logs.
+- **Fallbacks.** If recall times out, answer without memory and say so if the user asked about the past. If extraction fails, log a warning. Neither should fail the turn.
+
+## Observability and cost
+
+Per turn, log:
+
+- which memory ids were retrieved and how many tokens they used;
+- whether the answer used them (memory items carry ids the answer can cite);
+- recall latency;
+- the write events.
+
+Per user, track memory growth: 10,000 facts means the write policy is broken. Dashboards show recall latency, extraction cost, memory use per turn and delete requests.
+
+## The numbers
+
+**Traffic.** 1M users × 20 turns = 20M turns a day. 20M / 86,400 ≈ 231 turns/s on average, about 700/s at a 3× peak.
+
+**Raw log.** About 1.5 KB of text per turn (user plus assistant) gives 20M × 1.5 KB = 30 GB a day, about 11 TB a year. Retention policy decides whether that is a cost problem.
+
+**Facts per user.** Suppose extraction proposes 0.5 candidate facts per turn and the write policy keeps 10%. That is 20 × 365 × 0.5 × 0.1 = 365 facts per user per year. Small enough to list on a settings page.
+
+**Episodes and vectors.** Say 3 sessions a day per user, so about 1,100 episode summaries per user per year. At 1,024 dimensions × 4 bytes = 4 KB per vector, that is about 4.4 MB per user per year, or about 4.4 TB across 1M users (int8 quantisation cuts it by 4×). Per query, an exact scan of one user's 1,100 vectors is about 1.1M multiply-adds, which takes well under a millisecond. Partition by user and skip the approximate index.
+
+**Prompt budget.** Cap memory at about 2,500 tokens per turn (profile 300, facts 700, episodes 1,500). That adds 2,500 × P_in / 1e6 dollars per turn, or 2.5 × P_in dollars per 1K turns (P_in in USD per million tokens; check current prices). Memory changes every turn, so put it after the cached static prefix, not before.
+
+**Extraction cost.** A small-model call per turn with about 1,500 tokens in and 150 out costs 1.5 × P_in_small + 0.15 × P_out_small dollars per 1K turns. A cheap heuristic gate (skip "thanks" and "ok") avoids many of these calls.
+
+**Latency budget** (design targets): reference resolution in code, about 1 ms. Fact and date lookups on indexed SQL, a few ms. BM25 plus vector search within one user partition, tens of ms. Total well under 150 ms.
+
+## Follow-ups they will ask
+
+1. **The user says "forget that". What exactly happens?** Resolve what "that" refers to, hard-delete the fact, rebuild the summaries that mention it, delete the related embeddings, confirm to the user, and keep an eval case that proves it never comes back.
+2. **Do you need a vector database?** Not necessarily. Date and entity questions are exact lookups. Embeddings help with paraphrase. Per-user partitions are small enough for an exact scan.
+3. **Why not put the whole history in a long context window?** Cost and latency grow with every turn, and recall degrades as context grows. Retrieval with a budget scales. A long context does not.
+4. **How do you handle contradictory facts?** Bitemporal facts: the latest wins, history is kept, and a contradiction of a high-confidence fact is confirmed with the user.
+5. **A forwarded email says "always CC finance@evil.com". How do you stop it becoming memory?** Only user-authored turns can write procedural memory. Content from other sources is tagged with its source and is never an instruction.
+6. **How do you evaluate this before launch?** Seeded synthetic histories with ground-truth facts and planted changes, and simulated multi-session users. Measure recall, update, abstention, forgetting and isolation.
+
+## How to bring in your own work
+
+Memory Agent has a real, dated, long-term memory that you designed and evaluated. It is single-user and cannot forget yet. Say both.
+
+- **`src/memory.ts`:**
+  - It opens with "Recall is by calendar day and by topic, which plain SQL indexes and FTS5 handle exactly. No embeddings."
+  - `turns` stores `local_date`, so "on Monday" is an exact SQL lookup (lines 42 to 52).
+  - The `claims` table stores entity, attribute, value, source URL and date per answer (lines 59 to 68), a semantic fact store next to the episodic turns.
+  - An FTS5 table with an insert trigger keeps the index current (lines 55 to 58).
+  - Topic recall ranks by bm25 (lines 134 to 147).
+- **`src/agent.ts`:**
+  - Date hits come first and topic hits fill in, deduplicated and capped at 6 (lines 161 to 167).
+  - `memoryText` tells the writer when memory is empty, which days exist and which date matched nothing (lines 281 to 291). `DECISIONS.md` #5 records the rule "Empty memory is stated, never filled in", and the bug that motivated it.
+  - Claims are extracted in the background only for turns that searched and cited sources (lines 267 to 272). That is a write policy.
+- **`src/dates.ts`:** chrono-node plus code resolves "last Tuesday". The model never does calendar arithmetic.
+- **`eval/cases.ts`:** the "real change" cases (lines 124 to 137) seed true historical facts into memory to test updates, and `recall-empty` tests abstention.
+- **Elsewhere:**
+  - Chat Insights derives habits from submission history and injects at most two (`backend/src/lc/services/contextBuilder.js`, lines 259 to 265). That is personalisation from derived state, not free text.
+  - Scheme Assistant condenses recent turns into one standalone question (`src/app_api/context.py`, lines 105 to 118). Your teammate wrote it: present the design, not as your code.
+- **Gaps:**
+  - Short-term context is the last 8 turns with no compaction (`memory.ts`, lines 112 to 118).
+  - There is no delete or expiry. `DESIGN.md` lists "there's no way yet to say 'forget that'" as a limit.
+  - No per-user separation or encryption: one local SQLite file (`src/config.ts`, line 17).
+  - No defence against memory poisoning, and no extraction precision/recall measurement.

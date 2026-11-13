@@ -1,0 +1,228 @@
+[
+  {
+    "n": 1,
+    "term": "Tokenization (BPE) and why token count drives cost and latency",
+    "sections": [
+      "02.03",
+      "02.09"
+    ],
+    "answer": "Models read tokens, not characters. BPE starts from bytes and repeatedly merges the most frequent adjacent pair in its training text until the vocabulary reaches a target size, so common words become one token and rare strings split into several. Everything is billed and computed per token: cost = input tokens x input price + output tokens x output price. Latency grows with prompt length (prefill) and output length (decode, one token per step). English runs roughly four characters per token; Hindi and code often need noticeably more tokens for the same content, so the same feature costs more. Count with the provider's tokenizer or usage fields, never len(text)."
+  },
+  {
+    "n": 2,
+    "term": "Self-attention and its O(n²) cost",
+    "sections": [
+      "05.02",
+      "05.09"
+    ],
+    "answer": "Each token produces a query, key and value vector. Attention scores every query against every key with a scaled dot product, applies softmax and takes a weighted sum of the values, so any token can pull information from any earlier token in one step. The cost is the n by n score matrix: work grows with n squared, so doubling the context roughly quadruples attention compute. FlashAttention removes the n-squared memory by tiling, not the n-squared compute. In practice this is why long prompts slow prefill, why some providers charge more above a context threshold, and why you retrieve a few relevant passages instead of stuffing the whole corpus."
+  },
+  {
+    "n": 3,
+    "term": "Prefill vs decode",
+    "sections": [
+      "10.01",
+      "10.04"
+    ],
+    "answer": "Prefill runs the whole prompt through the model in one parallel pass and builds the KV cache. It is compute-bound and sets time to first token, roughly in proportion to prompt length. Decode then produces one token per forward pass, re-reading the weights and the growing KV cache each step, so it is memory-bandwidth-bound and sets time per output token. Total latency is roughly TTFT + output tokens x TPOT. The levers differ: shorter prompts and prefix caching cut prefill; fewer output tokens, smaller or quantized models and speculative decoding cut decode. Batching raises throughput but can raise each user's latency."
+  },
+  {
+    "n": 4,
+    "term": "KV cache and its memory math",
+    "sections": [
+      "10.02",
+      "10.13"
+    ],
+    "answer": "Each decode step needs the keys and values of every earlier token at every layer, so the KV cache stores them instead of recomputing. Size per token = 2 (K and V) x layers x KV heads x head dim x bytes per value. With 32 layers, 8 KV heads, head dim 128 and fp16, that is 2 x 32 x 8 x 128 x 2 = 128 KiB per token, so one 32K-token sequence needs about 4 GiB. That memory, not compute, caps how many concurrent requests fit on a GPU. Levers: grouped-query attention, KV-cache quantization, PagedAttention to avoid fragmentation, and sharing cached prefixes across requests."
+  },
+  {
+    "n": 5,
+    "term": "Context windows and lost in the middle",
+    "sections": [
+      "12.10",
+      "27.03"
+    ],
+    "answer": "The context window is the most tokens one call can hold, prompt plus output. A large window is not the same as a usable one. Liu et al. 2023, Lost in the Middle, found multi-document QA accuracy was best when the relevant passage sat at the start or end of the context and dropped when it sat in the middle, and later work on context rot shows quality falls as irrelevant tokens pile up. Every token is also paid for. So put instructions first, keep retrieval to a few reranked passages, place the strongest evidence near the edges, and compact long histories rather than trusting the window size."
+  },
+  {
+    "n": 6,
+    "term": "Sampling: temperature and top-p",
+    "sections": [
+      "04.04"
+    ],
+    "answer": "The model outputs logits over the vocabulary, and softmax(logits / T) turns them into probabilities. A temperature T below 1 sharpens the distribution toward the top token, above 1 flattens it, and T = 0 is effectively greedy. Top-p keeps the smallest set of tokens whose cumulative probability reaches p, for example 0.9, renormalises and samples from that set, which cuts the long tail of unlikely tokens; top-k keeps a fixed count instead. Use low temperature for extraction, classification and judges, higher for brainstorming. Even T = 0 is not perfectly repeatable, and some newer models reject these parameters, so put decisions that must be repeatable in code."
+  },
+  {
+    "n": 7,
+    "term": "Embeddings and vector similarity",
+    "sections": [
+      "03.03",
+      "03.05"
+    ],
+    "answer": "An embedding model maps text to a fixed-length vector, trained contrastively so texts with similar meaning land close together. Similarity is usually cosine, dot(a, b) / (|a| |b|); for unit-normalised vectors cosine equals the dot product and gives the same ranking as L2 distance. A bi-encoder embeds queries and documents separately, so documents are embedded once offline and search becomes a nearest-neighbour lookup. Trade-offs: dimensions drive memory (1,024 float32 dimensions is 4 KB per vector), and vectors are only comparable within one model and version, so store the model id with every vector and re-embed the whole corpus when you switch."
+  },
+  {
+    "n": 8,
+    "term": "Chunking strategies",
+    "sections": [
+      "17.04",
+      "17.05"
+    ],
+    "answer": "Chunking splits documents into retrievable units, because one vector for a long document blurs its topics and the prompt can only hold a few passages. The baseline is fixed-size chunks of a few hundred tokens with some overlap. Structure-aware chunking splits on headings, sections or clauses and keeps tables and lists whole. Small-to-big indexes small chunks but hands the model the parent section. The trade-off: small chunks match precisely but lose context, large chunks keep context but dilute the vector and cost prompt tokens. Chunk count is about document tokens / (size - overlap). Pick the size by measuring recall on your own questions."
+  },
+  {
+    "n": 9,
+    "term": "Hybrid BM25 + dense retrieval",
+    "sections": [
+      "15.04",
+      "15.09"
+    ],
+    "answer": "BM25 scores exact term matches, weighted by how rare the term is (IDF), with term frequency saturating and long documents normalised; it is strong on identifiers, codes, names and rare words. Dense retrieval matches meaning and paraphrase but can miss an exact section number or product code. Hybrid search runs both legs in parallel and fuses the lists. Reciprocal rank fusion scores each document as the sum over legs of 1 / (k + rank), with k around 60, which avoids comparing incompatible score scales. It usually helps on mixed queries, but measure it: on a question-to-question corpus a BM25 leg can lower nDCG."
+  },
+  {
+    "n": 10,
+    "term": "Reranking",
+    "sections": [
+      "15.10",
+      "17.08"
+    ],
+    "answer": "First-stage retrievers, BM25 or a bi-encoder, score query and document separately, which is fast but coarse. A cross-encoder reranker reads the query and one candidate together through a transformer and outputs a relevance score. That is much more precise, but it costs one forward pass per pair, so it cannot scan the corpus. The pattern: retrieve a wide set of 50 to 100 candidates, rerank them, keep 5 to 10 for the prompt. Compute per query is roughly 2 x reranker parameters x candidates x pair tokens, which sets your GPU bill and adds tens of milliseconds or more. LLM listwise reranking trades more latency for quality."
+  },
+  {
+    "n": 11,
+    "term": "Recall@k, MRR and nDCG",
+    "sections": [
+      "15.11"
+    ],
+    "answer": "Recall@k is the share of relevant documents found in the top k. It is the metric for the first stage, because a reranker cannot recover what was never retrieved. Precision@k is the share of the top k that is relevant. MRR averages 1 / rank of the first relevant result over queries, which suits tasks with one right answer. nDCG@k uses graded relevance with a log discount: DCG is the sum of (2^rel - 1) / log2(rank + 1), divided by the DCG of the ideal ordering. All of them need labelled judgments, ideally pooled blind from several systems, on a few hundred real queries."
+  },
+  {
+    "n": 12,
+    "term": "RAG vs fine-tuning vs prompting",
+    "sections": [
+      "17.13",
+      "09.01"
+    ],
+    "answer": "Start with prompting: cheapest and instant to change. Add RAG when the model lacks knowledge, especially private, changing or citable facts; the knowledge lives in an index you can update in minutes and trace to sources. Fine-tune when the problem is behaviour rather than knowledge: a strict format or style, a narrow classifier, or distilling a large model's outputs into a small cheap one. Fine-tuning is a poor way to add facts: they are slow to update, cannot be cited and can still be hallucinated. Long context suits small, stable corpora but is paid on every call. The options combine; let evals decide."
+  },
+  {
+    "n": 13,
+    "term": "LoRA and QLoRA",
+    "sections": [
+      "09.05"
+    ],
+    "answer": "Full fine-tuning updates every weight and needs memory for weights, gradients and optimizer state, roughly 16 bytes per parameter with Adam in mixed precision. LoRA freezes the base model and learns a low-rank update for chosen weight matrices, W + BA, where B is d x r and A is r x d with rank r around 8 to 64, so trainable parameters per matrix fall from d squared to 2dr, often well under 1% of the model. QLoRA also stores the frozen base in 4-bit NF4 while training the adapters in higher precision, so a 7B model fits on one consumer-class GPU. Adapters are small and swappable."
+  },
+  {
+    "n": 14,
+    "term": "Quantization: INT8/INT4 trade-offs",
+    "sections": [
+      "10.08",
+      "09.03"
+    ],
+    "answer": "Quantization stores weights, and sometimes activations or the KV cache, in fewer bits: FP16 is 2 bytes per parameter, INT8 is 1 and INT4 is 0.5. A 70B model drops from about 140 GB to about 35 GB of weights in 4-bit, which changes how many GPUs you need. Because decode is memory-bandwidth-bound, fewer bytes also mean faster tokens. GPTQ and AWQ use calibration data to protect the weights that matter; GGUF targets CPUs and laptops. The cost is quality: 8-bit is usually close to lossless, 4-bit often acceptable, lower degrades, and the loss is uneven across tasks. Rerun your own evals on the quantized model."
+  },
+  {
+    "n": 15,
+    "term": "RLHF vs DPO",
+    "sections": [
+      "07.05",
+      "07.06"
+    ],
+    "answer": "Both teach a model human preferences from pairs of responses where a person preferred one. RLHF first trains a reward model on those pairs, then optimises the policy with reinforcement learning, usually PPO, to maximise reward minus a KL penalty that keeps it near the reference model. It works but is heavy: policy, reference, reward and value models in memory, and touchy training. DPO (Rafailov et al. 2023) shows the same objective can be optimised directly with a classification-style loss on the log-probability ratios of chosen versus rejected answers, with no reward model or RL loop. DPO is simpler and cheaper; RL still wins with verifiable rewards."
+  },
+  {
+    "n": 16,
+    "term": "Hallucination: causes and mitigations",
+    "sections": [
+      "04.10",
+      "29.06"
+    ],
+    "answer": "A model is trained to produce plausible text, not true text, so when it lacks knowledge it still writes fluently; post-training can reward confident answers and sampling adds variance. In applications the causes are missing or stale knowledge, retrieval that brought the wrong passage, long noisy context, and prompts that demand an answer. Mitigations stack: ground answers in retrieved sources with citations, give the model a legal way to abstain, verify in code that cited ids exist and numbers appear in the source, add a second checking call for named facts, keep temperature low for facts, and track faithfulness on an eval set. You reduce it; you never eliminate it."
+  },
+  {
+    "n": 17,
+    "term": "Structured output and tool calling",
+    "sections": [
+      "13.02",
+      "13.09",
+      "21.02"
+    ],
+    "answer": "Structured output makes the model return data that matches a schema. JSON mode only guarantees valid JSON; schema-enforced or constrained decoding masks tokens that would break the schema, so fields and types hold, but you still validate meaning in code with Pydantic or Zod. Tool calling is the same mechanism aimed at actions: you describe functions with JSON schemas, the model returns a call with arguments, your code runs it and sends back the result. Use structured output when one call should produce data; use tools when the model must choose actions or fetch information mid-turn. Every tool definition costs input tokens on every call."
+  },
+  {
+    "n": 18,
+    "term": "Agent vs workflow",
+    "sections": [
+      "22.01"
+    ],
+    "answer": "In a workflow your code owns the control flow: fixed steps such as classify, retrieve, generate and verify, with LLM calls inside them. In an agent the model decides the next step in a loop, choosing tools until it judges the task done. Workflows are cheaper, faster, easier to test and easy to bound. Agents handle open-ended tasks where the number and order of steps cannot be known in advance, at the price of variable latency and cost and new failure modes. Anthropic's Building Effective Agents (2024) gives the rule: use the simplest design that works, and add autonomy only where evals show a fixed pipeline failing."
+  },
+  {
+    "n": 19,
+    "term": "Agent loops and their failure modes",
+    "sections": [
+      "22.05",
+      "22.13"
+    ],
+    "answer": "The loop: call the model with the conversation and the tool definitions; if it returns tool calls, run them, append the results and call again; stop on a final answer or when a budget runs out. Failure modes: repeating the same call, swallowed or misread tool errors, context growing until quality and cost degrade, wrong tool or arguments, declaring success too early, and side effects repeated on retry. Defences: hard caps on steps, tokens, cost and wall time; errors returned to the model as readable results; idempotency keys; trimmed tool output; checkpoints for resuming; human approval before irreversible actions; and evals that grade the trajectory, not only the final answer."
+  },
+  {
+    "n": 20,
+    "term": "Agent memory",
+    "sections": [
+      "23.03",
+      "23.04"
+    ],
+    "answer": "Models are stateless, so memory is whatever you put back into the context. Short-term memory is the conversation buffer, cut to a window or compacted into a running summary as it grows. Long-term memory keeps facts or episodes outside the model, in a database, search index, vector store or files, and retrieves the relevant ones each turn. A common split is episodic (what happened, with dates), semantic (facts about the user or world) and procedural (how to do things, often the prompt). The hard parts are the write policy, conflicts and staleness, privacy and deletion, and proving with evals that recall improves answers."
+  },
+  {
+    "n": 21,
+    "term": "MCP",
+    "sections": [
+      "26.02",
+      "26.04"
+    ],
+    "answer": "The Model Context Protocol, published by Anthropic in late 2024, standardises how AI applications connect to tools and data, turning N apps times M integrations into N plus M. A host runs one MCP client per server; servers expose tools (actions), resources (readable data) and prompts (templates) over JSON-RPC, through stdio locally or streamable HTTP remotely, with OAuth for remote auth. The model still only sees tool definitions; MCP standardises discovery and transport. Trade-offs: each connected server's tool descriptions cost context tokens, and third-party servers add supply-chain and injection risks such as tool poisoning. For one internal integration, a direct API call is simpler."
+  },
+  {
+    "n": 22,
+    "term": "Eval design: golden sets, judge calibration, pass@k vs pass^k",
+    "sections": [
+      "19.07",
+      "20.03",
+      "20.09"
+    ],
+    "answer": "Build a golden set from real traces: a few hundred cases stratified by type, including edge cases and questions with no valid answer, each with a reference or pass criteria. Prefer code checks (exact match, schema, citations exist) and use an LLM judge only for what code cannot check, with a binary or small rubric. Calibrate the judge against human labels and report true positive and true negative rates, not raw agreement. With per-attempt success p, pass@k = 1 - (1 - p)^k is the chance at least one of k tries passes, which suits generate-and-verify; pass^k = p^k is the chance all k pass, which measures agent reliability."
+  },
+  {
+    "n": 23,
+    "term": "Prompt injection, direct and indirect",
+    "sections": [
+      "33.02",
+      "33.03",
+      "33.06"
+    ],
+    "answer": "Prompt injection is untrusted text being followed as instructions, because a model cannot reliably separate data from commands in one token stream. Direct injection is typed by the user, jailbreak-style. Indirect injection hides in content the system reads, such as web pages, emails, documents and tool results, and is worse because the user is the victim. Risk peaks with Simon Willison's lethal trifecta: access to private data, exposure to untrusted content, and a channel to send data out. Classifiers help but are not sufficient. Architectural defences: least-privilege tools, no exfiltration channels such as auto-loaded markdown images, human approval for side effects, and dual-LLM or plan-then-execute patterns."
+  },
+  {
+    "n": 24,
+    "term": "Guardrails",
+    "sections": [
+      "29.01",
+      "29.05"
+    ],
+    "answer": "Guardrails are checks around the model. On input: scope classification, moderation, PII redaction, injection screening and rate limits. On output: schema validation, citation and number checks against sources, policy filters, and length and format rules. Each guard costs latency and has false positives, so run cheap deterministic code first, run model-based checks in parallel with generation where you can, and decide per rule whether a failure is fixed in place, retried once with the violation stated, replaced by a safe template, or escalated to a human. Measure guards like classifiers, with precision and recall on real traffic, not only unit tests."
+  },
+  {
+    "n": 25,
+    "term": "Cost and latency levers: caching, batching, routing, streaming",
+    "sections": [
+      "31.03",
+      "31.05",
+      "31.07",
+      "31.08"
+    ],
+    "answer": "Cost per request = input tokens x input price + output tokens x output price, less cache discounts; multiply by volume. Cost levers: prompt caching for a stable prefix placed first, billed at a fraction of normal input; exact or semantic response caches for repeated questions; routing easy requests to a cheap model and escalating hard ones; batch APIs at a discount for anything not interactive; and trimmed context and capped output. Latency levers: streaming cuts perceived wait to time to first token, parallel calls overlap independent steps, and smaller models or lower reasoning effort cut decode time. Track cost per successful task, not per token."
+  }
+]

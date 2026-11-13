@@ -1,0 +1,136 @@
+---
+id: "D04"
+title: "Voice assistant"
+prompt: "Design a voice assistant that customers can call or talk to in the app, in Hindi, English or a mix, to check account status and do simple actions. It has to feel like a conversation, not an IVR menu."
+sections: ["14.03", "14.04", "14.05", "31.08", "10.04", "29.07", "29.03"]
+minutes: 45
+---
+
+Voice is a latency problem first and an LLM problem second. A text chatbot that takes 3 seconds feels fine; a voice agent that pauses 3 seconds feels broken. The interviewer wants a stage-by-stage latency budget, a clear view of cascade versus speech-to-speech, and the details that only show up in audio: endpointing, barge-in, echo, numbers read aloud, and code-mixed speech.
+
+## Clarify and scope
+
+- **Channels.** Phone calls (narrowband audio, 8 kHz on traditional telephony) and in-app (wideband, better microphones, but noisy rooms). Both need streaming in and out.
+- **Languages.** Hindi, English and Hinglish within one sentence. Ask which other Indian languages come next; it affects the speech-to-text choice.
+- **Tasks.** Read: balance, order or ticket status, FAQs. Act: block a card, raise a complaint, book a callback. Anything else transfers to a human.
+- **Volume.** Assume 20K calls a day averaging 3 minutes, peak hour 12% of the day.
+- **Experience targets.** Conversation research (Stivers et al. 2009, ten languages) found that gaps between turns cluster around 0 to 200 ms, with language averages differing by at most about 250 ms; machines will not match that, but aim for a voice-to-voice response gap around 1 s at p50 and under about 1.5 s at p95, measured from end of user speech to first assistant audio.
+- **Compliance.** Call recording consent, transcript retention, and identity verification before account actions.
+
+## Baseline architecture
+
+A streaming cascade: speech-to-text, LLM, text-to-speech, each streaming into the next, with a turn manager in the middle.
+
+```text
+ caller audio (WebRTC / SIP) ─► echo cancel + noise suppress
+   ─► VAD (speech / silence frames)
+   ─► streaming STT ── partial transcripts ──┐
+                    └─ final transcript ─────┤
+   turn manager:                             ▼
+     endpointing: silence ≥ T ms OR semantic "turn complete" model
+     barge-in: user speech during playback ─► stop TTS, cancel LLM,
+               truncate assistant history to what was actually heard
+   ─► agent: system prompt (spoken style, cached) + state + last turns
+        tools: get_account, get_status, block_card (confirm + OTP), transfer
+        LLM streams tokens ─► sentence chunker (first clause ASAP)
+   ─► text normaliser (numbers, currency, dates → speakable words)
+   ─► streaming TTS ─► audio frames ─► caller
+   side channels: transcript + timings ─► trace; transfer ─► human queue
+```
+
+The [multimodal chapter](/14-multimodal-and-realtime-voice/#realtime-voice-pipelines-cascade-vs-speech-to-speech) covers the two pipeline styles in depth.
+
+## Key choices and trade-offs
+
+**Cascade versus speech-to-speech.** A realtime speech-to-speech model takes audio in and produces audio out. It can be faster, keeps prosody and emotion, and handles interruptions natively. The cascade gives control: pick the best speech-to-text for Hindi and code-mixing, put text guardrails and retrieval between stages, keep exact transcripts for audit, and swap any stage independently. For a regulated customer-service use with tools and Indian languages, start with the cascade and keep a speech-to-speech prototype to compare on latency and task success. Check current offerings and prices; this area changes every few months.
+
+**Endpointing is the biggest latency lever.** The system cannot reply until it decides the user has finished. A fixed silence threshold of a few hundred milliseconds either cuts off people who pause mid-sentence or feels sluggish. Combine VAD silence with a semantic end-of-turn signal (does the partial transcript look complete?), and use a longer threshold after the assistant asks for a number, because people pause while reading digits.
+
+**Barge-in.** When the user speaks over the assistant, stop playback within about 100 to 200 ms, cancel generation, and record only the part of the reply that was actually played. If the history keeps the full unplayed reply, the model believes it said things the user never heard. Ignore backchannels ("haan", "hmm", "okay") by requiring a minimum speech duration or a meaningful partial transcript. Echo cancellation stops the assistant's own voice from triggering barge-in on speakerphone.
+
+**Speculation on partial transcripts.** Start retrieval or even the LLM call on a stable partial transcript, and discard the work if the final transcript differs. It trades tokens for latency.
+
+**Write for the ear.** The prompt asks for short sentences, no markdown, no lists, one question at a time. A normaliser turns "Rs 1,250.50" and "12/03" into words the TTS will say correctly in the caller's language, and spells account numbers digit by digit.
+
+**Confirm before acting.** Read back the action and the key entity ("Block the card ending 4 3 2 1?") and require an explicit yes. Speech-to-text errors on digits are common; confirmation turns them into a retry instead of a wrong action.
+
+## Evals
+
+- **Speech-to-text.** Word error rate on your own call audio, sliced by language, accent, channel (phone versus app) and noise. More important than overall WER is entity accuracy: digits, names, amounts, dates. Code-mixed speech needs its own test set; public benchmarks will not represent it.
+- **End-to-end task success.** Scripted caller scenarios played as audio: recorded real calls (with consent) plus TTS-generated callers with noise added. Grade the final state (was the right card blocked, was the transfer made) in code.
+- **Turn-taking.** False endpointing rate (cut the user off), late endpointing (dead air), barge-in detection, and false barge-ins from backchannels or echo.
+- **Latency.** Voice-to-voice gap distribution, p50 and p95, per stage.
+- **Speech quality.** Human ratings of naturalness and pronunciation on a fixed script set, especially numbers and Hindi names.
+
+## Guardrails and fallbacks
+
+- **Identity.** Never authenticate by voice alone for account actions (voice can be cloned). Use OTP or in-app confirmation.
+- **Reprompt ladder.** After two failed understandings, offer a simpler question or keypad entry; after three, transfer to a human with the transcript.
+- **Scope.** Out-of-scope requests get a short spoken refusal and an offer to transfer.
+- **PII.** Redact card numbers, OTPs and account ids in stored transcripts and logs; never read a full number aloud.
+- **Provider failure.** Fallback STT or TTS provider per stage; if the LLM is down, a scripted menu, then transfer.
+
+## Observability and cost
+
+One trace per call with per-turn spans: VAD end, STT final, LLM first token, first TTS audio byte, playback start, barge-in events. Store transcripts with timings. Dashboards: voice-to-voice gap per stage, transfer rate and reason, task success, reprompt rate, STT confidence distribution, cost per call minute.
+
+## The numbers
+
+**Concurrency (Little's law).**
+
+```text
+call minutes/day     20,000 calls × 3 min        = 60,000 min
+peak hour            12% × 60,000                = 7,200 min in 60 min
+concurrent calls     7,200 / 60                  ≈ 120 at peak (plan for 2-3× bursts)
+each call holds      1 STT stream + 1 TTS stream + intermittent LLM calls
+```
+
+**Latency budget (targets; measure each stage).**
+
+```text
+endpointing wait after speech ends       300-600 ms   (biggest lever)
+STT final after endpoint                 100-300 ms
+LLM time to first token                  300-600 ms
+tokens until first speakable clause      100-200 ms
+TTS time to first audio                  100-300 ms
+network + jitter buffer                  50-150 ms
+total voice-to-voice                     ~0.95-2.15 s → tighten endpointing,
+                                         speculate, use a smaller LLM
+```
+
+**Cost per 1K call minutes** (check current prices; units differ by vendor):
+
+```text
+STT     1,000 × P_stt_per_min           (often billed on all streamed audio)
+TTS     assistant talks ~40% of the time at roughly 150 words/min
+        ≈ 60 words × ~6 chars = 360 chars per call minute
+        → 0.36M chars × P_tts_per_M_chars
+LLM     ~4 turns/min × ~3K input tokens (history re-sent) = 12K in, ~320 out
+        → 12 × P_in + 0.32 × P_out   (P per million tokens)
+total   = 1,000 × P_stt + 0.36 × P_tts + 12 × P_in + 0.32 × P_out
+        + telephony per-minute charges
+```
+
+Usually speech, not tokens, dominates. Prompt caching of the system prefix and trimming history keep the LLM term small as calls get longer.
+
+## Follow-ups they will ask
+
+- **"Users complain the bot interrupts them."** Endpointing is too aggressive: lengthen the silence threshold after questions that invite thinking, add a semantic completeness check, and measure the false-endpoint rate on real calls.
+- **"How do you handle Hinglish?"** Choose speech-to-text by WER and entity accuracy on your own code-mixed audio, let the LLM answer in the caller's register, and make the TTS voice support both scripts' pronunciations.
+- **"Why not speech-to-speech?"** Possible and often faster, but you lose exact transcripts and an easy place for text guardrails and retrieval; prototype both and compare task success and p95 gap.
+- **"How do you test without real customers?"** Synthetic callers via TTS plus noise, then recorded internal calls, then a small live slice with human transfer always available.
+- **"What happens when the LLM is slow?"** Play a short filler ("Let me check that") only when a tool call is known to be slow, never as a default, and alert on per-stage p95.
+
+## How to bring in your own work
+
+You have shipped voice in and out, but not a realtime voice agent. Be exact about the difference.
+
+- **Scheme Assistant's speech layer is your own code** (Scheme Assistant is a team project, and `speech.py` and the mobile app are the parts you wrote). It is push-to-talk, not streaming: the app records up to 30 s, uploads the clip, and Sarvam's `saaras:v4` returns text that goes into the input box; the citizen checks it and taps send, "so a mishearing never reaches the RAG unseen" (`src/app_api/speech.py` lines 1 to 7). That is the confirm-before-acting idea from this drill. The transcription call passes Hindi or auto-detect and a list of scheme words as `keyterms` (lines 119 to 131), which is your answer to "how do you get domain entities right in Hindi speech". Text to speech splits replies to fit the provider's per-request limit and sits behind an exact-match cache keyed on language, speed and text (lines 305 to 318). Audio is never stored; only sizes and timings are logged.
+- **What you have not built:** streaming STT, VAD and endpointing, barge-in, echo cancellation, WebRTC or telephony, a voice-to-voice latency budget, or WER measurement on your own audio. Say so, and say the push-to-talk design was chosen to avoid exactly those problems for a citizen app.
+
+What else transfers is latency engineering and bilingual handling:
+
+- **Perceived latency in Memory Agent.** Tokens stream to the browser over SSE, `firstTokenMs` is stamped on the first text event (`src/agent.ts` lines 62 to 66) and enforced by a per-scenario `maxFirstTokenMs` eval rule (`eval/run.ts` lines 240 to 241), and a regex fast path skips the roughly 2 s planner for small talk (`src/fastpath.ts` lines 49 to 62). Same instinct as a voice latency budget.
+- **Speculation with a gate.** Memory Agent's speculative writer starts beside the planner and its events are held in a three-state gate (`src/gate.ts` lines 6 to 19), then released or discarded (`src/agent.ts` lines 191 to 197). That is exactly the "start the LLM on a partial transcript, discard if it changes" pattern, and it is off by default until measured, which is the honest stance.
+- **Hinglish register.** Chat Insights's prompt builder picks English or Hinglish style instructions (`backend/src/lc/domain/promptBuilder.js` lines 51 to 53).
+- **If you interview at an Indian voice company,** at least one candidate report describes a technical round led by the ASR team head that went deep on ASR and VAD work. Before claiming this drill, extend the Scheme Assistant speech path or build a small streaming cascade (local Whisper-class STT, an LLM, a local TTS) with VAD, barge-in and a per-stage timing trace.

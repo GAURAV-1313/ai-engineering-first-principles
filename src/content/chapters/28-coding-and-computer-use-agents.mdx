@@ -1,0 +1,461 @@
+---
+id: "28"
+title: "Coding and Computer-Use Agents"
+summary: "Build and reason about agents that edit code and drive screens: the tools they need, how they find and patch code, how tests close the loop, how SWE-bench and OSWorld grade them and where those grades mislead, and how sandboxes, permission modes and git keep their work safe and reviewable."
+readingTime: "25 min"
+---
+
+Give a model a failing test, a shell and a file editor, and it does something a chat answer never does. It greps for the function, reads 40 lines, edits three, runs the test, reads a stack trace, edits again, and stops when the test goes green. Nobody grades its prose; the test runner does. A cheap, objective check after every step is why coding became the first domain where agents worked well enough for people to pay for them.
+
+Computer use is the same loop with the checks taken away. The agent sees a screenshot, clicks at `(812, 440)`, and looks again. No compiler says whether it clicked the right button, every step costs an image, and any page it reads may carry an attacker's instructions.
+
+This chapter builds on the loop from [chapter 22](/22-agent-loop/#react-loop), tool design from [chapter 21](/21-tool-use/#agent-computer-interface-design) and containment from [chapter 33](/33-security-prompt-injection/#sandboxing-and-containment). The design-interview version is [drill D03](/interview/d03/).
+
+## Why coding is the flagship domain
+
+An agent is only as good as the signal that tells it it is wrong. A support agent learns it failed when a customer complains next week. In code, the signal arrives in seconds and costs almost nothing.
+
+| Signal | Latency | What it catches |
+|---|---|---|
+| Parser or compiler | under a second | syntax errors, missing imports, type errors |
+| Linter and type checker | seconds | undefined names, wrong argument types |
+| Targeted unit test | seconds | the behaviour the task is about |
+| Full test suite | minutes | regressions elsewhere |
+| Human review | hours to days | wrong intent, bad design, security holes |
+
+Code is also **text** (no pixel grounding), **resettable** (`git stash` or a fresh container undoes almost anything) and **decomposable** into files, functions and tests. And a vast public record of issues and fixes exists to learn from, which is also why benchmarks built on public repos leak.
+
+The consequence: an agent's ceiling is set by its verifier. Anthropic's write-up of 16 parallel agents building a C compiler (February 2026) says the test harness had to be nearly perfect, or the agents solved the wrong problem. In a repo with no tests, a coding agent loses its main advantage.
+
+The same property creates the domain's signature failure: **tests passing for the wrong reasons**. Treat a green run as evidence to check, not as the definition of done.
+
+## Agent-computer interfaces
+
+Chapter 21 introduced the **agent-computer interface (ACI)** from the SWE-agent paper (Yang et al. 2024): tools designed for a model rather than a human. For coding, a small, stable set has emerged across Claude Code, Codex, OpenHands and SWE-agent:
+
+- **Find:** `glob(pattern)` for paths, `grep(pattern, path)` for content.
+- **Read:** `read_file(path, start, end)` with line numbers, never a 3,000-line file by default.
+- **Edit:** an exact replacement or a patch, applied by your code with checks.
+- **Run:** `bash(cmd, timeout)` for tests, builds and git, with output shaped before the model sees it.
+
+The shell could do all of it, but dedicated tools are easier to control: a `read_file` call is obviously a read, while `bash("cat x")` must be parsed, and an edit tool can refuse an ambiguous change where `sed -i` cannot.
+
+Shaping matters as much as the tool. SWE-agent's viewer showed about 100 lines at a time and its edit command rejected edits that broke the linter. The C compiler harness printed a few lines per test run, logged details to files, and put `ERROR` on the same line as the reason so grep could find it. Test output is the biggest context hog in a coding run, so cut it in code:
+
+```python
+import pathlib, subprocess
+
+def run(cmd: str, cwd: str, timeout: int = 120, keep: int = 60) -> str:
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"TIMEOUT after {timeout}s: {cmd}. Run a narrower command (one test file)."
+    lines = (p.stdout + p.stderr).splitlines()
+    if len(lines) > 2 * keep:                          # head shows setup, tail shows the failure
+        cut = len(lines) - 2 * keep
+        lines = lines[:keep] + [f"... {cut} lines omitted; full log in .agent/last.log"] + lines[-keep:]
+        log = pathlib.Path(cwd, ".agent", "last.log")
+        log.parent.mkdir(exist_ok=True)
+        log.write_text(p.stdout + p.stderr)
+    return f"exit={p.returncode}\n" + "\n".join(lines)
+```
+
+The exit code comes first because it is the one fact the model must not miss.
+
+**Project instruction files.** Coding agents load a repo file each session (`CLAUDE.md`, `AGENTS.md`) holding what the code cannot say: the test command, the folder not to touch. Claude Code's best-practices guide draws the useful line: that file is guidance the model may decide does not apply; a rule with no exceptions ("never read `.env`", "typecheck before finishing") belongs in a hook or deny rule the harness enforces.
+
+## Repo navigation
+
+A model cannot fix code it has not found, and it cannot read a 500,000-line repo. Many failed runs go wrong here: the agent edits a plausible function, not the one the bug lives in.
+
+Chapter 18 explains [why coding agents grep instead of embedding](/18-advanced-and-agentic-rag/#code-retrieval-grep-vs-embeddings). Navigation is layered, cheapest first:
+
+1. **Orientation:** the depth-limited file tree, README, instruction file and test layout.
+2. **Lexical search:** grep for the error string, function name or route from the issue.
+3. **Structure:** go-to-definition and find-references from a language server. A signature change is only safe if you know every caller.
+4. **A repo map:** Aider sends a compact list of files and key symbols with signatures, ranked by a graph of references between files and fitted to a token budget (1K tokens by default).
+5. **Embeddings,** optionally, for conceptual questions in huge, inconsistently named codebases.
+
+A repo map needs no model. For Python the standard library is enough:
+
+```python
+import ast, pathlib
+
+def repo_map(root: str, budget_chars: int = 4000) -> str:
+    out = []
+    for path in sorted(pathlib.Path(root).rglob("*.py")):
+        if any(p in path.parts for p in (".venv", "node_modules", ".git")):
+            continue
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            out.append(f"{path}: (does not parse)"); continue
+        syms = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                syms.append(f"  def {node.name}({', '.join(a.arg for a in node.args.args)})")
+            elif isinstance(node, ast.ClassDef):
+                meths = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
+                syms.append(f"  class {node.name}: {', '.join(meths[:8])}")
+        out.append(f"{path.relative_to(root)}\n" + "\n".join(syms))
+    text = "\n".join(out)
+    return text if len(text) <= budget_chars else text[:budget_chars] + "\n... (map truncated; use grep)"
+```
+
+Run exploration in a [sub-agent](/27-context-engineering/#sub-agent-isolation) that returns "the bug is in `slugify`, `text/utils.py` lines 40 to 58, called from 3 places", not every file it skimmed.
+
+**How it fails:** whole files read "to be safe" fill the context; maps go stale after the agent's own edits; vendored and generated code drowns grep hits; monorepos repeat a symbol in ten services (scope by path first). Measure the **localisation hit rate**: did the agent open the file the human fix touched? It separates navigation failures from editing ones.
+
+## Edit formats and patching
+
+Once the agent knows what to change, it must express it as text your code can apply. The format sets output cost, apply rate and failure modes.
+
+| Format | What the model emits | Strength | Typical failure |
+|---|---|---|---|
+| Whole file | the complete new file | no matching needed | expensive; "rest unchanged" placeholders delete code |
+| Unified diff | `@@` hunks with `-` and `+` lines | compact, familiar | wrong line numbers or context; hunks fail |
+| Search/replace | an exact old block and its replacement | no line numbers | old block not found, or found twice |
+| Exact-replace tool | `str_replace(path, old, new)` call | harness checks uniqueness | stale `old` after an earlier edit |
+| Patch tool | a patch language (OpenAI's V4A for `apply_patch`) | multi-file, create, delete | needs a tolerant parser |
+
+The arithmetic favours targeted edits. Changing 5 lines of an 800-line file costs about 8,000 output tokens as a whole file (at roughly 10 tokens per line) and about 200 as a search/replace block. At 50 to 100 output tokens per second, that is 80 to 160 seconds against 2 to 4.
+
+Aider's benchmarks shaped the field: with GPT-4 Turbo, a unified diff without line numbers cut "lazy" placeholder comments about threefold compared with search/replace, and turning off whitespace-tolerant fallbacks multiplied edit errors. These are 2023-era, model-specific results; the lasting lessons are that models handle line numbers badly and that the applier should forgive formatting while staying strict about content. Anthropic's text-editor tool takes that line: `str_replace` must match exactly one location, and the documented errors are "no match" or "found N matches, add more context".
+
+```python
+def apply_edit(path: str, old: str, new: str) -> str:
+    src = open(path).read()
+    n = src.count(old)
+    if n == 0:
+        norm = lambda s: "\n".join(l.rstrip() for l in s.split("\n"))   # forgive trailing spaces only
+        if norm(src).count(norm(old)) != 1:
+            return "ERROR: no match. Re-read the file; it may have changed since you viewed it."
+        src, old = norm(src), norm(old)
+    elif n > 1:
+        return f"ERROR: {n} matches. Include more surrounding lines so the match is unique."
+    candidate = src.replace(old, new, 1)
+    if path.endswith(".py"):
+        try:
+            compile(candidate, path, "exec")             # syntax gate before writing
+        except SyntaxError as e:
+            return f"ERROR: edit would break syntax at line {e.lineno}: {e.msg}. File unchanged."
+    open(path, "w").write(candidate)
+    return f"OK: edited {path}"
+```
+
+Refuse ambiguity, leave the file untouched when an edit breaks parsing, and make every error say what to do next. Log file hashes before and after each edit so a run can be replayed or reverted.
+
+## Test-driven agent loops
+
+The coding loop is chapter 22's loop with a fixed shape: **reproduce, localise, edit, verify, regress**.
+
+```text
+ issue ──► explore ──► write or find a failing test ──► run: FAIL (expected)
+                                        │
+           ┌──── edit ◄── read error ◄──┘
+           ▼
+         run target test ── FAIL ──► read error, edit again (budget: steps, tokens, time)
+           │ PASS
+         run full suite ── FAIL ──► regression: fix or revert
+           │ PASS
+         check the diff (tests untouched? scope sane?) ──► commit on a branch ──► human review
+```
+
+Reproduce first: a test seen failing before the edit and passing after is evidence; a test never seen failing proves nothing. The full suite catches regressions. And the harness, not the model, decides "done":
+
+```python
+import hashlib, pathlib
+
+GUARDED = ("tests/**/*.py", "**/conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg")
+
+def fingerprint(repo: str, globs=GUARDED) -> dict:
+    return {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+            for g in globs for p in pathlib.Path(repo).glob(g)}
+
+def done_check(repo: str, before: dict, target: str) -> tuple[bool, str]:
+    after = fingerprint(repo)                        # edited, deleted or added (a skipping conftest)
+    touched = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+    if touched:
+        return False, f"REJECTED: tests modified: {touched}. Fix the code, not the tests."
+    t = run(f"python -m pytest -q {target}", repo)
+    if not t.startswith("exit=0"):
+        return False, t
+    full = run("python -m pytest -q -x", repo)
+    return full.startswith("exit=0"), full
+```
+
+Claude Code exposes the same idea as a `Stop` hook: a script runs when the agent tries to finish, and exit code 2 blocks the stop and sends its stderr back as the reason. Cap the retries, or an unfixable check loops forever.
+
+**Tests passing for the wrong reasons** take a few common forms: editing the assertion, special-casing the input (`if s == "Hello World": return "hello-world"`), swallowing the expected exception, skipping the test, mocking out the code under test. Defences: freeze existing tests as above, keep hidden tests the agent never sees, and have a reviewer read the diff for these patterns.
+
+**When not to loop.** Agentless (Xia et al. 2024) used a fixed localise, repair, validate pipeline with no agent choosing actions, at about $0.70 per issue on SWE-bench Lite. For a well-scoped bug class, a [workflow](/22-agent-loop/#workflows-vs-agents) can match an agent at lower cost and variance.
+
+**Cost.** Each step re-sends the growing context. Starting at 10K tokens and adding about 3K per step, a 30-step run reads 30 × 10K + 3K × (30 × 29 / 2) ≈ 1.6M input tokens. [Trimming tool output](/27-context-engineering/#tool-result-trimming) and prefix caching keep that affordable.
+
+## SWE-bench evaluation
+
+**What it is.** SWE-bench (Jimenez et al., ICLR 2024) took 2,294 real GitHub issues from 12 popular Python repositories. The model gets the issue and the repo at the commit before the fix, and produces a patch. Grading runs in a container: the **FAIL_TO_PASS** tests from the human fix must now pass, and the **PASS_TO_PASS** tests must still pass. The best model in the paper resolved under 2%.
+
+The family grew around its weaknesses:
+
+- **Lite:** a 300-task subset for cheaper runs.
+- **Verified** (OpenAI with the authors, August 2024): 93 developers screened samples and 500 were kept, because many originals had underspecified issues or tests that rejected valid fixes.
+- **Multimodal** (JavaScript issues with screenshots) and **Multilingual** (300 tasks, 9 languages).
+- **Pro** (Scale AI, 2025): 1,865 longer tasks from 41 repos, split into public (731), held-out (858) and commercial (276, from 18 proprietary startup codebases) sets to resist contamination.
+- **Live:** tasks refreshed from recent issues so they postdate training cutoffs.
+
+It measures repairing a described issue in a mature open-source Python repo, judged by the maintainers' tests; not feature work from vague specs, design quality or your stack.
+
+**Known issues**, each documented:
+
+- **Leaked solutions and weak tests.** SWE-Bench+ (Aleithan et al. 2024) found the fix spelled out in the issue or comments for roughly a third of resolved instances, and many passing patches suspicious because of weak tests.
+- **Plausible but wrong.** Wang, Pradel and Liu (2025) found about 30% of "resolved" patches on Verified behaving differently from the human fix, inflating reported rates by about 6 points.
+- **Contamination and flawed tasks.** In February 2026 OpenAI stopped reporting Verified: an audit of 138 problems its model often failed found at least 59.4% flawed, for example tests demanding details the issue never stated, and frontier models could reproduce some fixes from memory. It recommended Pro, then in July 2026 estimated about 30% of Pro's tasks broken and withdrew that recommendation.
+- **Answers in the environment.** A 2025 issue on SWE-bench's own tracker showed agents running `git log --all` in task containers and finding the future fixing commit; SWE-bench then stripped future history from its images. A Cursor study (June 2026) also found agents looking up merged fixes online; sealing history and the internet cut one model's SWE-bench Pro score by about 14 points.
+- **Harness dependence.** Scaffold, turn limit, attempts and container resources all move the score ([noise](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+<Callout type="warn">
+
+Never quote a vendor's SWE-bench number as a fact about a model. Ask which subset, which scaffold, how many attempts, whether git history and the internet were sealed, and when the training data ends. Scores on public repos measure memory as well as skill.
+
+</Callout>
+
+**Build your own.** Keep the method, not the leaderboard. Take bug-fix commits from your history that added a test, check out the parent, give the agent the issue text, and grade with the hidden test from the fix plus the existing suite, using `done_check` above. Run each task in a fresh container with `.git` squashed to one commit and no network, three trials each, and report pass^k alongside pass@1 ([agent evals](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory)). Read some passing transcripts too: that is where exploits hide ([eval gaming](/20-evals-judges-and-ci/#eval-awareness-and-gaming)).
+
+## Computer use: screenshots and actions
+
+Many tasks have no API: a government portal, a legacy desktop app, an admin screen. A **computer-use agent** operates the graphical interface like a person. Anthropic shipped the first widely available version in October 2024 and OpenAI's Operator followed in January 2025; the shape is the same.
+
+```text
+ ┌──────────── VM or container with a desktop ───────────┐
+ │  screenshot ──► model ──► action: click(x,y), type,   │
+ │      ▲                    key("ctrl+s"), scroll, wait │
+ │      └──────── harness executes, waits, re-captures ──┘
+```
+
+The model returns actions as tool calls in screen coordinates; your harness executes them and returns a fresh screenshot. Anthropic's computer-use tool documents the actions (screenshot, clicks, drag, scroll, type, key, wait, and a zoom for reading small text) and recommends modest resolutions such as 1280×800. The API does not resize for you: an oversized screenshot is rejected, so your harness downscales it, and the model's coordinates refer to the image it saw.
+
+That scaling is a classic bug. A Retina Mac captures at twice its logical resolution, so downscale before sending and map clicks back:
+
+```python
+def to_model(img_w: int, img_h: int, max_long: int = 1568, max_px: float = 1.15e6) -> float:
+    return min(1.0, max_long / max(img_w, img_h), (max_px / (img_w * img_h)) ** 0.5)
+
+def click(model_x: int, model_y: int, scale: float, dpr: float = 2.0) -> tuple[int, int]:
+    # model saw the image at `scale`; the OS expects logical points (pixels / device pixel ratio)
+    return round(model_x / scale / dpr), round(model_y / scale / dpr)
+```
+
+Those limits are the documented ones for earlier Claude models; newer models accept larger images, so keep them in config.
+
+**Pixels, accessibility tree or DOM.** Pure pixels work on anything but force the model to do **grounding**, finding the exact coordinates of "the Submit button", where many failures start. An accessibility tree (the OS's list of controls with roles, names and bounds) or a page's DOM lets the model act on named elements: `click(ref="button:Submit")` is unambiguous and survives layout changes. Set-of-Mark prompting (Yang et al. 2023) is the hybrid: number boxes on the screenshot and let the model pick a number. Prefer an API, then structured elements, then pixels.
+
+**Latency and cost.** Anthropic's docs put a screenshot at roughly 1,000 to 1,800 input tokens. A 40-step task that keeps every screenshot re-sends them all: 1.5K × (40 × 41 / 2) ≈ 1.2M input tokens of images. Each step also pays a capture, a model call of a few seconds, the action and a settle wait, so 40 steps take minutes. Keep only the last few screenshots and use the structured path when it exists.
+
+**How it fails:** clicks on stale screenshots, pop-ups stealing focus, slow loads read as "nothing happened", tiny targets. Log every screenshot with its action so failures replay frame by frame.
+
+## Browser agents
+
+Most computer use happens in a browser, which offers a cheaper interface than pixels. A browser agent drives a real browser through Playwright or the Chrome DevTools protocol and reads each page as an accessibility snapshot (elements with roles, names and reference ids), keeping screenshots for canvas-heavy pages.
+
+The new problem: **the web is adversarial input**, and a browser agent often runs with the user's logged-in sessions. That is the [lethal trifecta](/33-security-prompt-injection/#the-lethal-trifecta) in one product: private data, untrusted content, and a way to send data out by navigating or submitting a form.
+
+The incidents are documented. Brave's researchers showed in August 2025 that Perplexity's Comet, asked to summarise a Reddit thread, followed instructions hidden in a comment and sent the user's email address and a one-time passcode to the attacker. Anthropic's Claude for Chrome pilot (August 2025) reported 23.6% attack success on its own 123 test cases without mitigations and 11.2% with them (vendor-reported). In December 2025, writing about hardening its Atlas browser agent, OpenAI said prompt injection, like scams and social engineering, is unlikely ever to be fully solved. Design on that assumption:
+
+- **Separate identity:** a fresh profile with no saved logins; the user hands over a session for one task.
+- **Scope:** an allowlist of domains per task; a new domain is an approval point.
+- **Gate consequential actions in code:** purchases, sending messages, changing settings, accepting terms and entering credentials pause for a human who sees the exact values.
+- **Classifiers as a layer, not a boundary:** Anthropic's computer-use tool scans screenshots for injections, which lowers the rate without removing it ([why classifiers are insufficient](/33-security-prompt-injection/#why-classifiers-are-insufficient)).
+- **Hand back hard steps:** logins, CAPTCHAs and payments go to the human.
+
+```python
+CONSEQUENTIAL = {"submit_form", "purchase", "send_message", "enter_credentials", "accept_terms"}
+
+def gate(action: dict, task: dict, ask_human) -> bool:
+    host = action.get("host", "")
+    if action["type"] == "navigate" and host not in task["allowed_hosts"]:
+        return ask_human(f"Open new site {host}? Task: {task['goal']}")
+    if action["type"] in CONSEQUENTIAL:
+        return ask_human(f"{action['type']} on {host}: {action.get('fields', {})}")   # exact values, rendered by code
+    return True
+```
+
+## OSWorld-style evaluation
+
+You cannot grade a computer-use agent by its final message ("I've updated the spreadsheet"). You grade the **state of the machine** afterwards, the idea OSWorld made standard.
+
+**OSWorld** (Xie et al. 2024) has 369 tasks on real Ubuntu, Windows and macOS virtual machines: office documents, browsers, file managers, multi-app workflows. Each task has a setup script for a known starting state and an evaluation script that checks the outcome: open the saved `.xlsx` and compare cells, read a config file, inspect bookmarks. At publication humans completed over 72% and the best model about 12%. **OSWorld-Verified** (July 2025) fixed more than 300 reported task problems (changed websites, ambiguous instructions, fragile checkers) and moved runs to parallel cloud VMs.
+
+**WebArena** (Zhou et al. 2023) does the same for the web: 812 tasks on self-hosted shopping, forum, code-hosting and content-management sites, so the environment does not drift. Humans in a small study succeeded on about 78%; the best GPT-4 agent at publication on roughly 11 to 14%, depending on the paper version.
+
+For your own agent, copy the method:
+
+```python
+def check_invoice_task(vm) -> dict:
+    """Task: 'Fill invoice.xlsx row 5 from Ravi's email and save it.'"""
+    row = vm.read_xlsx("/home/user/invoice.xlsx")["Sheet1"][5]
+    ok = row["amount"] == 18450 and row["gstin"] == "27ABCDE1234F1Z5"
+    clean = vm.sent_mail_count() == 0 and vm.files_deleted() == []      # nothing else changed
+    return {"success": ok and clean, "steps": vm.steps, "seconds": vm.wall_time}
+```
+
+- **Reset to a snapshot** per trial; seed accounts and data; self-host or freeze websites.
+- **Check what should not change.** Success plus a deleted folder is a failure.
+- **Include infeasible tasks** and reward the agent for saying so.
+- **Report** success with confidence intervals, pass^k, median steps, wall time, cost and unapproved consequential actions.
+- **Audit checkers.** A checker that rejects a valid alternative is a benchmark bug, as OSWorld-Verified and the SWE-bench audits both found.
+
+## Long-running sessions
+
+Chapter 22 covers [checkpoints, resumability and Anthropic's initializer pattern](/22-agent-loop/#long-running-agents-checkpointing-resumability) (a JSON feature list, a progress file, git commits, one feature per session). Coding has the longest sessions, so here are its specific lessons.
+
+**The verifier carries the session.** In the C compiler project, 16 agents ran about 2,000 sessions over two weeks for just under $20,000 of API cost, by Anthropic's account. GCC served as a known-good oracle: when the Linux kernel failed to build, the harness compiled most files with GCC and only some with the new compiler, isolating broken files so different agents could fix different bugs. Its tests were written for a model: short output, details in log files, and a `--fast` mode running a deterministic 1% or 10% sample, because the model has no sense of elapsed time.
+
+**Agents declare victory early.** Anthropic's long-running-harness post (November 2025) reports agents marking features done after a unit test or a `curl` while the feature was broken in the browser; end-to-end browser testing found far more bugs. "Done" must be a check the harness runs.
+
+**Reset context, keep state in git.** Each session starts clean, reads the notes and `git log`, runs a smoke test to confirm the tree is not already broken, then takes one task ([structured notes](/27-context-engineering/#structured-note-taking)).
+
+**Cap cost.** At 2,000 sessions, a $5 overspend each is $10,000. Budget per session ([runaway control](/31-cost-and-latency-engineering/#agent-budgets-and-runaway-control)) and alert on sessions that keep editing while no test result changes.
+
+## Permission modes and auto-approval
+
+An agent that asks before every command is useless; one that never asks is fast until it deletes the wrong directory. Chapter 33 covers [approval fatigue and auto mode's classifier](/33-security-prompt-injection/#permission-prompts-vs-autonomous-modes). Here is how products expose the dial.
+
+Claude Code's documented modes, most to least supervised: **manual** (reads only; edits, shell and network ask), **accept edits** (edits and common file commands in the working directory run), **plan** (research only until you approve a plan), **auto** (everything runs, with a classifier reviewing each action), **don't ask** (pre-approved tools only, the rest denied; for CI) and **bypass** (no checks; isolated containers only). Deny rules apply in every mode, and protected paths such as `.git` and `.claude` get stricter handling. OpenAI's Codex splits the idea into a sandbox mode (read-only, workspace-write, full access) and an approval policy; in workspace-write, network is off by default and `.git` stays read-only.
+
+Anthropic found users accepted 93% of permission prompts, which is why a click is weak protection, and reports its auto-mode classifier missing about 17% of a small set of real overeager actions: better than reflexive clicking, not a boundary.
+
+Underneath is a policy function your harness owns:
+
+```python
+import re, shlex
+
+DENY = [r"\brm\s+-rf\s+(/|~|\$HOME)", r"git\s+push\b.*\b(main|master)\b", r"curl[^|]*\|\s*(ba)?sh", r"\.env\b"]
+ALLOW = {"pytest", "python", "ls", "cat", "rg", "grep"}
+GIT_READ = {"status", "diff", "log", "show", "branch"}
+
+def decide(cmd: str, sandboxed: bool) -> str:
+    if any(re.search(p, cmd) for p in DENY):
+        return "deny"
+    if re.search(r"[;&|`$()<>]", cmd):              # chained or substituted: do not try to parse it
+        return "allow" if sandboxed else "ask"
+    argv = shlex.split(cmd)
+    if argv[0] == "git":
+        return "allow" if len(argv) > 1 and argv[1] in GIT_READ else "ask"
+    return "allow" if sandboxed or argv[0] in ALLOW else "ask"
+```
+
+Parsing shell safely is close to impossible (`bash -c`, `python -c`, a script the agent just wrote), so the deny list is a seatbelt. The boundary is the sandbox: workspace-only writes, no secrets mounted, egress through an allowlisting proxy. Inside it, auto-approve generously; at its edges (network, credentials, push, deploy) ask with the exact command shown. Log each decision with the rule that fired.
+
+## Version control for agent work
+
+Git is the agent's undo button, its memory and the unit a human reviews.
+
+- **A branch per task.** The output is a pull request that a human or CI merges. Protect the main branch in the host's settings, not in the prompt.
+- **Small commits as checkpoints.** Commit after each green run with a message that says why. A bad step becomes `git reset --hard HEAD~1`, and the next session reads `git log` as history.
+- **Worktrees for parallel agents.** `git worktree add ../wt-fix-123 -b agent/fix-123` gives each agent its own checkout over one object store. Each also needs its own ports, database and caches, or agents collide at runtime instead.
+- **Coordinate through the repo.** The C compiler agents claimed tasks by committing lock files to a shared upstream; a push conflict sent the second agent elsewhere.
+- **Attribute.** A `Co-Authored-By` trailer or a bot identity makes agent work searchable in audits.
+- **Keep `.git` out of reach.** Codex keeps it read-only, Claude Code protects it, and benchmarks showed agents mining future commits from it.
+
+**Review is the bottleneck.** METR's randomised study (July 2025) found experienced open-source developers took about 19% longer on tasks in their own large repos with early-2025 AI tools, while believing they were about 20% faster. Newer tools may differ, but generated code is cheap and review is not: keep diffs small, put the evidence (tests run, before and after) in the PR, and review the diff, not the agent's summary. At extreme volume the pressure reaches the version-control system itself: Anthropic wrote in October 2026 that agent-driven merges to its monorepo grew from about 2,500 a day in May to over 30,000 by September, and that it moved the monorepo off git to an in-house system it says is not a general git replacement.
+
+<Production>
+
+**Failure modes.** Tests passing for the wrong reasons: freeze test files, keep hidden tests, review diffs. Destructive commands: deny rules plus a sandbox. Ambiguous edits: refuse them. Localisation misses: track whether the agent opened the right file. Flaky UI grounding: stale screenshots, pop-ups, scaled coordinates. Early "done": the harness runs the check.
+
+**Cost.** Input grows roughly with steps squared (about 1.6M tokens for 30 steps, as computed above), and screenshots add 1K to 2K tokens each. Trim test output, cache the prefix, explore in sub-agents, budget per task.
+
+**Latency.** Coding steps take seconds: run targeted tests in the loop and the full suite once. A 40-step desktop task takes minutes; prefer APIs and DOM actions, and run such tasks asynchronously with [progress updates](/34-product-ux-and-feedback/#streaming-and-progress-ux).
+
+**Observability.** Full action logs that allow replay: each command with exit code and truncated output, each edit with file hashes, each screenshot with its action, each permission decision with its rule, and the final diff. Metrics: resolve rate on your task set, localisation hit rate, edit-apply failures, steps and cost per task, approval rate per action type ([trajectory tracing](/30-observability/#agent-trajectory-tracing)).
+
+**Security.** Sandbox every agent that runs code: workspace-only writes, no host mounts, resource limits, gVisor or a microVM for untrusted multi-tenant work ([managed sandboxes](/32-deployment-and-llmops/#managed-agent-platforms-and-sandboxes)). Egress through an allowlisting proxy. Credential isolation: no production keys in the sandbox, short-lived scoped tokens, a separate browser profile, a human for logins and payments. Repo files, issues, PR text and web pages are untrusted input.
+
+</Production>
+
+<Interview>
+
+<Q q="Design an AI coding agent." reported>
+
+- **Scope and SLOs:** bug fixes from issues with a reproducible failure, a human merges; targets for resolve rate on an internal task set, cost per task, p95 time to PR, zero writes outside the sandbox.
+- **Architecture:** issue in, sandboxed container on a fresh branch; glob, grep, ranged reads, an exact-replace edit tool and `bash` with shaped output; reproduce, edit, test, full suite; output is a PR with evidence.
+- **Model and context:** strong model for edits, cheaper sub-agent for exploration; instruction file and repo map preloaded, the rest just in time; trimmed output; prefix caching.
+- **Evals:** SWE-style tasks mined from your bug-fix commits, hidden tests, sealed git history, pass^k over 3 trials, localisation hit rate.
+- **Guardrails:** egress allowlist, no secrets, deny rules, frozen tests, budgets on steps, tokens and money.
+- **Numbers:** 30 steps ≈ 1.6M input tokens before caching; multiply by the current price page.
+- **The trap:** starting from the prompt and model with no sandbox, no definition of done and no eval set.
+
+</Q>
+
+<Q q="Build a code-review agent and evaluate its accuracy." reported>
+
+- A bounded, read-only workflow (diff, context, review, verify, post) with one small agentic step for extra context; full design in [drill D03](/interview/d03/).
+- Structured comments with file, line, failing scenario and evidence quote; a verifier drops comments whose quote is not at that line or that repeat the linter.
+- Precision first: cap comments per PR and suppress weak categories, because developers mute noisy bots.
+- Eval set: seeded bugs in merged PRs (recall at the right line), historical PRs where a human found a bug, human-labelled samples of bot comments (precision); calibrate any judge against those labels ([validating judges](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans)).
+- Online: share of comments resolved by a code change, dismissed, and repos turning it off.
+- **The trap:** reporting comment volume, or one precision number with no interval and no recall.
+
+</Q>
+
+<Q q="How do you safely let an agent run shell commands?">
+
+- Start from the boundary: container or microVM, workspace-only writes, no host mounts, no credentials, resource and time limits.
+- Network through an egress proxy with an allowlist; new domains ask.
+- Auto-approve inside the boundary; at its edges (network, credentials, push, deploy) ask with the exact command shown.
+- Deny rules as a seatbelt for the obvious, knowing shell parsing is never complete.
+- Log every command, exit code and decision; promote always-approved prompts to rules.
+- **The trap:** "a regex blocklist", which `bash -c` or a script the agent wrote walks straight past.
+
+</Q>
+
+<Q q="How would you evaluate a browser agent?">
+
+- Self-hosted or snapshotted sites, reset per trial, so runs are comparable (WebArena style).
+- Grade final state with code, including what must not change (OSWorld style).
+- Include infeasible tasks and pages with hidden injected instructions; report attack success separately.
+- Report success with confidence intervals, pass^k, steps, wall time, cost and unapproved consequential actions.
+- Audit checkers on a sample of failures.
+- **The trap:** grading the agent's final message, or testing on live sites and comparing runs from different days.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** a small offline coding agent that fixes a failing test in a toy repo, inside a sandbox with no network, with a harness that refuses edited tests as a fix; then the PR-review bot from the outline on the same sandbox. Build both in **Memory Agent** (`~/memory-agent`), on a branch, in `labs/coding-agent/`, reusing the loop from [chapter 22](/22-agent-loop/#long-running-agents-checkpointing-resumability)'s Apply-it if you built it.
+
+**Runs offline.** Two backends behind one interface: a scripted mock that replays fixed tool calls (to test the harness deterministically), and Ollama with a small code model (a 7B Qwen coder or similar). No paid API.
+
+**Steps.**
+
+1. **Toy repo.** `labs/coding-agent/toy/` with `text/utils.py` (a `slugify` that mishandles repeated spaces and edge punctuation) and `tests/test_utils.py` with 6 tests, 2 failing. Keep a hidden test file outside the repo. `git init` with one commit.
+2. **Sandbox.** Build a tiny image once, while you still have network (`FROM python:3.12-slim` plus `RUN pip install pytest`, tagged `lab-sandbox`), because the slim image has no pytest and the sandbox cannot install it. Then run every tool call via `docker run --rm --network none --memory 512m --cpus 1 -v <trial copy>:/work -w /work lab-sandbox`, on a fresh copy per trial. Mount nothing else from your home directory; copy the hidden tests in only at grading time.
+3. **Tools.** `glob`, `grep`, `read_file(path, start, end)`, `str_replace` with the uniqueness and syntax checks above, and `run` with exit code first and head-and-tail truncation, behind the `decide()` policy.
+4. **Done check.** Fingerprint test files at start; finish only when target tests and the full suite pass with no test file changed, or when the budget (15 steps, 60K tokens, 5 minutes) runs out.
+5. **Adversarial mocks.** Script one run that edits the assertion, one that adds a `conftest.py` skipping the failing tests, and one that special-cases the test input.
+6. **Real runs.** Five Ollama runs, each step logged to `runs/<id>.jsonl` (command, exit code, edit hashes, tokens, decision).
+7. **PR-review bot.** Same sandbox, read-only mount. For 30 historical PRs from your repos, feed the diff to the model, require file, line, failing scenario and a quoted line per comment, drop comments whose quote is not at that line, and cap at 5 per PR. Label every posted comment useful, wrong or noise yourself.
+
+**Definition of done.**
+- The assertion-editing and `conftest.py` mocks are rejected by the fingerprint check; the special-casing mock fails the hidden tests.
+- A `DECISIONS.md` table for the five runs: resolved (hidden tests), steps, tokens, wall time, edit failures, policy denials.
+- A tool call that tries `pip download requests` fails with a network error, and the log shows it.
+- You can replay any run from its JSONL and name its first wrong step.
+- The bot's precision on the 30 PRs, with a 95% interval, and the three worst false positives explained.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Be direct: none of your repos contains a coding or computer-use agent** (no sandbox, edit applier, test loop or screen control). Say so, then talk about what you have observed as a heavy *user* of coding agents, which is real and checkable.
+- **Chat Insights's agent-assisted commits carry tests and reasons.** At the pin, Chat Insights has 95 commits: 12 authored as "Claude" (the LeetCode Coach landing page and demo video, September 2026) and 43 with a `Co-Authored-By: Claude` trailer (September 14 to November 3, 2026), 13 of which touch a test file. The pinned commit `5a289f8` changes `backend/src/lc/services/llm/anthropic.js`, adds 49 lines to `backend/tests/lc/llm.anthropic.test.js`, and its message explains the failure and the replay evidence. That is this chapter's pattern: a test with the fix, a reason in the commit, and you as the reviewing committer.
+- **Chat Insights's `.opencode/AGENTS.md` is guidance, not enforcement.** It routes an agent through spec, plan, and incremental test-driven work, but at the pin there is no CI workflow, so only your own session runs `npm test` (the `jest` script in `backend/package.json`). A CI job or stop hook that runs it is a cheap fix and a good story.
+- **Answer Grader shows parallel worktrees and their collision.** Your lines in `.claude/launch.json` (commit `a71fdb7`) run the API from `.claude/worktrees/practice-exp` (port 8012) and `.claude/worktrees/telegram-bot` (port 8020). The same file gives 8020 to both `design-static` (line 38) and `telegram-bot-api` (line 76), and 8021 to `design-practice` (line 48) and `telegram-bot-api-lan` (line 92): the runtime clash the version-control section warns about.
+- **A team-repo lesson from Scheme Assistant.** At the pin a teammate's commit records an agent worktree, `.claude/worktrees/agent-aeca10331ac48b773`, as a gitlink, and `.gitignore` has no `.claude` entry. Not your code, but a fair example of why agent working directories belong in `.gitignore`.
+- **Gap to close.** Build the Apply-it in Memory Agent, then the D03 reviewer over your own history, so "have you built a coding agent?" gets "yes, here is its eval".
+
+</YourProject>

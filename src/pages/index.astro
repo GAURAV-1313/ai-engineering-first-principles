@@ -1,0 +1,75 @@
+---
+import { getCollection } from 'astro:content';
+import Page from '../layouts/Page.astro';
+import { parts, chapterById, chapterHref, stars, weightWord, FAST_TRACK } from '../lib/outline';
+import { evidence, repos } from '../lib/data';
+import { libraryDocs } from '../lib/library';
+import { SITE_NAME, SITE_DESCRIPTION, AUTHOR, abs } from '../lib/seo';
+
+const written = new Set((await getCollection('chapters')).filter((e) => !e.data.draft).map((e) => e.data.id));
+const total = parts.reduce((n, p) => n + p.chapters.length, 0);
+const sections = parts.flatMap((p) => p.chapters).reduce((n, id) => n + chapterById[id].sections.length, 0);
+const covered = new Set(evidence.map((e) => e.section));
+const cov = (id: string) => {
+  const items = evidence.filter((e) => e.chapter === Number(id));
+  return repos.map((r) => {
+    const mine = items.filter((e) => e.repo === r.slug);
+    return { r, n: mine.length, solid: mine.some((e) => e.quality === 'solid') };
+  }).filter((x) => x.n > 0);
+};
+const home = abs(Astro.site, '/');
+const jsonLd = [
+  { '@type': 'WebSite', '@id': `${home}#website`, url: home, name: SITE_NAME, description: SITE_DESCRIPTION, inLanguage: 'en', author: AUTHOR, publisher: AUTHOR },
+  {
+    '@type': 'Course', '@id': `${home}#course`, url: home, name: SITE_NAME, description: SITE_DESCRIPTION,
+    provider: AUTHOR, author: AUTHOR, inLanguage: 'en', isAccessibleForFree: true, educationalLevel: 'Intermediate',
+    teaches: ['Large language models', 'Retrieval-augmented generation (RAG)', 'LLM evaluation', 'AI agents', 'Model Context Protocol (MCP)', 'LLMOps', 'AI system design interviews'],
+    offers: { '@type': 'Offer', price: 0, priceCurrency: 'USD', category: 'Free' },
+    hasCourseInstance: { '@type': 'CourseInstance', courseMode: 'Online', courseWorkload: 'PT20H' },
+    hasPart: parts.flatMap((p) => p.chapters).map((id) => ({ '@type': 'LearningResource', name: `${id}. ${chapterById[id].title}`, url: abs(Astro.site, chapterHref(chapterById[id])) })),
+  },
+];
+const firstFast = FAST_TRACK.find((id) => written.has(id)) ?? FAST_TRACK[0];
+---
+<Page title="AI Engineering from First Principles: LLMs, RAG, Evals and Agents, annotated" description={SITE_DESCRIPTION} current="book" jsonLd={jsonLd}>
+  <section class="home-hero">
+    <p class="home-kicker">Study edition</p>
+    <h1 class="home-title">AI Engineering from First Principles</h1>
+    <p class="home-lede">LLM basics, retrieval, evals, agents and production LLM systems, built up from the mechanism, with real code from {repos.map((r) => r.name).join(', ')} in the margin. Written for shipping, and for the interview after it.</p>
+    <p class="home-stats">
+      <span><b>{written.size}</b> of {total} chapters written</span>
+      <span><b>{sections}</b> sections</span>
+      <span><b>{evidence.length}</b> examples from {repos.length} repos</span>
+      <span><b>{covered.size}</b> sections shown in your code</span>
+      <span><b>{libraryDocs.length}</b> open-licence readings</span>
+    </p>
+    <p class="home-start">
+      <a class="btn btn-primary" href={chapterHref(firstFast)}>Start the fast track →</a>
+      <a class="btn" href="/interview/">Interview prep</a>
+      <a class="btn" href="/gaps/">What to build next</a>
+    </p>
+    <p class="legend"><span>★★★ core: ships daily, asked in most loops</span><span>★★ important</span><span>★ literacy</span><span><span style="color: var(--accent)">fast</span> = on the interview fast track</span></p>
+  </section>
+
+  {parts.map((p) => (
+    <section class="part">
+      <header class="part-h"><span class="part-n">Part {p.id}</span><h2 class="part-t">{p.title}</h2></header>
+      {p.chapters.map((id) => {
+        const c = chapterById[id];
+        const bars = cov(id);
+        return (
+          <a class="chrow" href={chapterHref(c)}>
+            <span class="chrow-n">{c.id}</span>
+            <span class="chrow-t">{c.title}<span class="chrow-s">{c.sections.slice(0, 4).map((s) => s.title).join(' · ')}{c.sections.length > 4 ? ' …' : ''}</span></span>
+            <span class="chrow-w" title={weightWord(c.weight)}>{stars(c.weight)}</span>
+            <span class="covbar" title={bars.map((b) => `${b.r.name}: ${b.n}`).join(', ') || 'No examples yet'}>
+              {bars.map((b) => <i class:list={{ naive: !b.solid }} style={`--fam: var(--fam-${b.r.hue})`}></i>)}
+              <span>{bars.reduce((n, b) => n + b.n, 0) || ''}</span>
+            </span>
+            <span class:list={['chrow-state', { 'is-written': written.has(c.id) }]}>{written.has(c.id) ? 'written' : 'outline'}{FAST_TRACK.includes(c.id) && <span class="ft"> · fast</span>}</span>
+          </a>
+        );
+      })}
+    </section>
+  ))}
+</Page>

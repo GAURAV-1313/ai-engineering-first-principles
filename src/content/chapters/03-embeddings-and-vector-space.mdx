@@ -1,0 +1,584 @@
+---
+id: "03"
+title: "Embeddings and Vector Space"
+summary: "Understand how text and images become vectors whose geometry encodes meaning, from word2vec to contrastively trained bi-encoders, so you can pick, size, calibrate and migrate an embedding model in production and defend each choice in an interview."
+readingTime: "34 min"
+---
+
+A search box gets the query "can I get money for building a toilet at home". The document that answers it says "financial assistance for construction of individual household latrines". Keyword search finds almost nothing: the only shared word is "for". A human sees at once that the two mean the same thing. The engineering problem is to make a computer see it too, in milliseconds, across millions of documents, without hand-writing a synonym for every phrase anyone might type.
+
+The answer the field settled on is to map every piece of text to a point in a space of a few hundred to a few thousand dimensions, arranged so that texts with similar meaning land near each other. That mapping is an **embedding**, and "near" becomes a dot product you can compute a billion times a second. Retrieval, deduplication, clustering, semantic caching, memory recall, routing and recommendation all reduce to "embed it, then find the neighbours".
+
+Getting it right in production is harder: which model, how many dimensions, which threshold, and what happens when a new model version silently stops matching your stored vectors? This chapter builds the mechanism from one-hot vectors up to contrastively trained sentence encoders, then covers choosing and running a model. How the vectors are indexed is in [Vector Search and Indexing](/16-vector-search-and-indexing/#hnsw). How they feed a RAG system is in [RAG Pipelines](/17-rag-pipelines/#indexing-pipeline).
+
+## One-hot to dense
+
+After [tokenization](/02-tokenization/#why-discrete-tokens) every word or subword is an integer id. An integer is a name, not a meaning: id 4,021 is not "closer" to id 4,022 in any useful sense. The first fix is the **one-hot vector**. For a vocabulary of V words, word i becomes a V-length vector with a 1 in position i and 0 everywhere else.
+
+One-hot vectors are honest about what they do not know. Every pair of distinct words is equally far apart, and the dot product of any two different words is exactly 0. "Hotel" is as unlike "motel" as it is unlike "giraffe". A bag-of-words document vector (the sum of its one-hots, or TF-IDF weights) inherits the same property. Two documents are similar only if they share literal tokens. That is why the toilet query above fails, and why [BM25](/15-information-retrieval-foundations/#bm25) is still excellent at exact identifiers and useless at paraphrase.
+
+They are also wasteful: with V = 50,000, each word is a 50,000-dimensional vector with one non-zero entry, and nothing learned about "hotel" transfers to "motel".
+
+A **dense embedding** fixes both problems. Give each word a learned vector of d numbers, with d typically 50 to 1,000, stored as a V × d matrix E. Looking up word i is the same as multiplying its one-hot vector by E: the one-hot simply selects row i. So an embedding layer is a linear layer applied to one-hot input, implemented as a table lookup because multiplying by a vector of zeros is pointless.
+
+```python
+import numpy as np
+
+V, d = 6, 3
+vocab = ["hotel", "motel", "inn", "giraffe", "zebra", "lion"]
+one_hot = np.eye(V)                              # row i is word i
+print(one_hot[0] @ one_hot[1])                   # hotel·motel = 0.0, same as hotel·giraffe
+
+# A dense table, here hand-set so the geometry is visible. Training learns it.
+E = np.array([[0.9, 0.1, 0.0],   # hotel
+              [0.8, 0.2, 0.1],   # motel
+              [0.7, 0.1, 0.2],   # inn
+              [0.0, 0.9, 0.3],   # giraffe
+              [0.1, 0.8, 0.4],   # zebra
+              [0.1, 0.7, 0.6]])  # lion
+
+def vec(w): return one_hot[vocab.index(w)] @ E    # identical to E[vocab.index(w)]
+def cos(a, b): return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+
+print(round(cos(vec("hotel"), vec("motel")), 2))    # 0.98
+print(round(cos(vec("hotel"), vec("giraffe")), 2))  # 0.10
+```
+
+The cost is a parameter table: V × d × 4 bytes in float32. At V = 50,000 and d = 300 that is 60 MB, small next to the model that uses it. The win is that each dimension is now shared across words, so whatever pushes "hotel" somewhere also informs "motel" if they are trained on similar evidence. You get **generalisation** in place of memorisation.
+
+Individual dimensions usually mean nothing on their own: training finds a working basis, rotated arbitrarily, so only distances and directions carry meaning. And a randomly initialised table is dense and meaningless. The geometry is only as good as the training signal, which is the next section.
+
+## Distributional hypothesis and word2vec
+
+You cannot label the meaning of 50,000 words by hand. The trick that made dense embeddings practical is to get the signal for free from raw text, using the **distributional hypothesis**: words that occur in similar contexts tend to have similar meanings. Zellig Harris argued this in 1954, and J. R. Firth's 1957 line, roughly "you know a word by the company it keeps", is the version everyone quotes. "Hotel" and "motel" both appear near "booked", "night", "room" and "check-in". "Giraffe" appears near "neck", "savanna" and "zoo". Count contexts and you get meaning without a dictionary.
+
+Early methods counted co-occurrences, reweighted them with pointwise mutual information (PMI) and compressed with SVD. **word2vec** (Mikolov et al. 2013, two papers that year) turned it into a prediction task that trains fast on billions of tokens.
+
+### Skip-gram with negative sampling
+
+Slide a window over the corpus. For each centre word c and each word o within, say, 5 positions, you have a positive pair (c, o). Each word has two vectors: v as a centre word and u as a context word. Training pushes the score `u_o · v_c` up for real pairs. For each real pair it also draws k random "negative" words from the vocabulary (sampled by frequency raised to the 0.75 power, which boosts rare words a little) and pushes their scores down. The loss for one pair is:
+
+```text
+loss = −log σ(u_o · v_c) − Σ_{j=1..k} log σ(−u_j · v_c)        σ = sigmoid
+```
+
+This is a binary classifier ("is this a real neighbour or noise?") whose only parameters are the vectors. Words that share neighbours receive the same gradient pushes and drift together. One SGD step looks like this:
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+V, d, lr, k = 10_000, 100, 0.025, 5
+W_in  = rng.normal(0, 0.01, (V, d))    # v: centre-word vectors (the ones you keep)
+W_out = np.zeros((V, d))               # u: context-word vectors
+sigmoid = lambda x: 1 / (1 + np.exp(-x))
+
+def sgns_step(c: int, o: int, neg_dist: np.ndarray) -> None:
+    negs = rng.choice(V, size=k, p=neg_dist)       # unigram^0.75 distribution
+    ids = np.concatenate(([o], negs))
+    labels = np.array([1.0] + [0.0] * k)           # 1 = real pair, 0 = noise
+    v = W_in[c]
+    scores = sigmoid(W_out[ids] @ v)               # (k+1,) predicted P(real)
+    g = scores - labels                            # gradient of the logistic loss
+    grad_v = g @ W_out[ids]                        # how the centre vector should move
+    np.add.at(W_out, ids, -lr * np.outer(g, v))    # update context vectors (handles repeated ids)
+    W_in[c] -= lr * grad_v                         # update centre vector
+```
+
+Negative sampling exists for cost. The "correct" objective is a softmax over all V words for every pair, which is V dot products per step. Negative sampling replaces that with k + 1 dot products, k usually 5 to 20. With V = 1M that is V / (k + 1), roughly a 50,000× to 170,000× cut in work per step, the difference between weeks and hours.
+
+Levy and Goldberg (2014) showed that skip-gram with negative sampling implicitly factorises a PMI matrix shifted by log k, so the neural and count-based methods are close relatives. GloVe (Pennington et al. 2014) fits log co-occurrence counts directly. fastText (Bojanowski et al. 2017) adds character n-grams, so unseen and misspelt words still get a vector.
+
+### What the geometry captures, and what it does not
+
+The famous result is that directions carry relations: `vec(king) − vec(man) + vec(woman)` lands near `vec(queen)`, and country-to-capital offsets are roughly parallel. Read that carefully before quoting it in an interview. The standard evaluation excludes the three input words from the answer. Without that exclusion the nearest neighbour is often just "king", and analogy accuracy drops sharply (Nissim et al. 2020 make this point). Directions exist, but they are noisier than the demo suggests.
+
+The same mechanism learns whatever the corpus says. Bolukbasi et al. (2016) found occupation words lined up along a gender direction in news-trained vectors ("man is to computer programmer as woman is to homemaker"). An embedding is a compressed summary of its training text, biases included. That matters again later, when a general model meets your legal or medical corpus.
+
+The deeper limit is **one vector per word type**: "bank" in "river bank" and "bank account" gets the same vector, a frequency-weighted average of its senses. Fixing that needs context, two sections on.
+
+## Cosine/dot/L2
+
+Three similarity functions dominate, and two of them are usually the same thing in disguise.
+
+- **Dot product:** `a · b = Σ a_i b_i`. Large when vectors point the same way and are long.
+- **Cosine similarity:** `cos(a, b) = (a · b) / (‖a‖ ‖b‖)`. The dot product with length divided out, so it depends only on the angle. Range −1 to 1.
+- **Euclidean (L2) distance:** `‖a − b‖ = sqrt(Σ (a_i − b_i)²)`. Straight-line distance. Smaller is closer.
+
+The identity that ties them together, for any vectors:
+
+```text
+‖a − b‖² = ‖a‖² + ‖b‖² − 2 (a · b)
+
+If ‖a‖ = ‖b‖ = 1 (unit-normalised):
+‖a − b‖² = 2 − 2 cos(a, b)        and        a · b = cos(a, b)
+```
+
+So once every vector is normalised to length 1, all three rank neighbours **identically**. Dot product equals cosine, and L2 distance is a monotone function of cosine. That is why most production systems normalise once at write time and then use the cheapest operation, the dot product (inner product). It is also why one search over a normalised matrix scores a whole corpus with a single matrix-vector multiply.
+
+```python
+import numpy as np
+
+def normalise(M: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(M, axis=-1, keepdims=True)
+    n[n == 0] = 1.0                            # never divide by zero; flag these rows instead
+    return M / n
+
+rng = np.random.default_rng(1)
+docs = normalise(rng.normal(size=(1000, 384)).astype(np.float32))
+q = normalise(rng.normal(size=384).astype(np.float32))
+
+by_dot = np.argsort(-(docs @ q))[:10]
+by_l2  = np.argsort(np.linalg.norm(docs - q, axis=1))[:10]
+assert (by_dot == by_l2).all()                 # identical ranking on unit vectors
+```
+
+### Why cosine "works"
+
+Cosine is not magic. It works because the model was trained so that it would. A contrastive loss (covered below) literally optimises "the dot product of normalised query and positive is higher than with negatives". The geometry is shaped for that measure. Use the measure the model was trained with: the model card says cosine, dot or L2. A model trained with unnormalised dot product (some older dense retrievers were) can put useful information in vector length, such as how specific or popular a passage is, and normalising throws it away. A model trained with cosine has meaningless lengths, so using raw dot product lets an arbitrarily long vector win.
+
+Some APIs return unit vectors only at their native dimension. Normalise yourself and you never depend on it.
+
+### Scores are ranks, not probabilities
+
+A cosine of 0.82 does not mean "82% relevant". It only says this pair is closer than pairs with lower scores, **for this model**. Different models put unrelated pairs at very different baselines, so a threshold copied from a blog post or from your previous model is wrong by default. Treat any threshold as a calibrated number with a model id attached (see [pitfalls](#pitfalls-domain-shift-anisotropy-version-drift)).
+
+The cost side is simple arithmetic. Exact scoring is N × d multiply-adds per query: 1M vectors × 768 dims ≈ 0.77 billion, which a CPU with a good BLAS does in tens of milliseconds (roughly; measure yours). Past a few million vectors, or at high QPS, you switch to an approximate index; that trade is in [exact kNN limits](/16-vector-search-and-indexing/#exact-knn-limits).
+
+<Callout type="interview">
+
+"Why cosine?" is a probe for whether you know the normalisation identity. Say: on unit vectors cosine, dot product and L2 give the same ranking, so you normalise once and use inner product; the real rule is to use whatever metric the model was trained with.
+
+</Callout>
+
+## Contextual vs static
+
+word2vec, GloVe and fastText are **static** embeddings: one fixed vector per word type, looked up from a table. **Contextual** embeddings give each token occurrence its own vector, computed from the whole sentence around it.
+
+ELMo (Peters et al. 2018) did this with bidirectional LSTMs. BERT (Devlin et al. 2019) did it with a Transformer encoder trained to fill in masked tokens. Inside the encoder, each layer mixes every token's vector with the others through [attention](/05-transformer-intuition/#attention-as-soft-lookup-q-k-v). So by the top layer, the vector at the position of "bank" depends on whether "river" or "loan" is nearby. The static embedding table still exists as the first layer. Everything above it adds context.
+
+```text
+static:      "bank" ──lookup──► v_bank                     (same in every sentence)
+
+contextual:  "I sat on the river bank"  ─► encoder ─► h_bank(river sense)
+             "the bank froze my account" ─► encoder ─► h_bank(finance sense)
+             cos(h_bank(river), h_bank(finance)) noticeably below 1
+```
+
+For retrieval you rarely want a vector per token. You want **one vector per text** (a query, a chunk, a product description). That means **pooling** the token vectors:
+
+- **CLS pooling:** take the vector of the special first token. In BERT it was trained for next-sentence prediction, not similarity.
+- **Mean pooling:** average all token vectors (ignoring padding). This is the usual default.
+- **Last-token pooling:** for decoder-only LLMs used as embedders. Causal attention means only the final token has seen the whole input.
+
+### The surprise: raw BERT makes bad sentence embeddings
+
+A natural first attempt is "run BERT, mean-pool, use cosine". It works badly. Reimers and Gurevych (2019) measured it on semantic textual similarity: averaged BERT token vectors and the CLS vector both did worse than simply averaging static GloVe vectors. The reason is that masked-token pretraining never asked whole-sentence vectors to be comparable by cosine. The same geometry problem shows up as anisotropy, covered in [pitfalls](#pitfalls-domain-shift-anisotropy-version-drift).
+
+So "contextual" is necessary but not sufficient. You need a contextual encoder that has also been **trained for the similarity function you will use**. The same lesson applies to taking hidden states from a chat LLM: without similarity training, they are a poor embedding. Modern LLM-based embedders (several current leaderboard leaders are built on decoder LLMs) add exactly that contrastive fine-tuning on top.
+
+### When static still wins
+
+Static vectors are a table lookup: microseconds, no GPU. They suit classical-model features, keyword expansion or on-device use. For anything sentence-level or multilingual, use a trained contextual encoder. The trade-off is cost: a contextual embedding needs a forward pass through the encoder. That is roughly 2 × parameters × tokens FLOPs, so a 110M-parameter encoder on a 20-token query is about 4.4 GFLOPs. That is milliseconds on a GPU and tens of milliseconds on a CPU core (roughly), and it is on your query hot path.
+
+## Bi-encoders and Sentence-BERT
+
+There are two ways to use a Transformer to score whether text A matches text B.
+
+A **cross-encoder** feeds both texts together, `[CLS] A [SEP] B`, through one encoder and outputs a single relevance score. Every token of A attends to every token of B, so it can notice that "not eligible" negates the match. It is accurate. But nothing can be precomputed: each (query, document) pair needs its own forward pass.
+
+A **bi-encoder** runs A and B through the same encoder **separately**, pools each into a vector, and scores the pair with cosine. The two never see each other inside the model, so it loses fine interactions. But every document vector can be computed once, offline, and stored. A query then costs one forward pass plus a nearest-neighbour search.
+
+```text
+cross-encoder:  [query ‖ doc] ─► encoder ─► score          N forward passes per query
+
+bi-encoder:     query ─► encoder ─► q ┐
+                                      ├─► cos(q, d_i) for all i   1 forward pass per query
+                doc_i ─► encoder ─► d_i (precomputed, indexed)
+```
+
+The Sentence-BERT paper (Reimers and Gurevych 2019) put a number on the gap. Finding the most similar pair in 10,000 sentences with a cross-encoder means scoring every pair: 10,000 × 9,999 / 2 ≈ 50 million forward passes, which they estimated at about 65 hours with BERT. With SBERT it was about 5 seconds: 10,000 encodings plus a cheap matrix of cosines.
+
+### What Sentence-BERT actually did
+
+SBERT is a **siamese** network: BERT with shared weights on both sides, then mean pooling, fine-tuned on about a million natural language inference pairs (SNLI and MultiNLI). A softmax classifier over `(u, v, |u − v|)` forced the pooled vectors themselves to carry the relationship. At inference you drop the classifier and keep the encoder, and cosine between pooled vectors becomes meaningful. The `sentence-transformers` library came out of this work.
+
+```python
+from sentence_transformers import SentenceTransformer   # runs locally, no API
+import numpy as np
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")   # 384 dims, small
+
+docs = ["Financial assistance for construction of individual household latrines.",
+        "Wage rates under the rural employment guarantee scheme.",
+        "Pension eligibility for widows above 40 years of age."]
+D = model.encode(docs, normalize_embeddings=True)          # offline, once: shape (3, 384)
+
+def search(query: str, k: int = 2):
+    q = model.encode([query], normalize_embeddings=True)[0]  # online, per query
+    scores = D @ q                                             # cosine, since unit length
+    top = np.argsort(-scores)[:k]
+    return [(docs[i], round(float(scores[i]), 3)) for i in top]
+
+print(search("can I get money for building a toilet at home"))
+```
+
+### When to use which
+
+Use both, in sequence. The bi-encoder is the **recall** stage: it scans millions of vectors and returns the top 50 to 200 candidates cheaply. The cross-encoder is the **precision** stage: it rescores those few candidates with full attention. Cost per query is one encoder pass plus K cross-encoder passes, with K in the tens, not N. The mechanics, latency budgets and model choices for that second stage are in [cross-encoder re-ranking](/15-information-retrieval-foundations/#cross-encoder-re-ranking). Late-interaction models such as ColBERT sit between the two: they store one vector per token and score with a cheap max-sim over tokens ([late interaction](/15-information-retrieval-foundations/#late-interaction-colbert)).
+
+**Symmetric vs asymmetric tasks.** SBERT was trained on sentence pairs of similar length and type: symmetric similarity. Search is **asymmetric**: a 10-word question against a 300-word passage that answers it. A model trained only on paraphrase pairs will rank a passage that restates the question above one that answers it. Retrieval-trained models handle this with different input prefixes for each side. E5 uses `query: ` and `passage: `, nomic-embed-text uses `search_query: ` and `search_document: `, and Gemini's API has task types such as `RETRIEVAL_QUERY` and `RETRIEVAL_DOCUMENT`. Many newer LLM-based embedders go further and expect a one-line task instruction in front of the query only (for example "Instruct: given a citizen's question, retrieve the scheme clause that answers it"), with documents embedded bare; the exact template is on the model card. Leaving them off, or using the document prefix for queries, is a silent quality loss. Nothing errors, and recall just drops a few points.
+
+<Callout type="warn">
+
+The prefix is part of the model contract. Store it with the model id, apply it in one function used by both the indexer and the query path, and add a test that the query path uses the query prefix.
+
+</Callout>
+
+## Contrastive training
+
+SBERT's NLI classifier was a stepping stone. Nearly every strong embedding model today is trained **contrastively**: show the model a pair that should match and many that should not, and train it to rank the match first. The mechanism is short enough to write out.
+
+Take a batch of B (query, positive) pairs: a question and the passage that answers it, a title and its abstract, a caption and its image. Encode all of them and normalise. Form the B × B matrix of similarities S, where `S[i][j] = q_i · p_j / τ`. The diagonal holds the true pairs. Every off-diagonal entry in row i is another query's positive, reused as a negative for query i. These are **in-batch negatives**: B − 1 negatives per query for free, because you already computed those vectors. The loss is cross-entropy where the correct "class" for row i is column i:
+
+```python
+import numpy as np
+
+def info_nce(Q: np.ndarray, P: np.ndarray, N: np.ndarray | None = None,
+             tau: float = 0.05) -> float:
+    """Q, P: (B, d) unit-normalised; row i of P is the positive for row i of Q.
+    N: optional (M, d) mined hard negatives, added as extra columns for every query."""
+    cols = P if N is None else np.vstack([P, N])           # (B or B+M, d)
+    S = (Q @ cols.T) / tau                                 # scaled similarities
+    S = S - S.max(axis=1, keepdims=True)                   # numerical stability
+    log_softmax = S - np.log(np.exp(S).sum(axis=1, keepdims=True))
+    B = len(Q)
+    return float(-np.mean(log_softmax[np.arange(B), np.arange(B)]))  # −log P(own partner)
+```
+
+This is the **InfoNCE** loss (van den Oord et al. 2018). It is the [softmax](/04-language-modeling-and-sampling/#logits-softmax) you already know, with "which column is my partner?" as the classification task. CLIP (images and text), DPR (Karpukhin et al. 2020, dense passage retrieval) and the E5, BGE and GTE families all train with a variant of it. SimCSE (Gao et al. 2021) showed how far it goes even without labels. Encode the same sentence twice with different dropout masks, call the two outputs a positive pair, and the resulting sentence embeddings perform on par with earlier supervised methods on similarity benchmarks.
+
+### The knobs and why they matter
+
+- **Temperature τ.** Dividing by a small τ (commonly 0.01 to 0.05) sharpens the softmax so the loss concentrates on the hardest negatives. Too high and everything looks equally fine. Too low and training is unstable and over-penalises near-duplicates. CLIP learns τ as a parameter.
+- **Batch size.** More in-batch negatives make the task harder and the embeddings better. CLIP used batches of 32,768.
+- **Hard negatives.** Random negatives are mostly easy. The model learns more from ones that look right and are wrong, such as urban toilet grants for a rural question. DPR added one BM25-retrieved non-answer per question; later recipes mine them with an earlier model.
+- **False negatives.** Some mined negatives (and in-batch duplicates) are actually relevant, and the loss pushes apart things that belong together. Filter negatives that a cross-encoder scores too close to the positive.
+
+### What this means for you in production
+
+You will rarely pretrain an embedder, but **fine-tuning one on your own pairs** is one of the cheapest retrieval gains available. Your logs already hold (query, cited passage) pairs. A few thousand plus mined hard negatives, one epoch of InfoNCE on a small open model, and a before/after recall@10 on a held-out set is a day's work. Hold out by document, not by query, or you measure memorisation. Include the long tail in the eval, because a narrow pair distribution makes the model better at your 20 frequent query types and worse at the rest. And a fine-tuned model is **a new model id**, so every stored vector must be re-embedded ([version drift](#pitfalls-domain-shift-anisotropy-version-drift)).
+
+## Matryoshka embeddings
+
+Dimension is a cost multiplier you pay on every vector forever. Storage is N × d × bytes. Exact search is N × d operations per query. ANN index memory and network transfer both scale with d. Arithmetic for 10M chunks in float32:
+
+```text
+d = 3072:  10M × 3072 × 4 B = 122.9 GB
+d = 1536:  10M × 1536 × 4 B =  61.4 GB
+d =  512:  10M ×  512 × 4 B =  20.5 GB
+d =  256:  10M ×  256 × 4 B =  10.2 GB      (int8 at 256 dims: 2.6 GB)
+```
+
+Cutting off the last dimensions of a normally trained model is destructive, because information is spread across all coordinates.
+
+**Matryoshka Representation Learning** (Kusupati et al. 2022) trains the model so that truncation is safe. The contrastive loss is computed not once but at several nested prefix lengths, for example the first 64, 128, 256, 512 and 1,024 dimensions, and the losses are summed. Gradient pressure then packs the most important information into the earliest dimensions, like nested dolls. The full vector is best, but its first 256 coordinates are a good embedding on their own.
+
+OpenAI's `text-embedding-3` models (1,536 dims small, 3,072 large) expose this as a `dimensions` parameter; their launch post reported the large model at 256 dims still beating their previous 1,536-dim model on MTEB. Gemini has `output_dimensionality`, and open models such as nomic-embed-text v1.5 are trained this way too. If the model card does not say Matryoshka, truncation is not a feature.
+
+```python
+import numpy as np
+
+def truncate(V: np.ndarray, k: int) -> np.ndarray:
+    """Keep the first k dims of a Matryoshka embedding and RE-NORMALISE.
+    A prefix of a unit vector has length < 1, so cosine-by-dot-product breaks without this."""
+    Vk = V[:, :k]
+    return Vk / np.linalg.norm(Vk, axis=1, keepdims=True)
+
+def recall_at_k(Q, D, gold, k=10):                 # gold[i] = index of the right doc for query i
+    top = np.argsort(-(Q @ D.T), axis=1)[:, :k]
+    return float(np.mean([g in row for g, row in zip(gold, top)]))
+
+def dimension_sweep(Q_full, D_full, gold, dims=(1024, 512, 256, 128)):
+    for k in dims:
+        r = recall_at_k(truncate(Q_full, k), truncate(D_full, k), gold)
+        print(f"d={k:5d}  recall@10={r:.3f}  bytes/vec={k*4}")
+```
+
+### Two production patterns
+
+1. **Pick a smaller d and stop.** Run the sweep above on your labelled set, find the smallest d whose recall is within your tolerance of full size, and store that. Half the dimensions halves storage and search compute.
+2. **Funnel (adaptive retrieval).** Search a cheap index of 128- or 256-dim prefixes to get the top 200, then rescore those 200 with the full vectors held on disk or in a column. You get most of the speed of the small vector and most of the quality of the large one. It combines naturally with int8 or binary quantization ([quantization](/16-vector-search-and-indexing/#binary-int8-quantization)): 1,024 dims as one bit each is 128 bytes, a 32× cut from float32.
+
+**The renormalisation trap.** A prefix of a unit vector is shorter than 1, so dot-product scores shrink and thresholds shift. Some APIs renormalise for you and some do not. Normalise after every truncation, in your code.
+
+**The id trap.** A shape mismatch fails loudly; a 1,024-dim query against 1,024-dim rows from a different model fails silently. Put the dimension in the model id, for example `openai:text-embedding-3-large@1024`.
+
+## Multimodal (CLIP-style)
+
+The contrastive recipe does not care what the two inputs are. **CLIP** (Radford et al. 2021) trained an image encoder and a text encoder together on about 400 million (image, caption) pairs from the web, with the same B × B InfoNCE matrix: the caption written for image i is the positive, and the other captions in the batch are negatives. Both encoders project into one shared space, so an image and a sentence describing it land near each other.
+
+That shared space gives you three capabilities with no task-specific training:
+
+- **Text-to-image search:** embed the query text and find the nearest image vectors.
+- **Image-to-image and image-to-text search:** embed a photo and find similar photos or matching descriptions.
+- **Zero-shot classification:** embed each label as a sentence ("a photo of a cracked wall", "a photo of an intact wall") and pick the label nearest the image. CLIP matched a fully supervised ResNet-50 on ImageNet this way without using any of ImageNet's training labels.
+
+```python
+import numpy as np
+
+def zero_shot_classify(image_vec: np.ndarray, labels: list[str], embed_text) -> list[tuple[str, float]]:
+    """image_vec: unit-normalised CLIP image embedding. embed_text: CLIP text tower (or a mock)."""
+    prompts = [f"a photo of {l}" for l in labels]           # prompt template matters (a few points)
+    T = np.stack([embed_text(p) for p in prompts])
+    T = T / np.linalg.norm(T, axis=1, keepdims=True)
+    logits = 100.0 * (T @ image_vec)                         # CLIP's learned scale is ~100
+    p = np.exp(logits - logits.max()); p /= p.sum()
+    return sorted(zip(labels, p.round(3).tolist()), key=lambda x: -x[1])
+```
+
+### What goes wrong
+
+- **The modality gap.** Liang et al. (2022) showed that image vectors and text vectors occupy separate regions of the shared space, even after training. Cross-modal similarities are systematically lower than within-modality ones. So in a mixed index, a text query's nearest neighbours are often other texts, not the images you wanted. Keep separate indexes per modality, or keep separate thresholds and fuse rankings rather than raw scores.
+- **Text inside images.** CLIP-style models partly read text in images, which makes them vulnerable to typographic attacks: a label stuck on an object can change the prediction. For scanned documents that is a feature to exploit, not a curiosity.
+- **Documents are not photos.** A scanned form or a slide is mostly layout and text. CLIP was trained on natural photos with short captions, and it is weak there. For page images the current options are OCR then text embeddings, or document-screenshot retrievers such as ColPali (Faysse et al. 2024), which embed page images with a vision-language model and late interaction. See [tables and multimodal](/18-advanced-and-agentic-rag/#tables-and-multimodal) for the RAG side.
+
+SigLIP (Zhai et al. 2023) replaced the softmax with a per-pair sigmoid loss, a training-efficiency change to recognise by name. Image towers are heavier than embedding a short query, so image embedding belongs in the offline ingest path, cached by content hash.
+
+## Choosing a model (MTEB, dims, cost, latency)
+
+You choose an embedding model once and live with it for a long time, because changing it means re-embedding everything. Choose on evidence from your own data, with public benchmarks as a shortlist only.
+
+### What MTEB is, and how to read it
+
+The Massive Text Embedding Benchmark (Muennighoff et al. 2022) evaluates embedders across task types: retrieval, reranking, classification, clustering, pair classification, semantic textual similarity (STS), summarisation and bitext mining. The original release covered 58 datasets in 112 languages, and the multilingual extension (MMTEB) is much larger. Its headline finding still holds: no single model wins every task.
+
+Reading the leaderboard well:
+
+- **Look at the retrieval column, not the average.** The average blends clustering and classification, which you may not care about. The retrieval tasks are largely drawn from BEIR (Thakur et al. 2021).
+- **Look at the languages you serve.** An English-strong model can be mediocre on Hindi or Hinglish.
+- **Discount small gaps.** A 1-point difference in average score is noise relative to the difference between any public dataset and your corpus.
+- **Watch for contamination.** Some models train on benchmark training splits. A leaderboard number means "worth testing", not "will be best".
+
+### The variables that actually decide
+
+| Variable | Why it matters | How to measure |
+|---|---|---|
+| Recall on your queries | The only quality number that predicts your system | recall@10 / nDCG@10 on 50 to 200 labelled queries |
+| Dimensions (and Matryoshka support) | Storage and search cost, forever | N × d × bytes |
+| Max input tokens | Text past the limit is silently cut off | Compare against your chunk length distribution |
+| Languages and scripts | Cross-lingual queries are common in India | Stratify the eval by language |
+| Hosted vs self-hosted | Price per token vs GPU-hours; data residency | Monthly tokens × price vs GPU cost |
+| Query latency (p95) | It is on the hot path of every request | Time the call from your server, not a laptop |
+| Licence and stability | Deprecations force a migration on someone else's schedule | Read the licence and deprecation policy |
+
+The cost arithmetic for a hosted model is one-off for the corpus plus a running cost for queries:
+
+```text
+corpus cost   = chunks × avg tokens per chunk / 1e6 × price per 1M tokens
+                (2M chunks × 350 tokens = 700M tokens → 700 × P)
+monthly query = queries/month × avg query tokens / 1e6 × P
+                (3M queries × 20 tokens = 60M tokens → 60 × P)
+```
+
+Embedding prices are low per token compared with generation (check the current price page), so the expensive parts are usually **storage at high d** and **re-embedding on every model change**. Self-hosting trades the bill for GPU time: chunks / T seconds, with throughput T measured on your hardware and chunk lengths.
+
+### A selection harness
+
+```python
+import numpy as np, time
+
+def evaluate(embed, queries, corpus, gold, k=10, query_prefix="", doc_prefix=""):
+    """embed(list[str]) -> (n, d) array. gold[i] = set of relevant corpus indices for query i."""
+    D = embed([doc_prefix + c for c in corpus])
+    D /= np.linalg.norm(D, axis=1, keepdims=True)
+    t0 = time.perf_counter()
+    Q = embed([query_prefix + q for q in queries])
+    q_ms = (time.perf_counter() - t0) * 1000 / len(queries)
+    Q /= np.linalg.norm(Q, axis=1, keepdims=True)
+    top = np.argsort(-(Q @ D.T), axis=1)[:, :k]
+    recall = np.mean([len(set(row) & g) / len(g) for row, g in zip(top, gold)])
+    hit = np.mean([bool(set(row) & g) for row, g in zip(top, gold)])
+    return {"recall@k": round(float(recall), 3), "hit@k": round(float(hit), 3),
+            "dim": D.shape[1], "ms_per_query_batched": round(q_ms, 2)}
+```
+
+Run it for 2 to 4 candidates plus BM25 on one labelled set, and report per query type and language ([IR metrics](/15-information-retrieval-foundations/#metrics-p-k-r-k-mrr-ndcg)). Beware **pooling bias**: if labels came from judging only what model A retrieved, model A will look best. Pool candidates from every system, then label blind.
+
+## Pitfalls (domain shift, anisotropy, version drift)
+
+Embedding failures are rarely crashes. You get ten plausible-looking results and the right one is not among them. Three causes are worth knowing by name.
+
+### Domain shift
+
+A general embedder learned "similar" from web text, forums and NLI pairs. Inside a specialised domain (legal clauses, drug interactions, Hindi circulars) everything looks alike to it, while the distinctions that matter (section 80C vs 80D, a superseded clause vs its replacement) are the fine differences it never learned. BEIR (Thakur et al. 2021) showed dense retrievers trained on one dataset often losing to plain BM25 on a new domain. Symptoms: identifiers and acronyms retrieve badly, and the top 10 are all "on topic" with none the specific answer. Remedies, cheapest first:
+
+1. **Hybrid retrieval.** Add a BM25 leg and fuse ranks, so exact tokens get a vote ([hybrid search](/15-information-retrieval-foundations/#hybrid-search-and-rrf)).
+2. **Enrich the indexed text** with the document title and heading path ([contextual enrichment](/17-rag-pipelines/#contextual-enrichment)).
+3. **Choose a domain-closer model** with your harness.
+4. **Fine-tune** on your pairs ([contrastive training](#contrastive-training)).
+5. **Re-rank** with a cross-encoder, which reads the query and passage together.
+
+The mirror-image mistake is putting constraining metadata (subject code, date, jurisdiction) **into** the document text. A query that cannot contain it is pushed away from its exact match. Put it in filter columns or the reranker.
+
+### Anisotropy
+
+You might expect unrelated texts to score near 0. With many models they score 0.6, 0.7 or higher. Ethayarajh (2019) found contextual representations occupy a narrow cone rather than spreading over the sphere, so even random words have high cosine, especially in upper layers. Contrastive training largely repairs this: Wang and Isola (2020) framed the goal as **alignment** (positives close) plus **uniformity** (everything spread out). But a compressed score range survives in many production models.
+
+Consequences:
+
+- **Thresholds are fragile.** If relevant pairs score 0.85 and unrelated ones 0.78, a 0.80 cut-off sits on a cliff, and any change to model, prefix or text moves both populations.
+- **Hubness.** A few vectors become the nearest neighbour of a large share of queries (Radovanović et al. 2010) and show up in every top 10. Watch per-document retrieval counts.
+
+Fixes: calibrate thresholds per model on your own data; prefer **rank-based** decisions (top-k, rank fusion) to score cut-offs; and for older models, mean-centre (subtract the corpus mean, renormalise) or whiten (Su et al. 2021). Centring is a fitted transform, so it is part of the model version.
+
+```python
+import numpy as np
+
+def calibrate_threshold(same_scores, diff_scores, max_fpr=0.05):
+    """same_scores: cosines for pairs that SHOULD match; diff_scores: for pairs that should not.
+    Both must come from the REAL runtime path: raw query text vs stored corpus vectors."""
+    diff = np.sort(np.asarray(diff_scores))
+    t = float(diff[int(np.ceil((1 - max_fpr) * len(diff))) - 1])   # allow max_fpr false matches
+    tpr = float(np.mean(np.asarray(same_scores) > t))
+    return {"threshold": round(t, 4), "recall_of_true_matches": round(tpr, 3),
+            "gap": round(float(np.min(same_scores) - diff.max()), 4)}
+```
+
+### Version drift
+
+The most expensive pitfall, because it is silent. Vectors from two models, or two versions of one, live in **different coordinate systems**, often with the same dimension. A model-B query against model-A vectors returns normal-looking scores and an essentially random ranking. It happens through a provider switch on the query path only, a backfill that died halfway, a changed prefix, pooling, truncation or normalisation step (same weights, different function), a loose dependency pin on a self-hosted model, or, more rarely, a hosted model revised behind the same name.
+
+The defence is bookkeeping:
+
+1. **Stamp every vector** with a full model id: provider, model, version, dimension, prefix scheme. For example `openai:text-embedding-3-large@1024`.
+2. **Filter by it at query time**, or assert in the query path that the index's id equals the query embedder's id, and fail loudly if not.
+3. **Canary check.** On deploy and daily, re-embed a few fixed probe texts and assert cosine against their stored vectors is about 1.0.
+4. **Migrate as a new index**, never in place. Build the new vectors alongside the old, evaluate, switch, and keep the old for rollback. The full plan is in the 50M-vector interview answer below and in [re-embedding](/16-vector-search-and-indexing/#updates-deletes-re-embedding).
+
+<Callout type="tip">
+
+Treat embeddings as a derived, versioned index, never as source data. If you can regenerate every vector from stored text plus a model id, a migration costs only compute. If the source text is gone, the vectors are a one-way door.
+
+</Callout>
+
+<Production>
+
+**Failure modes.**
+
+- Vectors from two models (or one model at two dimensions or prefixes) in one index: plausible garbage, no error.
+- Domain mismatch: poor recall on identifiers and precise questions while paraphrases look fine.
+- Thresholds calibrated on the wrong population (corpus vs corpus instead of query vs corpus) or on the previous model.
+- Chunks longer than the model's input limit, silently truncated; missing or swapped query/document prefixes.
+
+**Cost.**
+
+- Storage is N × d × bytes per component. 50M × 1,024 × 4 B ≈ 205 GB in float32, ≈ 51 GB in int8, ≈ 6.4 GB binary. That is before ANN index overhead and replicas.
+- Re-embedding on a model upgrade is the big recurring bill. Hosted: total corpus tokens / 1e6 × price (50M chunks × 300 tokens = 15B tokens → 15,000 × P). Self-hosted: N / T seconds of GPU, with throughput T measured.
+- Matryoshka truncation and quantization cut storage linearly; measure recall at each step. Cache embeddings by (content hash, model id).
+
+**Latency.** The query embedding is on the hot path of every request, before any search can start.
+
+- A hosted API call adds a network round trip plus queueing, often 50 to several hundred milliseconds at p95 (roughly; measure from your server region). A small local encoder on CPU is tens of milliseconds.
+- Levers: an LRU cache of recent query vectors, and starting the embedding call in parallel with the lexical query.
+
+**Observability.**
+
+- Store model id, dimension and embedded-at per vector. Expose "rows per model id" as a metric: during a migration it is your progress bar, outside one more than one value is an incident.
+- Log the query model id and top-k scores per request. A sudden shift in median top-1 score means the model, prefix or data changed.
+- Canary probe on deploy; recall@k on a labelled set as a CI gate for any embedding change.
+
+**Security.**
+
+- **Embeddings are not anonymised data.** Morris et al. (2023, "Text Embeddings Reveal (Almost) As Much As Text") trained an inversion model (vec2text) that recovered 92% of 32-token inputs exactly from the embeddings of the open encoder they attacked, and recovered full names from clinical notes. Other models are not immune by default; assume a vector can be inverted. Treat a vector store with the same access controls, encryption and retention rules as the text it came from.
+- A hosted embedding API is a data transfer: a residency question for government, health or legal data.
+- Anyone who can write to the corpus can plant passages crafted to sit near common queries ([indirect injection](/33-security-prompt-injection/#indirect-injection)). Enforce tenant and ACL filters inside the vector query.
+
+</Production>
+
+<Interview>
+
+<Q q="What is an embedding, and why does cosine similarity work?">
+
+- A learned map from an input (token, sentence, image) to a dense vector, trained so that closeness tracks the similarity the training signal defined: shared contexts for word2vec, query-passage relevance for retrievers.
+- It starts as a lookup table (one-hot times a V × d matrix); contextual models refine token vectors with attention, then pool to one vector per text.
+- Cosine works because the model was **trained** with it: a contrastive (InfoNCE) loss directly optimises normalised dot product to rank positives above negatives.
+- On unit vectors, cosine = dot product, and ‖a − b‖² = 2 − 2cos, so all three metrics rank identically. Normalise once and use inner product. Use the metric the model card specifies.
+- Scores are model-specific ranks, not probabilities. Many models compress unrelated pairs into a high band (anisotropy), so thresholds must be calibrated per model.
+- **The trap:** "cosine measures how similar the meanings are" with no mention of training, or claiming that 0.8 means "80% similar" or that a threshold transfers across models.
+
+</Q>
+
+<Q q="Bi-encoder vs cross-encoder: when do you use each?">
+
+- **Bi-encoder:** encodes query and document separately into vectors. Documents are precomputed, so a query costs one forward pass plus ANN search. Use it for first-stage recall over millions of items.
+- **Cross-encoder:** reads query and document together with full cross-attention and outputs one score. It is more accurate on negation, specificity and multi-constraint queries, but needs one forward pass per pair and cannot be indexed. Use it to rerank the top 20 to 100.
+- Quote the SBERT number: best pair among 10,000 sentences is about 50M cross-encoder passes (n(n−1)/2), estimated at about 65 hours, vs about 5 seconds with a bi-encoder.
+- Production uses both: bi-encoder (plus BM25) for recall@K, cross-encoder for precision@n. Cost is 1 + K forward passes per query, so K is a latency budget. Late interaction (ColBERT) sits in between.
+- **The trap:** "cross-encoders are better, so use them" without the N-passes-per-query cost, or "bi-encoders are enough" without measuring what a reranker adds on your set.
+
+</Q>
+
+<Q q="How would you pick an embedding model for legal documents?">
+
+- **Scope first.** Languages, document length vs input limit, query style (plain questions vs section numbers), corpus size, residency, latency SLO.
+- **Shortlist** 3 or 4 models from MTEB's retrieval column filtered by language and licence, one self-hostable, plus BM25 as a baseline.
+- **Build the eval before choosing.** 100 to 200 queries stratified by type (exact citation, paraphrase, cross-lingual, "superseded vs current"), labelled blind from a pooled candidate set.
+- **Expect domain shift.** Legal text is full of identifiers and near-identical clauses, so plan hybrid BM25 + dense retrieval, heading-path enrichment of chunks and a cross-encoder reranker. Fine-tuning on (question, clause) pairs is the next step if recall is still short.
+- **Numbers to quote:** storage N × d × 4 bytes (Matryoshka-truncate if recall holds); re-embed cost = corpus tokens × price; p95 query-embed latency measured from your region.
+- **The trap:** "take the top of the MTEB leaderboard" or "use a legal-BERT" without an eval on your own queries, or ignoring that section numbers need a lexical leg.
+
+</Q>
+
+<Q q="How do you migrate 50M vectors to a new embedding model with zero downtime?">
+
+- **Principle:** two models' vectors are incompatible even at equal dimension, so never mix them. Build a second index and switch atomically.
+- **Size it.** At 1,024 dims, 50M × 4 KB ≈ 205 GB float32 per copy, so budget double storage during the overlap. Re-embed cost: 50M × ~300 tokens = 15B tokens → 15,000 × price per 1M tokens hosted, or 50M / T GPU-seconds self-hosted (at a measured T = 2,000 chunks/s, about 7 GPU-hours).
+- **Dual-write.** From day 0, new and changed documents are embedded with both models. Each row carries its model id.
+- **Backfill.** A resumable, throttled job over rows missing the new-model vector, committing per batch, keyed by content hash.
+- **Validate.** Labelled eval on both indexes (recall@k, nDCG); shadow live traffic and compare top-k overlap; recalibrate every threshold.
+- **Cut over** with one alias or flag that switches query embedder and index **together**, by tenant or traffic percentage. Keep the old index and dual-write for a rollback window, then drop it. Assert embedder id equals index id on every request.
+- **The trap:** re-embedding in place (mixed spaces mid-migration), switching the query model before the backfill finishes, or forgetting that thresholds and caches keyed on the old model are now wrong.
+
+</Q>
+
+<Q q="Your similarity threshold worked last month and now lets junk through. What happened?">
+
+- First suspect the embedding function: a model or version change, a new `dimensions` value without renormalisation, a prefix change, a dependency bump. Check query vs row model ids and run the canary.
+- Then the data: new document types or languages, or metadata added to one side only.
+- Plot true-match and non-match score populations from the runtime path (query vs stored corpus) and look at the gap.
+- Fix by recalibrating per model id at a chosen false-positive rate. Prefer rank-based gates or a cross-encoder score for decisions that matter. Store the threshold next to the model id it belongs to.
+- **The trap:** nudging the number until today's examples pass, without asking which side of the comparison changed.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Compare two local embedding models on Scheme Assistant's own corpus, then write the migration plan you would need to switch.** Do it in `~/scheme-assistant` as a new script, for example `scripts/compare_embedders.py`. Everything runs offline with `sentence-transformers`: `BAAI/bge-m3` (already the `LocalEmbeddings` default in `src/app/core/embeddings.py`) against a smaller multilingual model such as `intfloat/multilingual-e5-small` (remember its `query: ` / `passage: ` prefixes). No paid API.
+
+1. **Export a sample.** Dump about 2,000 retrievable chunks (id, heading, body, clause path, document title) to `artifacts/chunks_sample.jsonl`, using the same `heading + "\n" + body` text that `chunk_text_for_embedding` in `src/app/ingest/embed.py` produces.
+2. **Label 50 queries.** Mix Hindi, English and Hinglish, and include exact clause lookups, paraphrases and two or three questions whose answer is in a superseded version. Pool candidates from both models' top 20 and a BM25 top 20, then mark the relevant chunk ids without looking at which system found them. Save to `artifacts/embed_eval_labels.json`.
+3. **Run the harness** from the [model choice](#choosing-a-model-mteb-dims-cost-latency) section for both models and BM25: recall@10, hit@10, dimension, and ms per query on your machine. Break results down by language and query type.
+4. **Calibrate.** For each model, compute the score distributions of true and false matches and the gap, using the [calibration function](#pitfalls-domain-shift-anisotropy-version-drift). Note how far apart the two models' "good" scores sit.
+5. **Matryoshka check (optional).** If a candidate supports it, sweep 1,024 / 512 / 256 dims with renormalisation and record recall at each.
+6. **Write `docs/embedding-migration.md`** for switching to the winner: the new model id (with dimension), a storage estimate, dual-write in `embed_pending`, backfill via the existing `embedding_model != model_id` selector, validation gates per language stratum, the flip that moves query embedder and rows together, the threshold to recalibrate (the per-tenant `abstain_score_floor` in `src/app/db/tenants.py`) and the rollback window.
+
+**Done when:**
+
+- One command prints a table of both models plus BM25 with recall@10 and hit@10 overall and per language.
+- The labels file has 50 queries, and the pooling is documented in the script's docstring.
+- Each model has a calibrated threshold and gap printed next to its model id.
+- The migration doc names every place a model id or threshold lives, with a rollback step.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader's `backend/embeddings.py` is your version-drift answer, with the reasoning written down.** Its docstring warns that OpenAI and Gemini vectors share `EMBEDDING_DIM`, so a provider swap "is NOT detectable by shape" and yields "meaningless similarities rather than an error". `reembed_corpus.py` treats embeddings as a derived index and requires an all-or-nothing rebuild. `backend/retrieval.py` raises a clear error when the query dimension differs from the corpus. Then admit the gap: no per-row model id, so a same-dimension switch is caught only by discipline.
+- **The same file is a measured "what goes in the vector" story.** `build_retrieval_representation` records a measurement over 200 questions. With question text only, exact matches scored about 1.0 and the best different question 0.90, a gap of 0.095. Adding a `Subject:` line to the corpus side only pulled exact matches down to a median of 0.93 and a minimum of 0.84, and the gap shrank to 0.002. The rule it lands on, "metadata that constrains rather than means... belongs in the rerank", is the domain-shift and calibration lesson in your own numbers. `scripts/calibrate_reuse_threshold.py` adds the population lesson: calibrating corpus against corpus endorsed a threshold that caught only 56% of real matches, so it now embeds real query text against stored vectors.
+- **Matryoshka and normalisation, in Answer Grader code.** `_normalize` exists because a truncated Gemini vector comes back un-normalised. `_embed_openai` omits the `dimensions` parameter at the native 1,536 so query vectors stay comparable with the stored corpus. One honest catch: `_embed_gemini` sends `task_type="RETRIEVAL_DOCUMENT"` for every call, queries included, so if you ever switch providers, use `RETRIEVAL_QUERY` on the query path.
+- **Scheme Assistant is the fully pinned version.** `src/app/core/embeddings.py` builds the model id with the dimension in it (`openai:text-embedding-3-large@1024`, or `local:BAAI/bge-m3` for residency). `embed_pending` in `src/app/ingest/embed.py` re-embeds any chunk whose `embedding_model` differs from the embedder's id, committing per batch, and `src/app/config.py` calls the model a "one-way door". `DenseRetriever` in `src/app/core/retrieval.py` keeps a 256-entry LRU of query vectors and overlaps the call (its comment estimates 0.5 to 1 s on OpenAI) with the lexical leg. `scripts/d3_bge_m3_check.py` tested BGE-M3 on real Hindi, English and Hinglish pages, cross-language queries included, before committing: your "pick a model on your own data" answer.
+- **Contrast and gaps.** Memory Agent chose "No embeddings" for memory (`src/memory.ts`, FTS5/BM25 by day and topic), which is a defensible choice when recall is by date and keyword. Chat Insights's `backend/src/services/embeddings.js` is a stub that returns null. None of your repos has an embedding canary probe, a fine-tuned embedder, Matryoshka truncation chosen by a recall sweep, or a multimodal (CLIP-style) index. The Apply-it above gives Scheme Assistant a model comparison and a migration plan.
+
+</YourProject>

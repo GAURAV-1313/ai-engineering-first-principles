@@ -1,0 +1,102 @@
+---
+import Page from '../../layouts/Page.astro';
+import EvidenceCard from '../../components/EvidenceCard.astro';
+import { repos, evidence, flows, byStrength, qualityGlyph } from '../../lib/data';
+import { chapters, chapterHref } from '../../lib/outline';
+
+export function getStaticPaths() {
+  return repos.map((repo) => ({ params: { slug: repo.slug }, props: { repo } }));
+}
+const { repo } = Astro.props;
+const list = evidence.filter((e) => e.repo === repo.slug);
+const myFlows = flows.filter((f) => f.repo === repo.slug);
+const q = { solid: list.filter((e) => e.quality === 'solid').length, naive: list.filter((e) => e.quality === 'naive').length,
+  missing: list.filter((e) => e.quality === 'missing').length };
+const byCh = chapters.map((c) => ({ c, items: list.filter((e) => e.chapter === Number(c.id)).sort((a, b) => a.conceptId.localeCompare(b.conceptId) || byStrength(a, b)) }))
+  .filter((x) => x.items.length);
+const layers = [...new Set(list.map((e) => e.layer))];
+const stepHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\(([^()]+:\d+(?:-\d+)?)\)/g, '<code>$1</code>');
+---
+<Page title={`${repo.name}: AI Engineering in Real Code`} description={`${repo.product}`.slice(0, 300)} crumb="Repos" current="repos" wide>
+  <div class="repo" style={`--fam: var(--fam-${repo.hue})`}>
+    <header class="view-head">
+      <p class="view-crumbs"><a href="/repos/">Repos</a> <span aria-hidden="true">/</span> {repo.familyName}</p>
+      <h1 class="view-title"><span class="chip chip-lg">{repo.chip}</span> {repo.name}</h1>
+      <p class="view-lede">{repo.product}</p>
+      <dl class="repo-facts">
+        <div><dt>Stack</dt><dd>{repo.stack.join(', ')}</dd></div>
+        <div><dt>Examples</dt><dd>{list.length}: {q.solid} solid, {q.naive} naive, {q.missing} missing</dd></div>
+        <div><dt>Chapters</dt><dd>{byCh.length} of {chapters.length}</dd></div>
+        {repo.share && <div><dt>Who wrote it</dt><dd>{repo.share}</dd></div>}
+        {repo.github && <div><dt>Source</dt><dd><a href={`https://github.com/${repo.github}`} target="_blank" rel="noopener noreferrer">{repo.github}</a></dd></div>}
+      </dl>
+    </header>
+
+    {repo.architecture && (
+      <section class="iv-sec" aria-labelledby="arch-h">
+        <h2 class="sec-h" id="arch-h">How the AI path is built</h2>
+        <p class="repo-prose">{repo.architecture}</p>
+      </section>
+    )}
+
+    {myFlows.length > 0 && (
+      <section class="iv-sec" aria-labelledby="flows-h">
+        <h2 class="sec-h" id="flows-h">Request flows</h2>
+        <p class="sec-note">End-to-end journeys through the code, each step pinned to a file and line. Good material for "walk me through your system".</p>
+        {myFlows.map((f) => (
+          <details class="flow">
+            <summary><span class="flow-t">{f.name}</span><span class="iv-k">{f.steps.length} steps · ch {f.chapters.map((n) => String(n).padStart(2, '0')).join(', ')}</span></summary>
+            <ol class="flow-steps">{f.steps.map((s) => <li set:html={stepHtml(s)} />)}</ol>
+          </details>
+        ))}
+      </section>
+    )}
+
+    {repo.uncovered.length > 0 && (
+      <section class="iv-sec" aria-labelledby="unc-h">
+        <h2 class="sec-h" id="unc-h">Not in this repo</h2>
+        <p class="sec-note">Hands-on sections this repo does not demonstrate. See <a href="/gaps/">Gaps</a> for the whole picture.</p>
+        <p class="unc">{repo.uncovered.map((id) => <span class="iv-id">{id}</span>)}</p>
+      </section>
+    )}
+
+    <section class="iv-sec" aria-labelledby="ex-h" data-repo-examples>
+      <h2 class="sec-h" id="ex-h">Every example, by chapter</h2>
+      <div class="filters" role="group" aria-label="Filter examples">
+        <span class="filters-l">Show</span>
+        <button type="button" class="fbtn" data-f="quality" data-v="weak" aria-pressed="false">Only naive and missing</button>
+        <button type="button" class="fbtn" data-f="author" data-v="mine" aria-pressed="false">Only mine</button>
+        {layers.length > 1 && layers.map((l) => <button type="button" class="fbtn" data-f="layer" data-v={l} aria-pressed="false">{l}</button>)}
+      </div>
+      {byCh.map(({ c, items }) => (
+        <details class="exch">
+          <summary>
+            <span class="iv-id">{c.id}</span><span class="exch-t">{c.title}</span>
+            <span class="exch-q">{qualityGlyph.solid} {items.filter((e) => e.quality === 'solid').length}
+              {items.some((e) => e.quality === 'naive') && <> {qualityGlyph.naive} {items.filter((e) => e.quality === 'naive').length}</>}
+              {items.some((e) => e.quality === 'missing') && <> {qualityGlyph.missing} {items.filter((e) => e.quality === 'missing').length}</>}</span>
+            <a class="exch-read" href={`${chapterHref(c)}?repo=${repo.slug}`}>Read with these</a>
+          </summary>
+          <div class="exch-cards">{items.map((e) => <EvidenceCard e={e} titles={{}} />)}</div>
+        </details>
+      ))}
+    </section>
+  </div>
+</Page>
+<script>
+  const root = document.querySelector<HTMLElement>('[data-repo-examples]');
+  const state: Record<string, string | null> = { quality: null, author: null, layer: null };
+  root?.querySelectorAll<HTMLButtonElement>('.fbtn').forEach((b) => b.addEventListener('click', () => {
+    const f = b.dataset.f!; const on = b.getAttribute('aria-pressed') !== 'true';
+    root.querySelectorAll<HTMLButtonElement>(`.fbtn[data-f="${f}"]`).forEach((x) => x.setAttribute('aria-pressed', 'false'));
+    b.setAttribute('aria-pressed', String(on)); state[f] = on ? b.dataset.v! : null;
+    root.querySelectorAll<HTMLElement>('.ev').forEach((ev) => {
+      ev.hidden = (state.quality === 'weak' && ev.dataset.quality === 'solid') || (!!state.author && ev.dataset.author !== state.author)
+        || (!!state.layer && ev.dataset.layer !== state.layer);
+    });
+    root.querySelectorAll<HTMLDetailsElement>('.exch').forEach((d) => {
+      const any = [...d.querySelectorAll<HTMLElement>('.ev')].some((ev) => !ev.hidden);
+      d.hidden = !any; if (on && any) d.open = true;
+    });
+  }));
+</script>

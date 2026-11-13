@@ -1,0 +1,3422 @@
+{
+  "parts": [
+    {
+      "id": "I",
+      "title": "Foundations",
+      "chapters": [
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "06",
+        "07",
+        "08",
+        "09"
+      ]
+    },
+    {
+      "id": "II",
+      "title": "Inference and serving economics",
+      "chapters": [
+        "10",
+        "11"
+      ]
+    },
+    {
+      "id": "III",
+      "title": "Talking to models",
+      "chapters": [
+        "12",
+        "13",
+        "14"
+      ]
+    },
+    {
+      "id": "IV",
+      "title": "Retrieval and RAG",
+      "chapters": [
+        "15",
+        "16",
+        "17",
+        "18"
+      ]
+    },
+    {
+      "id": "V",
+      "title": "Evaluation",
+      "chapters": [
+        "19",
+        "20"
+      ]
+    },
+    {
+      "id": "VI",
+      "title": "Agents",
+      "chapters": [
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28"
+      ]
+    },
+    {
+      "id": "VII",
+      "title": "Production",
+      "chapters": [
+        "29",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34"
+      ]
+    }
+  ],
+  "chapters": [
+    {
+      "id": "01",
+      "slug": "what-ai-engineering-is",
+      "title": "What AI Engineering Is",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "01.01",
+          "title": "Foundation models vs classical ML",
+          "slug": "foundation-models-vs-classical-ml"
+        },
+        {
+          "id": "01.02",
+          "title": "Three-layer AI stack (app/model/infra)",
+          "slug": "three-layer-ai-stack-app-model-infra"
+        },
+        {
+          "id": "01.03",
+          "title": "AI eng vs ML eng vs full-stack",
+          "slug": "ai-eng-vs-ml-eng-vs-full-stack"
+        },
+        {
+          "id": "01.04",
+          "title": "Probabilistic software: non-determinism as a design constraint",
+          "slug": "probabilistic-software-non-determinism-as-a-design-constraint"
+        },
+        {
+          "id": "01.05",
+          "title": "Use-case taxonomy (coding, extraction, support, search, automation)",
+          "slug": "use-case-taxonomy-coding-extraction-support-search-automation"
+        },
+        {
+          "id": "01.06",
+          "title": "Evaluating a use case; setting expectations",
+          "slug": "evaluating-a-use-case-setting-expectations"
+        },
+        {
+          "id": "01.07",
+          "title": "Demo-to-production gap; milestones; maintenance",
+          "slug": "demo-to-production-gap-milestones-maintenance"
+        },
+        {
+          "id": "01.08",
+          "title": "Build vs buy at the model layer",
+          "slug": "build-vs-buy-at-the-model-layer"
+        }
+      ],
+      "production": {
+        "F": "shipping demos that fail on the long tail; no eval baseline before launch.",
+        "C": "underestimating per-user token spend.",
+        "L": "chat-speed expectations.",
+        "O": "no traces from day one.",
+        "S": "data sent to third-party APIs."
+      },
+      "interview": [
+        {
+          "q": "How is AI engineering different from ML engineering?",
+          "reported": false
+        },
+        {
+          "q": "Walk me through taking an LLM feature from prototype to production.",
+          "reported": false
+        },
+        {
+          "q": "When should you *not* use an LLM?",
+          "reported": false
+        },
+        {
+          "q": "Tell me about an LLM feature you shipped: what broke after launch?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Pick one feature in your own repo that could use an LLM. Write a one-page design doc covering the user problem, success metric, failure cost, a latency/cost budget, and a \"non-LLM baseline\". Use it as the running project for later chapters.",
+      "sources": "Chip Huyen Ch1 (V); applied-llms.org https://applied-llms.org/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "02",
+      "slug": "tokenization",
+      "title": "Text as Numbers: Tokenization",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "02.01",
+          "title": "Why discrete tokens",
+          "slug": "why-discrete-tokens"
+        },
+        {
+          "id": "02.02",
+          "title": "Chars/bytes/words/subwords",
+          "slug": "chars-bytes-words-subwords"
+        },
+        {
+          "id": "02.03",
+          "title": "BPE step by step",
+          "slug": "bpe-step-by-step"
+        },
+        {
+          "id": "02.04",
+          "title": "WordPiece/Unigram/SentencePiece",
+          "slug": "wordpiece-unigram-sentencepiece"
+        },
+        {
+          "id": "02.05",
+          "title": "Byte-level BPE and tiktoken",
+          "slug": "byte-level-bpe-and-tiktoken"
+        },
+        {
+          "id": "02.06",
+          "title": "Vocab-size trade-offs",
+          "slug": "vocab-size-trade-offs"
+        },
+        {
+          "id": "02.07",
+          "title": "Special tokens and chat templates",
+          "slug": "special-tokens-and-chat-templates"
+        },
+        {
+          "id": "02.08",
+          "title": "Failure modes (arithmetic, spelling, non-English cost)",
+          "slug": "failure-modes-arithmetic-spelling-non-english-cost"
+        },
+        {
+          "id": "02.09",
+          "title": "Token counting and billing",
+          "slug": "token-counting-and-billing"
+        },
+        {
+          "id": "02.10",
+          "title": "Implementing BPE",
+          "slug": "implementing-bpe"
+        }
+      ],
+      "production": {
+        "F": "chat-template mismatch on self-hosted models; truncation mid-JSON.",
+        "C": "non-English and code text costs 1.5–3× more tokens (verify per tokenizer).",
+        "L": "output tokens dominate latency.",
+        "O": "log input/output/cached token counts per call.",
+        "S": "special-token injection in user input."
+      },
+      "interview": [
+        {
+          "q": "Why can't LLMs reliably count letters in \"strawberry\"?",
+          "reported": false
+        },
+        {
+          "q": "How does BPE work?",
+          "reported": false
+        },
+        {
+          "q": "Why does the same prompt cost different amounts across providers?",
+          "reported": false
+        },
+        {
+          "q": "How would you estimate monthly token spend for a feature?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Implement a minimal BPE trainer (about 100 lines). Then write a token-cost estimator that tokenizes 1,000 real inputs from your app with two tokenizers and projects monthly cost.",
+      "sources": "CS336 Lecture 1 and Assignment 1 (V); Karpathy Zero to Hero https://karpathy.ai/zero-to-hero.html (K); mlabonne §1 (V)",
+      "selfWrite": false
+    },
+    {
+      "id": "03",
+      "slug": "embeddings-and-vector-space",
+      "title": "Embeddings and Vector Space",
+      "part": "I",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "03.01",
+          "title": "One-hot to dense",
+          "slug": "one-hot-to-dense"
+        },
+        {
+          "id": "03.02",
+          "title": "Distributional hypothesis and word2vec",
+          "slug": "distributional-hypothesis-and-word2vec"
+        },
+        {
+          "id": "03.03",
+          "title": "Cosine/dot/L2",
+          "slug": "cosine-dot-l2"
+        },
+        {
+          "id": "03.04",
+          "title": "Contextual vs static",
+          "slug": "contextual-vs-static"
+        },
+        {
+          "id": "03.05",
+          "title": "Bi-encoders and Sentence-BERT",
+          "slug": "bi-encoders-and-sentence-bert"
+        },
+        {
+          "id": "03.06",
+          "title": "Contrastive training",
+          "slug": "contrastive-training"
+        },
+        {
+          "id": "03.07",
+          "title": "Matryoshka embeddings",
+          "slug": "matryoshka-embeddings"
+        },
+        {
+          "id": "03.08",
+          "title": "Multimodal (CLIP-style)",
+          "slug": "multimodal-clip-style"
+        },
+        {
+          "id": "03.09",
+          "title": "Choosing a model (MTEB, dims, cost, latency)",
+          "slug": "choosing-a-model-mteb-dims-cost-latency"
+        },
+        {
+          "id": "03.10",
+          "title": "Pitfalls (domain shift, anisotropy, version drift)",
+          "slug": "pitfalls-domain-shift-anisotropy-version-drift"
+        }
+      ],
+      "production": {
+        "F": "mixing embeddings from two model versions in one index; domain mismatch.",
+        "C": "re-embedding a corpus on model upgrade; storage per dimension.",
+        "L": "query-embedding latency on the hot path.",
+        "O": "track embedding model and version per vector.",
+        "S": "embeddings can leak source text (inversion attacks)."
+      },
+      "interview": [
+        {
+          "q": "What is an embedding, and why does cosine similarity work?",
+          "reported": false
+        },
+        {
+          "q": "Bi-encoder vs cross-encoder: when do you use each?",
+          "reported": false
+        },
+        {
+          "q": "How would you pick an embedding model for legal documents?",
+          "reported": false
+        },
+        {
+          "q": "How do you migrate 50M vectors to a new embedding model with zero downtime?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Embed a sample of your own repo's docs or issues with two models. Build a 50-query labelled set and compare recall@10. Write a re-embedding migration plan (dual-write, backfill, cut-over).",
+      "sources": "SLP3 https://web.stanford.edu/~jurafsky/slp3/ (K); Chip Huyen Ch3 \"Introduction to Embedding\" (V); Sentence-BERT https://arxiv.org/abs/1908.10084 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "04",
+      "slug": "language-modeling-and-sampling",
+      "title": "Language Modeling and Sampling",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "04.01",
+          "title": "Next-token prediction",
+          "slug": "next-token-prediction"
+        },
+        {
+          "id": "04.02",
+          "title": "Logits, softmax",
+          "slug": "logits-softmax"
+        },
+        {
+          "id": "04.03",
+          "title": "Entropy/cross-entropy/perplexity",
+          "slug": "entropy-cross-entropy-perplexity"
+        },
+        {
+          "id": "04.04",
+          "title": "Greedy, temperature, top-k, top-p, min-p",
+          "slug": "greedy-temperature-top-k-top-p-min-p"
+        },
+        {
+          "id": "04.05",
+          "title": "Penalties",
+          "slug": "penalties"
+        },
+        {
+          "id": "04.06",
+          "title": "Beam search (and why chat rarely uses it)",
+          "slug": "beam-search-and-why-chat-rarely-uses-it"
+        },
+        {
+          "id": "04.07",
+          "title": "Log-probs as signal",
+          "slug": "log-probs-as-signal"
+        },
+        {
+          "id": "04.08",
+          "title": "Stop sequences, max tokens, finish reasons",
+          "slug": "stop-sequences-max-tokens-finish-reasons"
+        },
+        {
+          "id": "04.09",
+          "title": "Determinism, seeds, batch-invariance",
+          "slug": "determinism-seeds-batch-invariance"
+        },
+        {
+          "id": "04.10",
+          "title": "Hallucination as a training/sampling property",
+          "slug": "hallucination-as-a-training-sampling-property"
+        },
+        {
+          "id": "04.11",
+          "title": "Engineering implications of probabilistic output",
+          "slug": "engineering-implications-of-probabilistic-output"
+        }
+      ],
+      "production": {
+        "F": "truncated output from `max_tokens` (check `finish_reason`); non-reproducible bugs.",
+        "C": "over-generation.",
+        "L": "output length drives latency.",
+        "O": "log sampling params and finish reason.",
+        "S": "high temperature makes jailbreak outputs more diverse."
+      },
+      "interview": [
+        {
+          "q": "What does temperature do mathematically?",
+          "reported": false
+        },
+        {
+          "q": "Why is temperature 0 not fully deterministic?",
+          "reported": false
+        },
+        {
+          "q": "How can you use log-probs for classification confidence?",
+          "reported": false
+        },
+        {
+          "q": "Why do LLMs hallucinate, and what can engineering (not training) do about it?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Write a sampling playground: implement temperature, top-k and top-p over raw logits from a small open model. Add a log-prob-based confidence threshold to a classifier in your app and measure precision at different thresholds.",
+      "sources": "Chip Huyen Ch2 \"Sampling\" and Ch3 (V); mlabonne §1 (V)",
+      "selfWrite": false
+    },
+    {
+      "id": "05",
+      "slug": "transformer-intuition",
+      "title": "Transformer Intuition",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "05.01",
+          "title": "RNN limits",
+          "slug": "rnn-limits"
+        },
+        {
+          "id": "05.02",
+          "title": "Attention as soft lookup (Q/K/V)",
+          "slug": "attention-as-soft-lookup-q-k-v"
+        },
+        {
+          "id": "05.03",
+          "title": "Scaled dot-product and multi-head",
+          "slug": "scaled-dot-product-and-multi-head"
+        },
+        {
+          "id": "05.04",
+          "title": "Causal masking",
+          "slug": "causal-masking"
+        },
+        {
+          "id": "05.05",
+          "title": "Positional encoding (RoPE)",
+          "slug": "positional-encoding-rope"
+        },
+        {
+          "id": "05.06",
+          "title": "MLP, residual stream, layer norm",
+          "slug": "mlp-residual-stream-layer-norm"
+        },
+        {
+          "id": "05.07",
+          "title": "Decoder-only vs encoder-only vs encoder-decoder",
+          "slug": "decoder-only-vs-encoder-only-vs-encoder-decoder"
+        },
+        {
+          "id": "05.08",
+          "title": "Parameter and FLOPs accounting",
+          "slug": "parameter-and-flops-accounting"
+        },
+        {
+          "id": "05.09",
+          "title": "Quadratic context cost",
+          "slug": "quadratic-context-cost"
+        },
+        {
+          "id": "05.10",
+          "title": "MQA/GQA, sliding window",
+          "slug": "mqa-gqa-sliding-window"
+        },
+        {
+          "id": "05.11",
+          "title": "Mixture-of-Experts",
+          "slug": "mixture-of-experts"
+        },
+        {
+          "id": "05.12",
+          "title": "SSM and hybrids (brief)",
+          "slug": "ssm-and-hybrids-brief"
+        },
+        {
+          "id": "05.13",
+          "title": "Interpretability intuitions",
+          "slug": "interpretability-intuitions"
+        },
+        {
+          "id": "05.14",
+          "title": "Build a tiny GPT",
+          "slug": "build-a-tiny-gpt"
+        }
+      ],
+      "production": {
+        "F": "long-context quality degradation.",
+        "C": "why long prompts cost more compute; MoE active vs total params.",
+        "L": "attention cost grows with context.",
+        "O": "n/a, conceptual.",
+        "S": "n/a."
+      },
+      "interview": [
+        {
+          "q": "Explain self-attention to a backend engineer.",
+          "reported": false
+        },
+        {
+          "q": "Why is attention O(n²), and what do GQA and FlashAttention change?",
+          "reported": false
+        },
+        {
+          "q": "Decoder-only vs encoder-only: which would you use for embeddings and why?",
+          "reported": false
+        },
+        {
+          "q": "What is MoE, and how does it affect serving cost?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Follow Karpathy's or Raschka's tiny GPT and train it on your own repo's code or READMEs. Instrument the attention maps for one prompt.",
+      "sources": "CS336 Lectures 2–4 (V); Karpathy (K); Raschka https://github.com/rasbt/LLMs-from-scratch (K); Illustrated Transformer https://jalammar.github.io/illustrated-transformer/ (K); CS224N https://web.stanford.edu/class/cs224n/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "06",
+      "slug": "pretraining-and-scaling",
+      "title": "Pretraining, Data and Scaling",
+      "part": "I",
+      "weight": 1,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "06.01",
+          "title": "Objective at scale",
+          "slug": "objective-at-scale"
+        },
+        {
+          "id": "06.02",
+          "title": "Web data",
+          "slug": "web-data"
+        },
+        {
+          "id": "06.03",
+          "title": "Filtering, dedup, quality classifiers",
+          "slug": "filtering-dedup-quality-classifiers"
+        },
+        {
+          "id": "06.04",
+          "title": "Data mix",
+          "slug": "data-mix"
+        },
+        {
+          "id": "06.05",
+          "title": "Scaling laws (Kaplan, Chinchilla)",
+          "slug": "scaling-laws-kaplan-chinchilla"
+        },
+        {
+          "id": "06.06",
+          "title": "GPU and compute budgets",
+          "slug": "gpu-and-compute-budgets"
+        },
+        {
+          "id": "06.07",
+          "title": "Parallelism intuition",
+          "slug": "parallelism-intuition"
+        },
+        {
+          "id": "06.08",
+          "title": "Training instability",
+          "slug": "training-instability"
+        },
+        {
+          "id": "06.09",
+          "title": "Base vs chat models",
+          "slug": "base-vs-chat-models"
+        },
+        {
+          "id": "06.10",
+          "title": "Open-weight vs closed landscape",
+          "slug": "open-weight-vs-closed-landscape"
+        }
+      ],
+      "production": {
+        "F": "knowledge cutoff and stale facts; benchmark contamination.",
+        "C": "why frontier pretraining is out of scope for app teams.",
+        "L": "n/a.",
+        "O": "n/a.",
+        "S": "data poisoning, licensing and provenance."
+      },
+      "interview": [
+        {
+          "q": "What do scaling laws tell you?",
+          "reported": false
+        },
+        {
+          "q": "Base vs instruct model: when would you use a base model?",
+          "reported": false
+        },
+        {
+          "q": "Why does knowledge cutoff matter for your product design?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Write a dedup and quality-filter script (MinHash plus heuristics) over a scraped corpus from your domain. Reuse it in Ch 09 and Ch 17.",
+      "sources": "CS336 Lectures 5–9, 13–14 and Assignments 2–4 (V); Chip Huyen Ch2 (V); HF Ultra-Scale Playbook https://huggingface.co/spaces/nanotron/ultrascale-playbook (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "07",
+      "slug": "post-training-and-alignment",
+      "title": "Post-Training and Alignment",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "07.01",
+          "title": "Why post-train",
+          "slug": "why-post-train"
+        },
+        {
+          "id": "07.02",
+          "title": "SFT",
+          "slug": "sft"
+        },
+        {
+          "id": "07.03",
+          "title": "Chat templates",
+          "slug": "chat-templates"
+        },
+        {
+          "id": "07.04",
+          "title": "Reward models",
+          "slug": "reward-models"
+        },
+        {
+          "id": "07.05",
+          "title": "RLHF (PPO) intuition",
+          "slug": "rlhf-ppo-intuition"
+        },
+        {
+          "id": "07.06",
+          "title": "DPO family",
+          "slug": "dpo-family"
+        },
+        {
+          "id": "07.07",
+          "title": "Constitutional AI / RLAIF",
+          "slug": "constitutional-ai-rlaif"
+        },
+        {
+          "id": "07.08",
+          "title": "RL with verifiable rewards (GRPO)",
+          "slug": "rl-with-verifiable-rewards-grpo"
+        },
+        {
+          "id": "07.09",
+          "title": "Rejection sampling, best-of-n",
+          "slug": "rejection-sampling-best-of-n"
+        },
+        {
+          "id": "07.10",
+          "title": "Safety training and refusals",
+          "slug": "safety-training-and-refusals"
+        },
+        {
+          "id": "07.11",
+          "title": "Sycophancy, reward hacking, over-refusal",
+          "slug": "sycophancy-reward-hacking-over-refusal"
+        },
+        {
+          "id": "07.12",
+          "title": "What post-training implies for app builders",
+          "slug": "what-post-training-implies-for-app-builders"
+        }
+      ],
+      "production": {
+        "F": "over-refusal on benign domain queries; sycophancy agreeing with wrong user claims; behaviour shifts on model version bumps.",
+        "C": "n/a.",
+        "L": "n/a.",
+        "O": "track refusal rate per model version.",
+        "S": "alignment is not a security boundary."
+      },
+      "interview": [
+        {
+          "q": "Explain RLHF vs DPO.",
+          "reported": false
+        },
+        {
+          "q": "What is GRPO, and why did verifiable rewards matter for reasoning models?",
+          "reported": false
+        },
+        {
+          "q": "Your model refuses legitimate medical questions: what are your options short of fine-tuning?",
+          "reported": false
+        },
+        {
+          "q": "What is reward hacking?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build a 100-prompt \"behaviour regression\" suite (refusals, sycophancy probes, tone) for your app. Run it against two model versions and diff the results.",
+      "sources": "CS336 Lectures 15–17 and Assignment 5 (V); mlabonne §3–5 (V); InstructGPT https://arxiv.org/abs/2203.02155 (K); DPO https://arxiv.org/abs/2305.18290 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "08",
+      "slug": "reasoning-models",
+      "title": "Reasoning Models and Test-Time Compute",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "08.01",
+          "title": "CoT origins",
+          "slug": "cot-origins"
+        },
+        {
+          "id": "08.02",
+          "title": "Self-consistency and best-of-n",
+          "slug": "self-consistency-and-best-of-n"
+        },
+        {
+          "id": "08.03",
+          "title": "Prompted vs trained reasoning (o1/R1 lineage)",
+          "slug": "prompted-vs-trained-reasoning-o1-r1-lineage"
+        },
+        {
+          "id": "08.04",
+          "title": "RL for reasoning",
+          "slug": "rl-for-reasoning"
+        },
+        {
+          "id": "08.05",
+          "title": "Thinking budgets and effort levels",
+          "slug": "thinking-budgets-and-effort-levels"
+        },
+        {
+          "id": "08.06",
+          "title": "Interleaved thinking with tools",
+          "slug": "interleaved-thinking-with-tools"
+        },
+        {
+          "id": "08.07",
+          "title": "When reasoning helps vs hurts",
+          "slug": "when-reasoning-helps-vs-hurts"
+        },
+        {
+          "id": "08.08",
+          "title": "Prompting reasoning models",
+          "slug": "prompting-reasoning-models"
+        },
+        {
+          "id": "08.09",
+          "title": "Faithfulness of visible reasoning",
+          "slug": "faithfulness-of-visible-reasoning"
+        },
+        {
+          "id": "08.10",
+          "title": "Evaluating reasoning models",
+          "slug": "evaluating-reasoning-models"
+        }
+      ],
+      "production": {
+        "F": "overthinking simple tasks; inconsistent effort.",
+        "C": "thinking tokens billed as output, often several times the answer length.",
+        "L": "TTFT of seconds to minutes; needs async UX.",
+        "O": "log thinking-token counts separately.",
+        "S": "reasoning traces may contain sensitive data; don't show them raw to users."
+      },
+      "interview": [
+        {
+          "q": "When would you choose a reasoning model over a standard model?",
+          "reported": false
+        },
+        {
+          "q": "How do you control cost with reasoning models?",
+          "reported": false
+        },
+        {
+          "q": "Is chain-of-thought faithful?",
+          "reported": false
+        },
+        {
+          "q": "Design a system that routes between fast and reasoning models.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Take 50 tasks from your app. Run them at low, medium and high reasoning effort plus a non-reasoning model. Plot accuracy against cost and p50/p95 latency, then pick a routing policy.",
+      "sources": "Chip Huyen Ch2 \"Test Time Compute\" (V); mlabonne \"Test-Time Compute\" (V); Berkeley F24 Denny Zhou (V); DeepSeek-R1 https://arxiv.org/abs/2501.12948 (K); Lilian Weng \"Why We Think\" https://lilianweng.github.io/posts/2025-05-01-thinking/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "09",
+      "slug": "fine-tuning-in-practice",
+      "title": "Fine-Tuning in Practice",
+      "part": "I",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "09.01",
+          "title": "Prompt vs RAG vs fine-tune decision",
+          "slug": "prompt-vs-rag-vs-fine-tune-decision"
+        },
+        {
+          "id": "09.02",
+          "title": "Training memory math",
+          "slug": "training-memory-math"
+        },
+        {
+          "id": "09.03",
+          "title": "Numeric formats",
+          "slug": "numeric-formats"
+        },
+        {
+          "id": "09.04",
+          "title": "Full vs PEFT",
+          "slug": "full-vs-peft"
+        },
+        {
+          "id": "09.05",
+          "title": "LoRA/QLoRA",
+          "slug": "lora-qlora"
+        },
+        {
+          "id": "09.06",
+          "title": "Dataset curation",
+          "slug": "dataset-curation"
+        },
+        {
+          "id": "09.07",
+          "title": "Synthetic data",
+          "slug": "synthetic-data"
+        },
+        {
+          "id": "09.08",
+          "title": "Distillation",
+          "slug": "distillation"
+        },
+        {
+          "id": "09.09",
+          "title": "Cleaning and formatting",
+          "slug": "cleaning-and-formatting"
+        },
+        {
+          "id": "09.10",
+          "title": "Hyperparameters and monitoring",
+          "slug": "hyperparameters-and-monitoring"
+        },
+        {
+          "id": "09.11",
+          "title": "DPO in practice",
+          "slug": "dpo-in-practice"
+        },
+        {
+          "id": "09.12",
+          "title": "Model merging",
+          "slug": "model-merging"
+        },
+        {
+          "id": "09.13",
+          "title": "Fine-tune vs base evaluation",
+          "slug": "fine-tune-vs-base-evaluation"
+        },
+        {
+          "id": "09.14",
+          "title": "Hosted FT APIs vs self-run",
+          "slug": "hosted-ft-apis-vs-self-run"
+        }
+      ],
+      "production": {
+        "F": "catastrophic forgetting; overfitting to format; stale fine-tune versus improving base models.",
+        "C": "training plus hosting a custom model; LoRA adapter multiplexing.",
+        "L": "smaller fine-tuned models cut latency.",
+        "O": "version datasets and adapters; eval before promotion.",
+        "S": "training data leakage and PII memorization."
+      },
+      "interview": [
+        {
+          "q": "When does fine-tuning beat RAG, and when doesn't it?",
+          "reported": false
+        },
+        {
+          "q": "Explain LoRA. Why does it use so little memory?",
+          "reported": false
+        },
+        {
+          "q": "How much GPU memory do you need to fine-tune a 7B model with QLoRA?",
+          "reported": false
+        },
+        {
+          "q": "Design a distillation pipeline from a frontier model to a small model for classification.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Distill a frontier model's outputs on one narrow task in your app (for example, ticket classification) into a LoRA on a small open model. Compare accuracy, cost per 1k calls and latency against the frontier model.",
+      "sources": "Chip Huyen Ch7–8 (V); mlabonne §3–4, §7 (V); LoRA https://arxiv.org/abs/2106.09685 (K); QLoRA https://arxiv.org/abs/2305.14314 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "10",
+      "slug": "inference-mechanics",
+      "title": "Inference Mechanics",
+      "part": "II",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "10.01",
+          "title": "Prefill vs decode",
+          "slug": "prefill-vs-decode"
+        },
+        {
+          "id": "10.02",
+          "title": "KV cache and memory",
+          "slug": "kv-cache-and-memory"
+        },
+        {
+          "id": "10.03",
+          "title": "Compute- vs memory-bound",
+          "slug": "compute-vs-memory-bound"
+        },
+        {
+          "id": "10.04",
+          "title": "TTFT, TPOT/ITL, throughput",
+          "slug": "ttft-tpot-itl-throughput"
+        },
+        {
+          "id": "10.05",
+          "title": "Static vs continuous batching",
+          "slug": "static-vs-continuous-batching"
+        },
+        {
+          "id": "10.06",
+          "title": "PagedAttention",
+          "slug": "pagedattention"
+        },
+        {
+          "id": "10.07",
+          "title": "FlashAttention",
+          "slug": "flashattention"
+        },
+        {
+          "id": "10.08",
+          "title": "Quantization (GPTQ/AWQ/GGUF/fp8)",
+          "slug": "quantization-gptq-awq-gguf-fp8"
+        },
+        {
+          "id": "10.09",
+          "title": "Speculative decoding",
+          "slug": "speculative-decoding"
+        },
+        {
+          "id": "10.10",
+          "title": "Prefix/prompt caching",
+          "slug": "prefix-prompt-caching"
+        },
+        {
+          "id": "10.11",
+          "title": "Serving parallelism",
+          "slug": "serving-parallelism"
+        },
+        {
+          "id": "10.12",
+          "title": "Accelerators",
+          "slug": "accelerators"
+        },
+        {
+          "id": "10.13",
+          "title": "Inference arithmetic worked examples",
+          "slug": "inference-arithmetic-worked-examples"
+        }
+      ],
+      "production": {
+        "F": "OOM from KV cache at long context; quality loss from aggressive quantization.",
+        "C": "GPU utilization drives the self-host cost; cached-input discounts.",
+        "L": "TTFT vs throughput trade-off under batching.",
+        "O": "track TTFT, ITL, tokens/s, queue depth, KV-cache utilization.",
+        "S": "cross-tenant cache side channels."
+      },
+      "interview": [
+        {
+          "q": "Explain the KV cache and why it is the memory bottleneck.",
+          "reported": false
+        },
+        {
+          "q": "Why is decode memory-bandwidth-bound?",
+          "reported": false
+        },
+        {
+          "q": "How does continuous batching improve throughput?",
+          "reported": false
+        },
+        {
+          "q": "How does speculative decoding speed up generation without changing outputs?",
+          "reported": false
+        },
+        {
+          "q": "Design an end-to-end batching system for LLM queries.",
+          "reported": true,
+          "note": "reported prompt, (S)"
+        }
+      ],
+      "applyIt": "Serve a small model with vLLM locally. Load-test it at concurrency 1 to 64, measuring TTFT, ITL and throughput. Then enable prefix caching and quantization and record the deltas.",
+      "sources": "Chip Huyen Ch9 (V); CS336 Lecture 10 (V); mlabonne LLM Engineer §6 (V); PagedAttention https://arxiv.org/abs/2309.06180 (K); kipply https://kipp.ly/transformer-inference-arithmetic/ (K); \"How to Scale Your Model\" https://jax-ml.github.io/scaling-book/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "11",
+      "slug": "serving-and-model-economics",
+      "title": "Serving, Model Selection and Economics",
+      "part": "II",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "11.01",
+          "title": "API vs self-hosted open weights",
+          "slug": "api-vs-self-hosted-open-weights"
+        },
+        {
+          "id": "11.02",
+          "title": "Engines (vLLM, SGLang, TGI, llama.cpp/Ollama)",
+          "slug": "engines-vllm-sglang-tgi-llama-cpp-ollama"
+        },
+        {
+          "id": "11.03",
+          "title": "Local and edge",
+          "slug": "local-and-edge"
+        },
+        {
+          "id": "11.04",
+          "title": "Pricing (input/output/cached/thinking)",
+          "slug": "pricing-input-output-cached-thinking"
+        },
+        {
+          "id": "11.05",
+          "title": "Cost-per-task modelling",
+          "slug": "cost-per-task-modelling"
+        },
+        {
+          "id": "11.06",
+          "title": "Model selection workflow",
+          "slug": "model-selection-workflow"
+        },
+        {
+          "id": "11.07",
+          "title": "Reading benchmarks critically",
+          "slug": "reading-benchmarks-critically"
+        },
+        {
+          "id": "11.08",
+          "title": "Gateways and multi-provider abstraction",
+          "slug": "gateways-and-multi-provider-abstraction"
+        },
+        {
+          "id": "11.09",
+          "title": "Routing and cascades",
+          "slug": "routing-and-cascades"
+        },
+        {
+          "id": "11.10",
+          "title": "Rate limits, quotas, batch APIs",
+          "slug": "rate-limits-quotas-batch-apis"
+        },
+        {
+          "id": "11.11",
+          "title": "Data residency, confidential inference",
+          "slug": "data-residency-confidential-inference"
+        },
+        {
+          "id": "11.12",
+          "title": "Deprecation and migration",
+          "slug": "deprecation-and-migration"
+        }
+      ],
+      "production": {
+        "F": "provider outage; 429 storms; silent model behaviour change on alias updates.",
+        "C": "break-even between API and self-host.",
+        "L": "regional latency; cold starts.",
+        "O": "per-provider error rates and spend.",
+        "S": "vendor data-retention terms; key management."
+      },
+      "interview": [
+        {
+          "q": "API or self-host for 10M requests/day? Walk through the math.",
+          "reported": false
+        },
+        {
+          "q": "How do you choose a model for a new feature?",
+          "reported": false
+        },
+        {
+          "q": "How do you make your app resilient to a provider outage?",
+          "reported": false
+        },
+        {
+          "q": "How do you migrate safely when a model is deprecated?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Put a gateway (LiteLLM-style or hand-rolled) in front of two providers in your app, with a fallback, retries with jitter, a per-feature cost tag and a model alias pinned to a version.",
+      "sources": "Chip Huyen Ch4 and Ch10 (V); mlabonne \"Running/Deploying LLMs\" (V); Anthropic \"Confidential Inference\" (V); RouteLLM https://arxiv.org/abs/2406.18665 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "12",
+      "slug": "prompting-fundamentals",
+      "title": "Prompting Fundamentals",
+      "part": "III",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "12.01",
+          "title": "System/user/assistant anatomy",
+          "slug": "system-user-assistant-anatomy"
+        },
+        {
+          "id": "12.02",
+          "title": "Zero/few-shot ICL",
+          "slug": "zero-few-shot-icl"
+        },
+        {
+          "id": "12.03",
+          "title": "Clear instructions",
+          "slug": "clear-instructions"
+        },
+        {
+          "id": "12.04",
+          "title": "Providing context",
+          "slug": "providing-context"
+        },
+        {
+          "id": "12.05",
+          "title": "Roles",
+          "slug": "roles"
+        },
+        {
+          "id": "12.06",
+          "title": "Delimiters/XML",
+          "slug": "delimiters-xml"
+        },
+        {
+          "id": "12.07",
+          "title": "Decomposition and chaining",
+          "slug": "decomposition-and-chaining"
+        },
+        {
+          "id": "12.08",
+          "title": "CoT prompting",
+          "slug": "cot-prompting"
+        },
+        {
+          "id": "12.09",
+          "title": "Prefill and steering",
+          "slug": "prefill-and-steering"
+        },
+        {
+          "id": "12.10",
+          "title": "Long-context position effects",
+          "slug": "long-context-position-effects"
+        },
+        {
+          "id": "12.11",
+          "title": "Iteration workflow",
+          "slug": "iteration-workflow"
+        },
+        {
+          "id": "12.12",
+          "title": "Versioning and management",
+          "slug": "versioning-and-management"
+        },
+        {
+          "id": "12.13",
+          "title": "Automatic optimization (DSPy)",
+          "slug": "automatic-optimization-dspy"
+        },
+        {
+          "id": "12.14",
+          "title": "Per-model differences",
+          "slug": "per-model-differences"
+        }
+      ],
+      "production": {
+        "F": "prompt regressions on model upgrades; few-shot overfitting; instruction conflicts.",
+        "C": "bloated system prompts on every call (cache them).",
+        "L": "chaining multiplies round-trips.",
+        "O": "prompt version ID on every trace.",
+        "S": "secrets in system prompts are extractable."
+      },
+      "interview": [
+        {
+          "q": "How do you systematically improve a prompt rather than by vibes?",
+          "reported": false
+        },
+        {
+          "q": "Few-shot vs fine-tuning: trade-offs?",
+          "reported": false
+        },
+        {
+          "q": "How do you version and roll out prompt changes safely?",
+          "reported": false
+        },
+        {
+          "q": "Why might a prompt that worked on model A fail on model B?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Move every prompt in your repo into versioned templates with IDs. Run one prompt through three iterations, each scored on a 30-example eval set (from Ch 19), and keep a changelog.",
+      "sources": "Chip Huyen Ch5 (V); FSDL \"Learn to Spell\" (V); Berkeley F24 DSPy (V); Anthropic prompt docs https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview (K); Lost in the Middle https://arxiv.org/abs/2307.03172 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "13",
+      "slug": "structured-output",
+      "title": "Structured Output",
+      "part": "III",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "13.01",
+          "title": "LLM as a typed function",
+          "slug": "llm-as-a-typed-function"
+        },
+        {
+          "id": "13.02",
+          "title": "JSON mode vs schema-enforced",
+          "slug": "json-mode-vs-schema-enforced"
+        },
+        {
+          "id": "13.03",
+          "title": "Constrained/grammar decoding",
+          "slug": "constrained-grammar-decoding"
+        },
+        {
+          "id": "13.04",
+          "title": "Pydantic/Zod validation",
+          "slug": "pydantic-zod-validation"
+        },
+        {
+          "id": "13.05",
+          "title": "Retry and repair loops",
+          "slug": "retry-and-repair-loops"
+        },
+        {
+          "id": "13.06",
+          "title": "Extraction and classification patterns",
+          "slug": "extraction-and-classification-patterns"
+        },
+        {
+          "id": "13.07",
+          "title": "Schema design (enums, nullables)",
+          "slug": "schema-design-enums-nullables"
+        },
+        {
+          "id": "13.08",
+          "title": "Streaming partial structures",
+          "slug": "streaming-partial-structures"
+        },
+        {
+          "id": "13.09",
+          "title": "Structured output vs tool calling",
+          "slug": "structured-output-vs-tool-calling"
+        },
+        {
+          "id": "13.10",
+          "title": "Evaluating structured output",
+          "slug": "evaluating-structured-output"
+        }
+      ],
+      "production": {
+        "F": "valid-JSON-but-wrong-values; hallucinated enum values; schema drift.",
+        "C": "retries double cost.",
+        "L": "constrained decoding overhead; streaming partial JSON.",
+        "O": "log validation failures by field.",
+        "S": "treat model JSON as untrusted input (injection into SQL or shell)."
+      },
+      "interview": [
+        {
+          "q": "How do you guarantee valid JSON from an LLM?",
+          "reported": false
+        },
+        {
+          "q": "How does constrained decoding work?",
+          "reported": false
+        },
+        {
+          "q": "Design a document-extraction pipeline for 1M invoices/month, with accuracy SLAs.",
+          "reported": false
+        },
+        {
+          "q": "How do you evaluate field-level extraction accuracy?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build an extractor for a real document type in your repos with a Pydantic schema, a repair loop and per-field accuracy metrics on 50 labelled docs.",
+      "sources": "Chip Huyen Ch2 \"Structured Outputs\" (V); mlabonne (V); OpenAI Cookbook structured-output eval (S); Outlines https://arxiv.org/abs/2307.09702 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "14",
+      "slug": "multimodal-and-realtime-voice",
+      "title": "Multimodal and Realtime Voice",
+      "part": "III",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "14.01",
+          "title": "Vision inputs (images, screenshots)",
+          "slug": "vision-inputs-images-screenshots"
+        },
+        {
+          "id": "14.02",
+          "title": "PDF/document understanding",
+          "slug": "pdf-document-understanding"
+        },
+        {
+          "id": "14.03",
+          "title": "STT/TTS",
+          "slug": "stt-tts"
+        },
+        {
+          "id": "14.04",
+          "title": "Realtime voice pipelines (cascade vs speech-to-speech)",
+          "slug": "realtime-voice-pipelines-cascade-vs-speech-to-speech"
+        },
+        {
+          "id": "14.05",
+          "title": "Turn-taking, barge-in, VAD",
+          "slug": "turn-taking-barge-in-vad"
+        },
+        {
+          "id": "14.06",
+          "title": "Image generation intuition",
+          "slug": "image-generation-intuition"
+        },
+        {
+          "id": "14.07",
+          "title": "Multimodal RAG",
+          "slug": "multimodal-rag"
+        },
+        {
+          "id": "14.08",
+          "title": "Token costs of images and audio",
+          "slug": "token-costs-of-images-and-audio"
+        },
+        {
+          "id": "14.09",
+          "title": "Evaluating multimodal outputs",
+          "slug": "evaluating-multimodal-outputs"
+        }
+      ],
+      "production": {
+        "F": "OCR errors cascading; voice interruptions mishandled.",
+        "C": "image tokens per page; per-minute audio.",
+        "L": "voice needs sub-~800 ms turn latency (verify against current vendor guidance).",
+        "O": "per-stage latency (STT → LLM → TTS).",
+        "S": "prompt injection via images; voice spoofing."
+      },
+      "interview": [
+        {
+          "q": "Design a voice assistant for customer support.",
+          "reported": true,
+          "note": "reported common prompt, (S)"
+        },
+        {
+          "q": "How do you hit low latency in a voice agent?",
+          "reported": false
+        },
+        {
+          "q": "How do you process scanned PDFs for RAG?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build a voice loop (STT → LLM → TTS) over one of your apps' APIs. Instrument per-stage latency and get p50 under your target.",
+      "sources": "Chip Huyen Ch6 \"RAG Beyond Texts\" (V); mlabonne \"Multimodal\" (V); Latent Space Vision/Voice sections (V, headings only).",
+      "selfWrite": true
+    },
+    {
+      "id": "15",
+      "slug": "information-retrieval-foundations",
+      "title": "Information Retrieval Foundations",
+      "part": "IV",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "15.01",
+          "title": "Queries, documents, relevance",
+          "slug": "queries-documents-relevance"
+        },
+        {
+          "id": "15.02",
+          "title": "Inverted index",
+          "slug": "inverted-index"
+        },
+        {
+          "id": "15.03",
+          "title": "TF-IDF",
+          "slug": "tf-idf"
+        },
+        {
+          "id": "15.04",
+          "title": "BM25",
+          "slug": "bm25"
+        },
+        {
+          "id": "15.05",
+          "title": "Analyzers",
+          "slug": "analyzers"
+        },
+        {
+          "id": "15.06",
+          "title": "Dense retrieval (DPR)",
+          "slug": "dense-retrieval-dpr"
+        },
+        {
+          "id": "15.07",
+          "title": "Late interaction (ColBERT)",
+          "slug": "late-interaction-colbert"
+        },
+        {
+          "id": "15.08",
+          "title": "Learned sparse (SPLADE)",
+          "slug": "learned-sparse-splade"
+        },
+        {
+          "id": "15.09",
+          "title": "Hybrid search and RRF",
+          "slug": "hybrid-search-and-rrf"
+        },
+        {
+          "id": "15.10",
+          "title": "Cross-encoder re-ranking",
+          "slug": "cross-encoder-re-ranking"
+        },
+        {
+          "id": "15.11",
+          "title": "Metrics (P@k, R@k, MRR, nDCG)",
+          "slug": "metrics-p-k-r-k-mrr-ndcg"
+        },
+        {
+          "id": "15.12",
+          "title": "Relevance judgments",
+          "slug": "relevance-judgments"
+        },
+        {
+          "id": "15.13",
+          "title": "Query rewriting",
+          "slug": "query-rewriting"
+        },
+        {
+          "id": "15.14",
+          "title": "Metadata filtering and ACLs",
+          "slug": "metadata-filtering-and-acls"
+        }
+      ],
+      "production": {
+        "F": "dense retrieval missing exact IDs or codes (needs BM25); ACL leaks.",
+        "C": "re-ranker cost per query.",
+        "L": "re-rank adds 50–300 ms (approximate; measure).",
+        "O": "log retrieved IDs and scores per query.",
+        "S": "retrieval must enforce the user's permissions before the LLM sees anything."
+      },
+      "interview": [
+        {
+          "q": "BM25 vs dense retrieval: when does each win?",
+          "reported": false
+        },
+        {
+          "q": "Why use hybrid search, and how does RRF work?",
+          "reported": false
+        },
+        {
+          "q": "How do you measure retrieval quality without labels?",
+          "reported": false
+        },
+        {
+          "q": "Where in the pipeline do you enforce document permissions?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Index one of your repos' docs or issues with BM25 plus dense retrieval, add RRF and a cross-encoder, and report recall@10 and nDCG@10 for each stage on your 50-query set.",
+      "sources": "Manning *Introduction to IR* https://nlp.stanford.edu/IR-book/ (K); SLP3 (K); Chip Huyen Ch6 (V); DPR https://arxiv.org/abs/2004.04906 (K); ColBERT https://arxiv.org/abs/2004.12832 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "16",
+      "slug": "vector-search-and-indexing",
+      "title": "Vector Search and Indexing",
+      "part": "IV",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "16.01",
+          "title": "Exact kNN limits",
+          "slug": "exact-knn-limits"
+        },
+        {
+          "id": "16.02",
+          "title": "IVF, PQ",
+          "slug": "ivf-pq"
+        },
+        {
+          "id": "16.03",
+          "title": "HNSW",
+          "slug": "hnsw"
+        },
+        {
+          "id": "16.04",
+          "title": "Recall/latency/memory trade-offs",
+          "slug": "recall-latency-memory-trade-offs"
+        },
+        {
+          "id": "16.05",
+          "title": "Vector DB vs search engine vs pgvector",
+          "slug": "vector-db-vs-search-engine-vs-pgvector"
+        },
+        {
+          "id": "16.06",
+          "title": "Updates, deletes, re-embedding",
+          "slug": "updates-deletes-re-embedding"
+        },
+        {
+          "id": "16.07",
+          "title": "Multi-tenancy and filtering",
+          "slug": "multi-tenancy-and-filtering"
+        },
+        {
+          "id": "16.08",
+          "title": "Binary/int8 quantization",
+          "slug": "binary-int8-quantization"
+        },
+        {
+          "id": "16.09",
+          "title": "Capacity planning",
+          "slug": "capacity-planning"
+        },
+        {
+          "id": "16.10",
+          "title": "Benchmarking",
+          "slug": "benchmarking"
+        }
+      ],
+      "production": {
+        "F": "filtered-search recall collapse; index rebuild downtime.",
+        "C": "RAM for HNSW at scale.",
+        "L": "ef/nprobe tuning.",
+        "O": "recall canaries.",
+        "S": "tenant isolation."
+      },
+      "interview": [
+        {
+          "q": "How does HNSW work?",
+          "reported": false
+        },
+        {
+          "q": "pgvector or a dedicated vector DB?",
+          "reported": false
+        },
+        {
+          "q": "Size the infrastructure for 100M 1024-dim vectors.",
+          "reported": false
+        },
+        {
+          "q": "How do you handle deletes and GDPR erasure in a vector index?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Benchmark pgvector HNSW against a dedicated store on 1M synthetic vectors: recall versus QPS curves, with and without metadata filters.",
+      "sources": "mlabonne \"Vector Storage\" (V); HNSW https://arxiv.org/abs/1603.09320 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "17",
+      "slug": "rag-pipelines",
+      "title": "RAG Pipelines",
+      "part": "IV",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "17.01",
+          "title": "Why RAG",
+          "slug": "why-rag"
+        },
+        {
+          "id": "17.02",
+          "title": "Architecture end to end",
+          "slug": "architecture-end-to-end"
+        },
+        {
+          "id": "17.03",
+          "title": "Ingestion and parsing",
+          "slug": "ingestion-and-parsing"
+        },
+        {
+          "id": "17.04",
+          "title": "Chunking",
+          "slug": "chunking"
+        },
+        {
+          "id": "17.05",
+          "title": "Contextual enrichment",
+          "slug": "contextual-enrichment"
+        },
+        {
+          "id": "17.06",
+          "title": "Indexing pipeline",
+          "slug": "indexing-pipeline"
+        },
+        {
+          "id": "17.07",
+          "title": "Top-k tuning",
+          "slug": "top-k-tuning"
+        },
+        {
+          "id": "17.08",
+          "title": "Re-ranking",
+          "slug": "re-ranking"
+        },
+        {
+          "id": "17.09",
+          "title": "Prompt assembly and citations",
+          "slug": "prompt-assembly-and-citations"
+        },
+        {
+          "id": "17.10",
+          "title": "Grounding/faithfulness",
+          "slug": "grounding-faithfulness"
+        },
+        {
+          "id": "17.11",
+          "title": "\"No answer\" handling",
+          "slug": "no-answer-handling"
+        },
+        {
+          "id": "17.12",
+          "title": "Freshness and incremental updates",
+          "slug": "freshness-and-incremental-updates"
+        },
+        {
+          "id": "17.13",
+          "title": "RAG vs long context vs fine-tuning",
+          "slug": "rag-vs-long-context-vs-fine-tuning"
+        },
+        {
+          "id": "17.14",
+          "title": "Optimization checklist",
+          "slug": "optimization-checklist"
+        }
+      ],
+      "production": {
+        "F": "the right doc exists but the answer is wrong (retrieval vs generation attribution); stale index; conflicting sources.",
+        "C": "context tokens per query × QPS.",
+        "L": "embed + search + rerank + generate budget.",
+        "O": "trace query → chunks → answer → citation.",
+        "S": "indirect prompt injection via indexed documents; ACL-filtered retrieval."
+      },
+      "interview": [
+        {
+          "q": "Design a production RAG system for 10M documents at 1K QPS.",
+          "reported": true,
+          "note": "reported, (S)"
+        },
+        {
+          "q": "The correct document exists but the answer is wrong. How do you debug it?",
+          "reported": true,
+          "note": "reported, (S)"
+        },
+        {
+          "q": "How do you choose a chunk size?",
+          "reported": false
+        },
+        {
+          "q": "How do you handle conflicting information across sources?",
+          "reported": true,
+          "note": "reported, (S)"
+        },
+        {
+          "q": "Long context or RAG?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build a cited Q&A over your own repos (code plus READMEs) with incremental re-indexing on git push. Ship a \"why this answer\" trace view.",
+      "sources": "Chip Huyen Ch6 (V); mlabonne RAG (V); FSDL askFSDL (V); RAG paper https://arxiv.org/abs/2005.11401 (K); Anthropic Contextual Retrieval https://www.anthropic.com/news/contextual-retrieval (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "18",
+      "slug": "advanced-and-agentic-rag",
+      "title": "Advanced and Agentic RAG",
+      "part": "IV",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "18.01",
+          "title": "Query decomposition and multi-hop",
+          "slug": "query-decomposition-and-multi-hop"
+        },
+        {
+          "id": "18.02",
+          "title": "HyDE and expansion",
+          "slug": "hyde-and-expansion"
+        },
+        {
+          "id": "18.03",
+          "title": "Text-to-SQL and query construction",
+          "slug": "text-to-sql-and-query-construction"
+        },
+        {
+          "id": "18.04",
+          "title": "GraphRAG",
+          "slug": "graphrag"
+        },
+        {
+          "id": "18.05",
+          "title": "Retrieval as a tool (agentic RAG)",
+          "slug": "retrieval-as-a-tool-agentic-rag"
+        },
+        {
+          "id": "18.06",
+          "title": "Deep-research iterative search",
+          "slug": "deep-research-iterative-search"
+        },
+        {
+          "id": "18.07",
+          "title": "Web search",
+          "slug": "web-search"
+        },
+        {
+          "id": "18.08",
+          "title": "Code retrieval (grep vs embeddings)",
+          "slug": "code-retrieval-grep-vs-embeddings"
+        },
+        {
+          "id": "18.09",
+          "title": "Tables and multimodal",
+          "slug": "tables-and-multimodal"
+        },
+        {
+          "id": "18.10",
+          "title": "Caching retrieved context",
+          "slug": "caching-retrieved-context"
+        },
+        {
+          "id": "18.11",
+          "title": "Permission-aware RAG",
+          "slug": "permission-aware-rag"
+        },
+        {
+          "id": "18.12",
+          "title": "RAG failure taxonomy",
+          "slug": "rag-failure-taxonomy"
+        }
+      ],
+      "production": {
+        "F": "agentic loops that never stop searching; text-to-SQL that writes destructive queries.",
+        "C": "multi-hop multiplies calls.",
+        "L": "iterative search runs to minutes, so needs async.",
+        "O": "per-hop traces.",
+        "S": "read-only DB roles for text-to-SQL; web content as an injection vector."
+      },
+      "interview": [
+        {
+          "q": "When is agentic RAG worth its latency?",
+          "reported": false
+        },
+        {
+          "q": "Design a text-to-SQL assistant for analysts. How do you make it safe?",
+          "reported": false
+        },
+        {
+          "q": "Design a deep-research agent that produces a cited report.",
+          "reported": true,
+          "note": "reported whiteboard prompt"
+        },
+        {
+          "q": "Why do coding agents often prefer grep over vector search?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Turn your Ch 17 RAG into an agent with `search_docs`, `grep_repo` and `read_file` tools. Compare it with single-shot RAG on multi-hop questions for accuracy, cost and latency.",
+      "sources": "mlabonne \"Advanced RAG\" (V); Berkeley F24 Jerry Liu (V); Anthropic multi-agent research system (V); OpenAI Cookbook file and web search (S); PromptLayer (V)",
+      "selfWrite": false
+    },
+    {
+      "id": "19",
+      "slug": "evals-methodology",
+      "title": "Evals I: Methodology and Error Analysis",
+      "part": "V",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "19.01",
+          "title": "Evals as the core loop",
+          "slug": "evals-as-the-core-loop"
+        },
+        {
+          "id": "19.02",
+          "title": "Model vs system evals",
+          "slug": "model-vs-system-evals"
+        },
+        {
+          "id": "19.03",
+          "title": "Benchmarks and contamination",
+          "slug": "benchmarks-and-contamination"
+        },
+        {
+          "id": "19.04",
+          "title": "Trace review",
+          "slug": "trace-review"
+        },
+        {
+          "id": "19.05",
+          "title": "Open/axial coding of failures",
+          "slug": "open-axial-coding-of-failures"
+        },
+        {
+          "id": "19.06",
+          "title": "Failure taxonomies",
+          "slug": "failure-taxonomies"
+        },
+        {
+          "id": "19.07",
+          "title": "Building eval sets",
+          "slug": "building-eval-sets"
+        },
+        {
+          "id": "19.08",
+          "title": "Synthetic inputs",
+          "slug": "synthetic-inputs"
+        },
+        {
+          "id": "19.09",
+          "title": "Exact/functional/reference metrics",
+          "slug": "exact-functional-reference-metrics"
+        },
+        {
+          "id": "19.10",
+          "title": "Similarity metrics' limits",
+          "slug": "similarity-metrics-limits"
+        },
+        {
+          "id": "19.11",
+          "title": "Human annotation guidelines",
+          "slug": "human-annotation-guidelines"
+        },
+        {
+          "id": "19.12",
+          "title": "Criteria: capability, instruction-following, cost, latency",
+          "slug": "criteria-capability-instruction-following-cost-latency"
+        },
+        {
+          "id": "19.13",
+          "title": "Noise, statistics, sample sizes",
+          "slug": "noise-statistics-sample-sizes"
+        },
+        {
+          "id": "19.14",
+          "title": "Eval-driven development",
+          "slug": "eval-driven-development"
+        }
+      ],
+      "production": {
+        "F": "generic metrics (\"helpfulness 4.2/5\") that don't track real failures; eval sets that go stale.",
+        "C": "eval runs cost tokens, so budget them.",
+        "L": "eval suite runtime gates deploys.",
+        "O": "evals are built from production traces.",
+        "S": "eval data contains PII; handle it accordingly."
+      },
+      "interview": [
+        {
+          "q": "How do you build an eval set for a new feature with no users yet?",
+          "reported": false
+        },
+        {
+          "q": "What is error analysis, and how do you run it?",
+          "reported": false
+        },
+        {
+          "q": "Model eval vs system eval: what's the difference?",
+          "reported": true,
+          "note": "flagged as a common confusion, (S)"
+        },
+        {
+          "q": "How many examples do you need to detect a 5% regression?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Review 100 real traces from your app and open-code the failures into a taxonomy. Turn the top three failure modes into a versioned eval set with pass/fail checks.",
+      "sources": "Hamel Evals FAQ (V); Chip Huyen Ch3–4 (V); CS336 Lecture 12 (V); Anthropic \"infrastructure noise\" (V); Hamel \"Your AI Product Needs Evals\" https://hamel.dev/blog/posts/evals/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "20",
+      "slug": "evals-judges-and-ci",
+      "title": "Evals II: Judges, RAG/Agent Evals and Continuous Evaluation",
+      "part": "V",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "20.01",
+          "title": "LLM-as-judge design",
+          "slug": "llm-as-judge-design"
+        },
+        {
+          "id": "20.02",
+          "title": "Pairwise vs pointwise",
+          "slug": "pairwise-vs-pointwise"
+        },
+        {
+          "id": "20.03",
+          "title": "Validating judges (TPR/TNR vs humans)",
+          "slug": "validating-judges-tpr-tnr-vs-humans"
+        },
+        {
+          "id": "20.04",
+          "title": "Judge biases",
+          "slug": "judge-biases"
+        },
+        {
+          "id": "20.05",
+          "title": "Comparative/Elo",
+          "slug": "comparative-elo"
+        },
+        {
+          "id": "20.06",
+          "title": "RAG evals: retrieval vs generation",
+          "slug": "rag-evals-retrieval-vs-generation"
+        },
+        {
+          "id": "20.07",
+          "title": "Faithfulness checks",
+          "slug": "faithfulness-checks"
+        },
+        {
+          "id": "20.08",
+          "title": "Tool-call and structured evals",
+          "slug": "tool-call-and-structured-evals"
+        },
+        {
+          "id": "20.09",
+          "title": "Agent evals: outcome vs trajectory",
+          "slug": "agent-evals-outcome-vs-trajectory"
+        },
+        {
+          "id": "20.10",
+          "title": "Multi-turn and simulated users",
+          "slug": "multi-turn-and-simulated-users"
+        },
+        {
+          "id": "20.11",
+          "title": "Sandboxed environments",
+          "slug": "sandboxed-environments"
+        },
+        {
+          "id": "20.12",
+          "title": "Eval awareness and gaming",
+          "slug": "eval-awareness-and-gaming"
+        },
+        {
+          "id": "20.13",
+          "title": "Evals in CI",
+          "slug": "evals-in-ci"
+        },
+        {
+          "id": "20.14",
+          "title": "Online evals and production sampling",
+          "slug": "online-evals-and-production-sampling"
+        }
+      ],
+      "production": {
+        "F": "unvalidated judges; position and verbosity bias; flaky agent evals from environment noise.",
+        "C": "a judge on every production trace is expensive, so sample.",
+        "L": "CI eval time.",
+        "O": "dashboards of eval scores per release.",
+        "S": "judge prompt injection by the outputs it grades."
+      },
+      "interview": [
+        {
+          "q": "How would you evaluate an agent beyond its final answer?",
+          "reported": true,
+          "note": "reported, (S)"
+        },
+        {
+          "q": "How do you know your LLM judge is trustworthy?",
+          "reported": false
+        },
+        {
+          "q": "Design an eval pipeline for a RAG chatbot, offline and online.",
+          "reported": false
+        },
+        {
+          "q": "How do you put evals in CI without flaky failures?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build an LLM judge for your top failure mode, validate it against 100 human labels (report TPR/TNR), and wire it into GitHub Actions as a regression gate. Add trajectory assertions for one agent flow.",
+      "sources": "Hamel FAQ (V); Chip Huyen Ch3 \"AI as a Judge\" (V); Anthropic \"Demystifying evals for AI agents\" and \"Eval awareness\" (V); Berkeley F25 Agent Evaluation (V); OpenAI Cookbook tools-evaluation (S); \"Who Validates the Validators?\" https://arxiv.org/abs/2404.12272 (K); τ-bench https://arxiv.org/abs/2406.12045 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "21",
+      "slug": "tool-use",
+      "title": "Tool Use / Function Calling",
+      "part": "VI",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "21.01",
+          "title": "Tools: text to action",
+          "slug": "tools-text-to-action"
+        },
+        {
+          "id": "21.02",
+          "title": "Call protocol",
+          "slug": "call-protocol"
+        },
+        {
+          "id": "21.03",
+          "title": "Agent-computer interface design",
+          "slug": "agent-computer-interface-design"
+        },
+        {
+          "id": "21.04",
+          "title": "Names, descriptions, examples",
+          "slug": "names-descriptions-examples"
+        },
+        {
+          "id": "21.05",
+          "title": "Granularity and consolidation",
+          "slug": "granularity-and-consolidation"
+        },
+        {
+          "id": "21.06",
+          "title": "Result size, format, errors",
+          "slug": "result-size-format-errors"
+        },
+        {
+          "id": "21.07",
+          "title": "Parallel calls",
+          "slug": "parallel-calls"
+        },
+        {
+          "id": "21.08",
+          "title": "Tool choice modes",
+          "slug": "tool-choice-modes"
+        },
+        {
+          "id": "21.09",
+          "title": "Built-in server tools",
+          "slug": "built-in-server-tools"
+        },
+        {
+          "id": "21.10",
+          "title": "Code execution as a meta-tool",
+          "slug": "code-execution-as-a-meta-tool"
+        },
+        {
+          "id": "21.11",
+          "title": "Tool search for large catalogs",
+          "slug": "tool-search-for-large-catalogs"
+        },
+        {
+          "id": "21.12",
+          "title": "Idempotency, retries, side effects",
+          "slug": "idempotency-retries-side-effects"
+        },
+        {
+          "id": "21.13",
+          "title": "Human approval",
+          "slug": "human-approval"
+        },
+        {
+          "id": "21.14",
+          "title": "Testing tools",
+          "slug": "testing-tools"
+        }
+      ],
+      "production": {
+        "F": "wrong tool or args; huge tool outputs flooding context; duplicate side effects on retry.",
+        "C": "tool definitions consume context on every call.",
+        "L": "sequential tool round-trips.",
+        "O": "log every call, its args, result size and errors.",
+        "S": "least privilege; validate arguments; never pass model-built strings to a shell or SQL unchecked."
+      },
+      "interview": [
+        {
+          "q": "How does function calling work under the hood?",
+          "reported": false
+        },
+        {
+          "q": "How do you design tools so the model uses them correctly?",
+          "reported": false
+        },
+        {
+          "q": "A tool call charged a customer twice. What went wrong, and how do you prevent it?",
+          "reported": false
+        },
+        {
+          "q": "How do you scale to 200 tools?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Expose three real operations from one of your backends as tools, with idempotency keys, typed args, error messages written for the model, and a confirmation gate on writes. Measure tool-selection accuracy on 30 prompts.",
+      "sources": "Anthropic \"Writing effective tools\" and \"Advanced tool use\" (V); Chip Huyen Ch6 \"Tools\" (V); OpenAI Cookbook function calling (S); Toolformer https://arxiv.org/abs/2302.04761 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "22",
+      "slug": "agent-loop",
+      "title": "The Agent Loop and Architectures",
+      "part": "VI",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "22.01",
+          "title": "Workflows vs agents",
+          "slug": "workflows-vs-agents"
+        },
+        {
+          "id": "22.02",
+          "title": "The augmented LLM",
+          "slug": "the-augmented-llm"
+        },
+        {
+          "id": "22.03",
+          "title": "Chaining, routing, parallelization",
+          "slug": "chaining-routing-parallelization"
+        },
+        {
+          "id": "22.04",
+          "title": "Orchestrator-workers; evaluator-optimizer",
+          "slug": "orchestrator-workers-evaluator-optimizer"
+        },
+        {
+          "id": "22.05",
+          "title": "ReAct loop",
+          "slug": "react-loop"
+        },
+        {
+          "id": "22.06",
+          "title": "Stop conditions and budgets",
+          "slug": "stop-conditions-and-budgets"
+        },
+        {
+          "id": "22.07",
+          "title": "State and message history",
+          "slug": "state-and-message-history"
+        },
+        {
+          "id": "22.08",
+          "title": "Error recovery",
+          "slug": "error-recovery"
+        },
+        {
+          "id": "22.09",
+          "title": "Reflection",
+          "slug": "reflection"
+        },
+        {
+          "id": "22.10",
+          "title": "Harness design",
+          "slug": "harness-design"
+        },
+        {
+          "id": "22.11",
+          "title": "Long-running agents, checkpointing, resumability",
+          "slug": "long-running-agents-checkpointing-resumability"
+        },
+        {
+          "id": "22.12",
+          "title": "Frameworks vs hand-rolled",
+          "slug": "frameworks-vs-hand-rolled"
+        },
+        {
+          "id": "22.13",
+          "title": "Failure modes",
+          "slug": "failure-modes"
+        },
+        {
+          "id": "22.14",
+          "title": "Twelve-factor principles",
+          "slug": "twelve-factor-principles"
+        }
+      ],
+      "production": {
+        "F": "infinite loops; goal drift; compounding errors; silent partial completion.",
+        "C": "unbounded loops lead to runaway spend.",
+        "L": "step count × call latency.",
+        "O": "a per-step trace tree.",
+        "S": "autonomy level matched to blast radius."
+      },
+      "interview": [
+        {
+          "q": "Workflow or agent: how do you decide?",
+          "reported": false
+        },
+        {
+          "q": "Implement a ReAct loop from scratch.",
+          "reported": false,
+          "note": "a likely coding round"
+        },
+        {
+          "q": "Design a support agent that drafts replies and escalates complex tickets.",
+          "reported": true,
+          "note": "reported whiteboard prompt"
+        },
+        {
+          "q": "How do you stop an agent from looping forever?",
+          "reported": false
+        },
+        {
+          "q": "Framework or hand-rolled? Defend your choice.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Hand-roll an agent loop (no framework) of about 200 lines with step and budget limits, checkpointing to disk and resume. Use it on one real workflow from your repos.",
+      "sources": "Anthropic \"Building effective agents\" https://www.anthropic.com/engineering/building-effective-agents (K), plus the two harness posts (V); Berkeley F24 Shunyu Yao and F25 Yann Dubois and Clay Bavor (V); Chip Huyen Ch6 (V); ReAct https://arxiv.org/abs/2210.03629 (K); Lilian Weng https://lilianweng.github.io/posts/2023-06-23-agent/ (K); 12-factor agents https://github.com/humanlayer/12-factor-agents (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "23",
+      "slug": "memory",
+      "title": "Memory",
+      "part": "VI",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "23.01",
+          "title": "Why stateless models need memory",
+          "slug": "why-stateless-models-need-memory"
+        },
+        {
+          "id": "23.02",
+          "title": "Conversation buffer",
+          "slug": "conversation-buffer"
+        },
+        {
+          "id": "23.03",
+          "title": "Summarization and compaction",
+          "slug": "summarization-and-compaction"
+        },
+        {
+          "id": "23.04",
+          "title": "Episodic/semantic/procedural stores",
+          "slug": "episodic-semantic-procedural-stores"
+        },
+        {
+          "id": "23.05",
+          "title": "Write policies",
+          "slug": "write-policies"
+        },
+        {
+          "id": "23.06",
+          "title": "Retrieval and relevance",
+          "slug": "retrieval-and-relevance"
+        },
+        {
+          "id": "23.07",
+          "title": "File-system/scratchpad memory",
+          "slug": "file-system-scratchpad-memory"
+        },
+        {
+          "id": "23.08",
+          "title": "Hierarchical (MemGPT)",
+          "slug": "hierarchical-memgpt"
+        },
+        {
+          "id": "23.09",
+          "title": "User profiles and personalization",
+          "slug": "user-profiles-and-personalization"
+        },
+        {
+          "id": "23.10",
+          "title": "Forgetting, staleness, conflicts",
+          "slug": "forgetting-staleness-conflicts"
+        },
+        {
+          "id": "23.11",
+          "title": "Privacy",
+          "slug": "privacy"
+        },
+        {
+          "id": "23.12",
+          "title": "Evaluating memory",
+          "slug": "evaluating-memory"
+        }
+      ],
+      "production": {
+        "F": "wrong or stale memories resurfacing; memory poisoning; context bloat.",
+        "C": "storage plus retrieval per turn.",
+        "L": "memory lookup on the hot path.",
+        "O": "show users and devs which memories were used.",
+        "S": "cross-user leakage; right-to-forget; injected \"remember this\" attacks."
+      },
+      "interview": [
+        {
+          "q": "What strategies exist for long-term memory?",
+          "reported": true,
+          "note": "reported, (V) PromptLayer"
+        },
+        {
+          "q": "How do you handle documents and conversations that exceed context?",
+          "reported": true,
+          "note": "reported, (V)"
+        },
+        {
+          "q": "Design memory for a personal assistant used daily for a year.",
+          "reported": false
+        },
+        {
+          "q": "How do you prevent memory poisoning?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Add a memory layer to your Ch 22 agent: a summarized short-term buffer, a long-term semantic store with explicit write rules, and a user-visible \"what I remember\" page with delete.",
+      "sources": "Anthropic \"The components of agent memory\" (V); Chip Huyen Ch6 \"Memory\" (V); mlabonne (V); MemGPT https://arxiv.org/abs/2310.08560 (K); Generative Agents https://arxiv.org/abs/2304.03442 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "24",
+      "slug": "planning",
+      "title": "Planning and Reasoning in Agents",
+      "part": "VI",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "24.01",
+          "title": "Planning vs reacting",
+          "slug": "planning-vs-reacting"
+        },
+        {
+          "id": "24.02",
+          "title": "Plan-then-execute",
+          "slug": "plan-then-execute"
+        },
+        {
+          "id": "24.03",
+          "title": "Decomposition and todo lists",
+          "slug": "decomposition-and-todo-lists"
+        },
+        {
+          "id": "24.04",
+          "title": "Tree/graph search",
+          "slug": "tree-graph-search"
+        },
+        {
+          "id": "24.05",
+          "title": "Reflexion",
+          "slug": "reflexion"
+        },
+        {
+          "id": "24.06",
+          "title": "Replanning",
+          "slug": "replanning"
+        },
+        {
+          "id": "24.07",
+          "title": "Verification",
+          "slug": "verification"
+        },
+        {
+          "id": "24.08",
+          "title": "Planning with reasoning models",
+          "slug": "planning-with-reasoning-models"
+        },
+        {
+          "id": "24.09",
+          "title": "Neuro-symbolic",
+          "slug": "neuro-symbolic"
+        },
+        {
+          "id": "24.10",
+          "title": "Evaluating plans",
+          "slug": "evaluating-plans"
+        }
+      ],
+      "production": {
+        "F": "over-planning; plans that are never revisited; unverifiable steps.",
+        "C": "tree search multiplies calls.",
+        "L": "planning adds an upfront delay.",
+        "O": "log plan vs executed steps.",
+        "S": "plan-then-execute as an injection defence (see 33.08)."
+      },
+      "interview": [
+        {
+          "q": "Plan-then-execute vs ReAct: trade-offs?",
+          "reported": false
+        },
+        {
+          "q": "How do you make an agent verify its own work?",
+          "reported": false
+        },
+        {
+          "q": "How would you use a reasoning model as planner and a cheap model as executor?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Add an explicit todo-list plan plus a verifier step to your agent. A/B it against the plain ReAct loop on 20 multi-step tasks.",
+      "sources": "Chip Huyen Ch6 \"Planning\" (V); Berkeley F24 Denny Zhou and Yuandong Tian (V); Tree of Thoughts https://arxiv.org/abs/2305.10601 (K); Reflexion https://arxiv.org/abs/2303.11366 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "25",
+      "slug": "multi-agent-systems",
+      "title": "Multi-Agent Systems",
+      "part": "VI",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "25.01",
+          "title": "When multiple agents help (and don't)",
+          "slug": "when-multiple-agents-help-and-dont"
+        },
+        {
+          "id": "25.02",
+          "title": "Orchestrator/sub-agent",
+          "slug": "orchestrator-sub-agent"
+        },
+        {
+          "id": "25.03",
+          "title": "Handoffs",
+          "slug": "handoffs"
+        },
+        {
+          "id": "25.04",
+          "title": "Parallel sub-agents and context isolation",
+          "slug": "parallel-sub-agents-and-context-isolation"
+        },
+        {
+          "id": "25.05",
+          "title": "Communication and shared state",
+          "slug": "communication-and-shared-state"
+        },
+        {
+          "id": "25.06",
+          "title": "Debate/critic",
+          "slug": "debate-critic"
+        },
+        {
+          "id": "25.07",
+          "title": "Token cost",
+          "slug": "token-cost"
+        },
+        {
+          "id": "25.08",
+          "title": "Coordination failures",
+          "slug": "coordination-failures"
+        },
+        {
+          "id": "25.09",
+          "title": "Agent teams for long tasks",
+          "slug": "agent-teams-for-long-tasks"
+        },
+        {
+          "id": "25.10",
+          "title": "Evaluation",
+          "slug": "evaluation"
+        }
+      ],
+      "production": {
+        "F": "duplicated work; conflicting edits; lost context in handoffs.",
+        "C": "multi-agent can multiply token spend several times over (Anthropic reports this for its research system; verify the figure in the post).",
+        "L": "parallelism cuts wall-clock time.",
+        "O": "a cross-agent trace tree.",
+        "S": "privilege boundaries between agents."
+      },
+      "interview": [
+        {
+          "q": "When is multi-agent worth the cost?",
+          "reported": false
+        },
+        {
+          "q": "Design a research system with parallel sub-agents.",
+          "reported": false
+        },
+        {
+          "q": "How do agents share state without stepping on each other?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Split your deep-research agent from Ch 18 into an orchestrator plus 3 parallel sub-agents. Compare quality, cost and wall-clock time with the single agent.",
+      "sources": "Anthropic multi-agent research system and parallel-Claudes C compiler (V); Berkeley F25 Noam Brown and Oriol Vinyals (V); Berkeley F24 AutoGen (V); OpenAI Cookbook Agents SDK (S)",
+      "selfWrite": false
+    },
+    {
+      "id": "26",
+      "slug": "mcp",
+      "title": "MCP and Agent Protocols",
+      "part": "VI",
+      "weight": 3,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "26.01",
+          "title": "The N×M integration problem",
+          "slug": "the-n-m-integration-problem"
+        },
+        {
+          "id": "26.02",
+          "title": "Host/client/server architecture",
+          "slug": "host-client-server-architecture"
+        },
+        {
+          "id": "26.03",
+          "title": "Transports (stdio, streamable HTTP)",
+          "slug": "transports-stdio-streamable-http"
+        },
+        {
+          "id": "26.04",
+          "title": "Tools, resources, prompts",
+          "slug": "tools-resources-prompts"
+        },
+        {
+          "id": "26.05",
+          "title": "Sampling, roots, elicitation",
+          "slug": "sampling-roots-elicitation"
+        },
+        {
+          "id": "26.06",
+          "title": "Building a server",
+          "slug": "building-a-server"
+        },
+        {
+          "id": "26.07",
+          "title": "OAuth for remote MCP",
+          "slug": "oauth-for-remote-mcp"
+        },
+        {
+          "id": "26.08",
+          "title": "Context cost of many servers",
+          "slug": "context-cost-of-many-servers"
+        },
+        {
+          "id": "26.09",
+          "title": "Code execution with MCP",
+          "slug": "code-execution-with-mcp"
+        },
+        {
+          "id": "26.10",
+          "title": "Packaging and distribution",
+          "slug": "packaging-and-distribution"
+        },
+        {
+          "id": "26.11",
+          "title": "Agent Skills",
+          "slug": "agent-skills"
+        },
+        {
+          "id": "26.12",
+          "title": "A2A",
+          "slug": "a2a"
+        },
+        {
+          "id": "26.13",
+          "title": "Protocol security (tool poisoning, rug pulls, confused deputy)",
+          "slug": "protocol-security-tool-poisoning-rug-pulls-confused-deputy"
+        },
+        {
+          "id": "26.14",
+          "title": "Protocol vs direct API",
+          "slug": "protocol-vs-direct-api"
+        }
+      ],
+      "production": {
+        "F": "tool-description bloat; version skew.",
+        "C": "tool schemas in context on every call.",
+        "L": "remote server hops.",
+        "O": "per-server call logs.",
+        "S": "untrusted third-party servers, token passthrough, malicious tool descriptions."
+      },
+      "interview": [
+        {
+          "q": "What is MCP, and what problem does it solve?",
+          "reported": false
+        },
+        {
+          "q": "MCP vs plain function calling?",
+          "reported": false
+        },
+        {
+          "q": "How would you secure a remote MCP server for enterprise users?",
+          "reported": false
+        },
+        {
+          "q": "MCP vs A2A?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Wrap one of your own backends as an MCP server (stdio, then streamable HTTP with OAuth). Use it from Claude Code or another MCP client and write a threat model for it.",
+      "sources": "MCP spec https://modelcontextprotocol.io/specification (K); Anthropic \"Code execution with MCP\", \"Desktop Extensions\", \"Agent Skills\" (V); mlabonne \"Agent Protocols\" (V); A2A https://a2a-protocol.org (K).",
+      "selfWrite": true
+    },
+    {
+      "id": "27",
+      "slug": "context-engineering",
+      "title": "Context Engineering",
+      "part": "VI",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "27.01",
+          "title": "From prompt to context engineering",
+          "slug": "from-prompt-to-context-engineering"
+        },
+        {
+          "id": "27.02",
+          "title": "Context as a finite attention budget",
+          "slug": "context-as-a-finite-attention-budget"
+        },
+        {
+          "id": "27.03",
+          "title": "Context rot",
+          "slug": "context-rot"
+        },
+        {
+          "id": "27.04",
+          "title": "Anatomy of agent context",
+          "slug": "anatomy-of-agent-context"
+        },
+        {
+          "id": "27.05",
+          "title": "System-prompt altitude",
+          "slug": "system-prompt-altitude"
+        },
+        {
+          "id": "27.06",
+          "title": "Just-in-time retrieval vs preloading",
+          "slug": "just-in-time-retrieval-vs-preloading"
+        },
+        {
+          "id": "27.07",
+          "title": "Compaction",
+          "slug": "compaction"
+        },
+        {
+          "id": "27.08",
+          "title": "Structured note-taking",
+          "slug": "structured-note-taking"
+        },
+        {
+          "id": "27.09",
+          "title": "Sub-agent isolation",
+          "slug": "sub-agent-isolation"
+        },
+        {
+          "id": "27.10",
+          "title": "Tool-result trimming",
+          "slug": "tool-result-trimming"
+        },
+        {
+          "id": "27.11",
+          "title": "Cache-aware layout",
+          "slug": "cache-aware-layout"
+        },
+        {
+          "id": "27.12",
+          "title": "Measuring context quality",
+          "slug": "measuring-context-quality"
+        }
+      ],
+      "production": {
+        "F": "context rot in long sessions; lost instructions after compaction.",
+        "C": "cache misses from unstable prefixes.",
+        "L": "prefill time grows with context.",
+        "O": "log context composition per call (tokens by source).",
+        "S": "untrusted content mixed with instructions."
+      },
+      "interview": [
+        {
+          "q": "What is context engineering, and how does it differ from prompt engineering?",
+          "reported": false
+        },
+        {
+          "q": "Your agent gets worse after 50 turns. Why, and what do you do?",
+          "reported": false
+        },
+        {
+          "q": "How do you structure context to maximize prompt-cache hits?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Add context accounting to your agent (a tokens-by-source breakdown per call), then implement compaction and stable-prefix ordering. Measure cache hit rate and long-session task success before and after.",
+      "sources": "Anthropic \"Effective context engineering\" (V); Chip Huyen Ch10 \"Enhance Context\" (V); Lost in the Middle (K); PromptLayer, \"context engineering\" as an interview topic (V).",
+      "selfWrite": true
+    },
+    {
+      "id": "28",
+      "slug": "coding-and-computer-use-agents",
+      "title": "Coding and Computer-Use Agents",
+      "part": "VI",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "28.01",
+          "title": "Why coding is the flagship domain",
+          "slug": "why-coding-is-the-flagship-domain"
+        },
+        {
+          "id": "28.02",
+          "title": "Agent-computer interfaces",
+          "slug": "agent-computer-interfaces"
+        },
+        {
+          "id": "28.03",
+          "title": "Repo navigation",
+          "slug": "repo-navigation"
+        },
+        {
+          "id": "28.04",
+          "title": "Edit formats and patching",
+          "slug": "edit-formats-and-patching"
+        },
+        {
+          "id": "28.05",
+          "title": "Test-driven agent loops",
+          "slug": "test-driven-agent-loops"
+        },
+        {
+          "id": "28.06",
+          "title": "SWE-bench evaluation",
+          "slug": "swe-bench-evaluation"
+        },
+        {
+          "id": "28.07",
+          "title": "Computer use: screenshots and actions",
+          "slug": "computer-use-screenshots-and-actions"
+        },
+        {
+          "id": "28.08",
+          "title": "Browser agents",
+          "slug": "browser-agents"
+        },
+        {
+          "id": "28.09",
+          "title": "OSWorld-style evaluation",
+          "slug": "osworld-style-evaluation"
+        },
+        {
+          "id": "28.10",
+          "title": "Long-running sessions",
+          "slug": "long-running-sessions"
+        },
+        {
+          "id": "28.11",
+          "title": "Permission modes and auto-approval",
+          "slug": "permission-modes-and-auto-approval"
+        },
+        {
+          "id": "28.12",
+          "title": "Version control for agent work",
+          "slug": "version-control-for-agent-work"
+        }
+      ],
+      "production": {
+        "F": "tests passing for the wrong reasons; destructive commands; flaky UI grounding.",
+        "C": "long sessions.",
+        "L": "screenshot loops are slow.",
+        "O": "full action logs and replays.",
+        "S": "sandboxing, network egress control, credential isolation."
+      },
+      "interview": [
+        {
+          "q": "Design an AI coding agent.",
+          "reported": true,
+          "note": "reported common prompt, (S)"
+        },
+        {
+          "q": "Build a code-review agent and evaluate its accuracy.",
+          "reported": true,
+          "note": "reported take-home, (V)"
+        },
+        {
+          "q": "How do you safely let an agent run shell commands?",
+          "reported": false
+        },
+        {
+          "q": "How would you evaluate a browser agent?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build a PR-review bot for your own repos that comments on diffs. Measure precision of its comments on 30 historical PRs, and run it in a sandboxed container with no network.",
+      "sources": "Anthropic Claude Code best practices, harness posts, auto mode, source control (V); Berkeley F24 Graham Neubig (V); SWE-bench https://arxiv.org/abs/2310.06770 (K); OSWorld https://arxiv.org/abs/2404.07972 (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "29",
+      "slug": "guardrails-and-safety",
+      "title": "Guardrails and Safety",
+      "part": "VII",
+      "weight": 3,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "29.01",
+          "title": "Taxonomy (input/output, sync/async)",
+          "slug": "taxonomy-input-output-sync-async"
+        },
+        {
+          "id": "29.02",
+          "title": "Moderation classifiers",
+          "slug": "moderation-classifiers"
+        },
+        {
+          "id": "29.03",
+          "title": "PII detection and redaction",
+          "slug": "pii-detection-and-redaction"
+        },
+        {
+          "id": "29.04",
+          "title": "Scope restriction",
+          "slug": "scope-restriction"
+        },
+        {
+          "id": "29.05",
+          "title": "Output validation and fact-checking",
+          "slug": "output-validation-and-fact-checking"
+        },
+        {
+          "id": "29.06",
+          "title": "Hallucination mitigation",
+          "slug": "hallucination-mitigation"
+        },
+        {
+          "id": "29.07",
+          "title": "Refusals and fallbacks",
+          "slug": "refusals-and-fallbacks"
+        },
+        {
+          "id": "29.08",
+          "title": "Guardrail latency",
+          "slug": "guardrail-latency"
+        },
+        {
+          "id": "29.09",
+          "title": "Human escalation",
+          "slug": "human-escalation"
+        },
+        {
+          "id": "29.10",
+          "title": "Policies and responsible scaling",
+          "slug": "policies-and-responsible-scaling"
+        },
+        {
+          "id": "29.11",
+          "title": "Bias checks",
+          "slug": "bias-checks"
+        },
+        {
+          "id": "29.12",
+          "title": "Evaluating guardrails",
+          "slug": "evaluating-guardrails"
+        }
+      ],
+      "production": {
+        "F": "false positives blocking users; guardrails bypassed by streaming output.",
+        "C": "an extra model call per request.",
+        "L": "sync guardrails add latency (run them in parallel or async where safe).",
+        "O": "block and flag rates; appeal logs.",
+        "S": "guardrails are defence in depth, not a security boundary."
+      },
+      "interview": [
+        {
+          "q": "Design guardrails for a healthcare chatbot.",
+          "reported": false
+        },
+        {
+          "q": "How do you guardrail streamed output?",
+          "reported": false
+        },
+        {
+          "q": "How do you reduce hallucinations in production?",
+          "reported": false
+        },
+        {
+          "q": "How do you measure guardrail false-positive rates?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Add input PII redaction and output groundedness checks to your RAG app, running in parallel with generation. Measure added p95 latency and the false-positive rate on 200 benign queries.",
+      "sources": "Chip Huyen Ch10 \"Guardrails\" (V); Hamel FAQ \"Production\" (V); Berkeley F24 Ben Mann and Dawn Song (V)",
+      "selfWrite": false
+    },
+    {
+      "id": "30",
+      "slug": "observability",
+      "title": "Observability",
+      "part": "VII",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "30.01",
+          "title": "Why APM isn't enough",
+          "slug": "why-apm-isnt-enough"
+        },
+        {
+          "id": "30.02",
+          "title": "Traces and spans for LLM calls",
+          "slug": "traces-and-spans-for-llm-calls"
+        },
+        {
+          "id": "30.03",
+          "title": "OpenTelemetry GenAI conventions",
+          "slug": "opentelemetry-genai-conventions"
+        },
+        {
+          "id": "30.04",
+          "title": "Logging prompts, completions, tool calls",
+          "slug": "logging-prompts-completions-tool-calls"
+        },
+        {
+          "id": "30.05",
+          "title": "Agent trajectory tracing",
+          "slug": "agent-trajectory-tracing"
+        },
+        {
+          "id": "30.06",
+          "title": "Quality/latency/cost/error metrics",
+          "slug": "quality-latency-cost-error-metrics"
+        },
+        {
+          "id": "30.07",
+          "title": "Drift detection",
+          "slug": "drift-detection"
+        },
+        {
+          "id": "30.08",
+          "title": "Feedback into traces",
+          "slug": "feedback-into-traces"
+        },
+        {
+          "id": "30.09",
+          "title": "Debugging from traces",
+          "slug": "debugging-from-traces"
+        },
+        {
+          "id": "30.10",
+          "title": "Incident response and postmortems",
+          "slug": "incident-response-and-postmortems"
+        },
+        {
+          "id": "30.11",
+          "title": "Log privacy and retention",
+          "slug": "log-privacy-and-retention"
+        },
+        {
+          "id": "30.12",
+          "title": "The trace → eval → fix loop",
+          "slug": "the-trace-eval-fix-loop"
+        }
+      ],
+      "production": {
+        "F": "no way to reproduce a bad answer; silent quality drift after provider changes.",
+        "C": "log storage of full prompts.",
+        "L": "tracing overhead.",
+        "O": "this chapter is the \"O\" for every other chapter.",
+        "S": "prompts and logs contain PII and secrets; apply redaction and access control."
+      },
+      "interview": [
+        {
+          "q": "Users say answers got worse last week. How do you investigate?",
+          "reported": false
+        },
+        {
+          "q": "What would you log for every LLM call?",
+          "reported": false
+        },
+        {
+          "q": "Design observability for a multi-agent system.",
+          "reported": false
+        },
+        {
+          "q": "How do you detect quality drift without labels?",
+          "reported": false
+        }
+      ],
+      "applyIt": "Instrument your app with OTel GenAI spans (model, tokens, cost, prompt version, tool calls) exported to a local Jaeger or Langfuse-style backend. Build a dashboard and one alert, then do a mock postmortem.",
+      "sources": "Chip Huyen Ch10 \"Monitoring and Observability\" (V); Anthropic postmortem and quality-report posts (V); OTel GenAI https://opentelemetry.io/docs/specs/semconv/gen-ai/ (K); OpenAI Cookbook trace-based improvement loop (S); roadmap.sh FAQ names AI observability (V).",
+      "selfWrite": true
+    },
+    {
+      "id": "31",
+      "slug": "cost-and-latency-engineering",
+      "title": "Cost and Latency Engineering",
+      "part": "VII",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "31.01",
+          "title": "Unit economics per task/user",
+          "slug": "unit-economics-per-task-user"
+        },
+        {
+          "id": "31.02",
+          "title": "Token budget accounting",
+          "slug": "token-budget-accounting"
+        },
+        {
+          "id": "31.03",
+          "title": "Prompt caching",
+          "slug": "prompt-caching"
+        },
+        {
+          "id": "31.04",
+          "title": "Semantic and exact caching",
+          "slug": "semantic-and-exact-caching"
+        },
+        {
+          "id": "31.05",
+          "title": "Routing and cascades",
+          "slug": "routing-and-cascades"
+        },
+        {
+          "id": "31.06",
+          "title": "Small/distilled models",
+          "slug": "small-distilled-models"
+        },
+        {
+          "id": "31.07",
+          "title": "Batch APIs",
+          "slug": "batch-apis"
+        },
+        {
+          "id": "31.08",
+          "title": "Streaming and perceived latency",
+          "slug": "streaming-and-perceived-latency"
+        },
+        {
+          "id": "31.09",
+          "title": "Parallel calls",
+          "slug": "parallel-calls"
+        },
+        {
+          "id": "31.10",
+          "title": "Reasoning-effort tuning",
+          "slug": "reasoning-effort-tuning"
+        },
+        {
+          "id": "31.11",
+          "title": "Context trimming",
+          "slug": "context-trimming"
+        },
+        {
+          "id": "31.12",
+          "title": "Agent budgets and runaway control",
+          "slug": "agent-budgets-and-runaway-control"
+        },
+        {
+          "id": "31.13",
+          "title": "Self-host break-even",
+          "slug": "self-host-break-even"
+        },
+        {
+          "id": "31.14",
+          "title": "Dashboards and alerts",
+          "slug": "dashboards-and-alerts"
+        }
+      ],
+      "production": {
+        "F": "semantic cache returning wrong answers; a cost spike from one runaway tenant.",
+        "C": "this chapter is the \"C\" for every other chapter.",
+        "L": "p95, not the mean; tail latency from long outputs.",
+        "O": "cost per feature, tenant and model.",
+        "S": "denial-of-wallet attacks; per-user rate limits."
+      },
+      "interview": [
+        {
+          "q": "Our LLM bill tripled. Walk me through cutting it by 50% without hurting quality.",
+          "reported": false
+        },
+        {
+          "q": "How does prompt caching work, and how do you design for it?",
+          "reported": false
+        },
+        {
+          "q": "When is semantic caching dangerous?",
+          "reported": false
+        },
+        {
+          "q": "Reduce p95 latency of a RAG chatbot from 6s to 2s.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Build a cost/latency report for your app: cost per request by feature, then apply caching, routing and batch processing. Write a before/after table with quality held constant on your eval set.",
+      "sources": "Chip Huyen Ch4, Ch9, Ch10 (V); Anthropic prompt caching docs https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching (K); RouteLLM (K).",
+      "selfWrite": true
+    },
+    {
+      "id": "32",
+      "slug": "deployment-and-llmops",
+      "title": "Deployment and LLMOps",
+      "part": "VII",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "32.01",
+          "title": "Reference architecture",
+          "slug": "reference-architecture"
+        },
+        {
+          "id": "32.02",
+          "title": "Prompts and config as code",
+          "slug": "prompts-and-config-as-code"
+        },
+        {
+          "id": "32.03",
+          "title": "Environments and staged rollout",
+          "slug": "environments-and-staged-rollout"
+        },
+        {
+          "id": "32.04",
+          "title": "A/B tests and shadow traffic",
+          "slug": "a-b-tests-and-shadow-traffic"
+        },
+        {
+          "id": "32.05",
+          "title": "Orchestration",
+          "slug": "orchestration"
+        },
+        {
+          "id": "32.06",
+          "title": "Async jobs and queues",
+          "slug": "async-jobs-and-queues"
+        },
+        {
+          "id": "32.07",
+          "title": "Streaming over SSE/WebSockets",
+          "slug": "streaming-over-sse-websockets"
+        },
+        {
+          "id": "32.08",
+          "title": "Rate limiting and backpressure",
+          "slug": "rate-limiting-and-backpressure"
+        },
+        {
+          "id": "32.09",
+          "title": "Fallbacks and failover",
+          "slug": "fallbacks-and-failover"
+        },
+        {
+          "id": "32.10",
+          "title": "Managed agent platforms and sandboxes",
+          "slug": "managed-agent-platforms-and-sandboxes"
+        },
+        {
+          "id": "32.11",
+          "title": "Model upgrade/regression management",
+          "slug": "model-upgrade-regression-management"
+        },
+        {
+          "id": "32.12",
+          "title": "Data flywheel",
+          "slug": "data-flywheel"
+        }
+      ],
+      "production": {
+        "F": "half-finished agent jobs on deploy; streaming connections dropped by proxies.",
+        "C": "idle GPU capacity.",
+        "L": "queueing under burst.",
+        "O": "release markers on dashboards.",
+        "S": "secrets management; sandbox isolation for agent runtimes."
+      },
+      "interview": [
+        {
+          "q": "Design ChatGPT (or a chat product) end to end.",
+          "reported": true,
+          "note": "a commonly cited prompt, (S) KDnuggets"
+        },
+        {
+          "q": "How do you roll out a new model version safely?",
+          "reported": false
+        },
+        {
+          "q": "How do you serve long-running agent tasks behind an HTTP API?",
+          "reported": false
+        },
+        {
+          "q": "Design an end-to-end architecture for an LLM app (gateway, cache, guardrails, router, observability).",
+          "reported": false
+        }
+      ],
+      "applyIt": "Deploy your app with streaming SSE, a job queue for long agent runs, a canary rollout of a new model version gated on eval scores, and shadow traffic.",
+      "sources": "Chip Huyen Ch10 (V); FSDL LLMOps and \"Launch in an Hour\" (V); mlabonne \"Deploying\" (V); Anthropic \"Scaling Managed Agents\" (V); Chip Huyen \"Building a GenAI Platform\" https://huyenchip.com/2024/07/25/genai-platform.html (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "33",
+      "slug": "security-prompt-injection",
+      "title": "Security: Prompt Injection and Agent Security",
+      "part": "VII",
+      "weight": 3,
+      "fastTrack": true,
+      "sections": [
+        {
+          "id": "33.01",
+          "title": "Threat model",
+          "slug": "threat-model"
+        },
+        {
+          "id": "33.02",
+          "title": "Direct injection and jailbreaks",
+          "slug": "direct-injection-and-jailbreaks"
+        },
+        {
+          "id": "33.03",
+          "title": "Indirect injection",
+          "slug": "indirect-injection"
+        },
+        {
+          "id": "33.04",
+          "title": "System-prompt extraction",
+          "slug": "system-prompt-extraction"
+        },
+        {
+          "id": "33.05",
+          "title": "Exfiltration channels (markdown images, links, tools)",
+          "slug": "exfiltration-channels-markdown-images-links-tools"
+        },
+        {
+          "id": "33.06",
+          "title": "The lethal trifecta",
+          "slug": "the-lethal-trifecta"
+        },
+        {
+          "id": "33.07",
+          "title": "Why classifiers are insufficient",
+          "slug": "why-classifiers-are-insufficient"
+        },
+        {
+          "id": "33.08",
+          "title": "Architectural defences (dual-LLM, CaMeL, plan-then-execute)",
+          "slug": "architectural-defences-dual-llm-camel-plan-then-execute"
+        },
+        {
+          "id": "33.09",
+          "title": "Least-privilege tools and scoped credentials",
+          "slug": "least-privilege-tools-and-scoped-credentials"
+        },
+        {
+          "id": "33.10",
+          "title": "Sandboxing and containment",
+          "slug": "sandboxing-and-containment"
+        },
+        {
+          "id": "33.11",
+          "title": "Permission prompts vs autonomous modes",
+          "slug": "permission-prompts-vs-autonomous-modes"
+        },
+        {
+          "id": "33.12",
+          "title": "MCP and tool supply chain",
+          "slug": "mcp-and-tool-supply-chain"
+        },
+        {
+          "id": "33.13",
+          "title": "Poisoning and backdoors",
+          "slug": "poisoning-and-backdoors"
+        },
+        {
+          "id": "33.14",
+          "title": "OWASP LLM Top 10 and red teaming",
+          "slug": "owasp-llm-top-10-and-red-teaming"
+        }
+      ],
+      "production": {
+        "F": "an agent with private data access, untrusted input and an outbound channel, which is the lethal trifecta.",
+        "C": "red-teaming cost.",
+        "L": "approval gates slow workflows.",
+        "O": "audit logs of every tool action.",
+        "S": "this chapter is the \"S\" for every other chapter."
+      },
+      "interview": [
+        {
+          "q": "What is prompt injection, and why can't it be fully solved with filters?",
+          "reported": false
+        },
+        {
+          "q": "An email assistant reads inbound mail and can send mail. Threat-model it.",
+          "reported": false
+        },
+        {
+          "q": "How do you design an agent that safely browses the web?",
+          "reported": false
+        },
+        {
+          "q": "Walk through the OWASP LLM Top 10.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Red-team your own RAG/agent with 20 indirect-injection payloads planted in indexed docs. Then add the defences (tool allow-lists, egress blocking, no markdown-image rendering, approval on writes) and re-run.",
+      "sources": "Chip Huyen Ch5 \"Defensive Prompt Engineering\" (V); mlabonne \"Securing LLMs\" (V); Berkeley F25 Safety and Security (V); Anthropic \"Beyond permission prompts\", \"How we contain Claude\", auto mode (V); Simon Willison https://simonwillison.net/series/prompt-injection/ (K); Greshake et al. https://arxiv.org/abs/2302.12173 (K); CaMeL https://arxiv.org/abs/2503.18813 (K); OWASP https://genai.owasp.org/llm-top-10/ (K)",
+      "selfWrite": false
+    },
+    {
+      "id": "34",
+      "slug": "product-ux-and-feedback",
+      "title": "Product UX for AI and the Feedback Loop",
+      "part": "VII",
+      "weight": 2,
+      "fastTrack": false,
+      "sections": [
+        {
+          "id": "34.01",
+          "title": "Designing for probabilistic output",
+          "slug": "designing-for-probabilistic-output"
+        },
+        {
+          "id": "34.02",
+          "title": "Expectation setting",
+          "slug": "expectation-setting"
+        },
+        {
+          "id": "34.03",
+          "title": "Chat vs embedded vs ambient vs agentic UX",
+          "slug": "chat-vs-embedded-vs-ambient-vs-agentic-ux"
+        },
+        {
+          "id": "34.04",
+          "title": "Streaming and progress UX",
+          "slug": "streaming-and-progress-ux"
+        },
+        {
+          "id": "34.05",
+          "title": "Showing sources and uncertainty",
+          "slug": "showing-sources-and-uncertainty"
+        },
+        {
+          "id": "34.06",
+          "title": "Approval UX",
+          "slug": "approval-ux"
+        },
+        {
+          "id": "34.07",
+          "title": "Error and refusal UX",
+          "slug": "error-and-refusal-ux"
+        },
+        {
+          "id": "34.08",
+          "title": "Explicit feedback",
+          "slug": "explicit-feedback"
+        },
+        {
+          "id": "34.09",
+          "title": "Implicit and conversational feedback",
+          "slug": "implicit-and-conversational-feedback"
+        },
+        {
+          "id": "34.10",
+          "title": "Feedback pitfalls",
+          "slug": "feedback-pitfalls"
+        },
+        {
+          "id": "34.11",
+          "title": "Trust, control, reversibility",
+          "slug": "trust-control-reversibility"
+        },
+        {
+          "id": "34.12",
+          "title": "Product metrics vs model metrics",
+          "slug": "product-metrics-vs-model-metrics"
+        }
+      ],
+      "production": {
+        "F": "over-trust; users unable to correct the AI; dead-end refusals.",
+        "C": "regenerate buttons multiply cost.",
+        "L": "perceived latency (stream; show agent progress).",
+        "O": "feedback events joined to traces.",
+        "S": "UI rendering of model output (XSS, markdown exfiltration)."
+      },
+      "interview": [
+        {
+          "q": "How do you collect useful feedback without annoying users?",
+          "reported": false
+        },
+        {
+          "q": "How would you measure whether an AI feature is succeeding?",
+          "reported": false
+        },
+        {
+          "q": "Design the UX for an agent that takes irreversible actions.",
+          "reported": false
+        }
+      ],
+      "applyIt": "Add thumbs-plus-reason feedback, citation display, an undo/approval step and a progress stream to one feature. Join the feedback to traces and review a week of it.",
+      "sources": "Chip Huyen Ch10 \"User Feedback\" (V); FSDL \"UX for Language User Interfaces\" (V); Google PAIR https://pair.withgoogle.com/guidebook/ (K); Microsoft HAX https://www.microsoft.com/en-us/haxtoolkit/ai-guidelines/ (K).",
+      "selfWrite": true
+    }
+  ]
+}

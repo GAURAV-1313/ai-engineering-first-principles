@@ -1,0 +1,641 @@
+{
+  "sources": [
+    {
+      "id": "ai-agent-book",
+      "title": "AI Agent book (English edition)",
+      "repo": "https://github.com/bojieli/ai-agent-book",
+      "commit": "dbc046eb896ac4e39aa19c7774c8bf49583b89a6",
+      "license": "Apache-2.0",
+      "licenseLabel": "Apache-2.0",
+      "author": "Bojie Li",
+      "base": "book-en/",
+      "docs": [
+        {
+          "path": "book-en/introduction.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "book-en/chapter1.md",
+          "chapters": [
+            "22",
+            "24"
+          ]
+        },
+        {
+          "path": "book-en/chapter2.md",
+          "chapters": [
+            "27"
+          ]
+        },
+        {
+          "path": "book-en/chapter3.md",
+          "chapters": [
+            "23"
+          ]
+        },
+        {
+          "path": "book-en/chapter4.md",
+          "chapters": [
+            "21",
+            "26"
+          ]
+        },
+        {
+          "path": "book-en/chapter5.md",
+          "chapters": [
+            "28"
+          ]
+        },
+        {
+          "path": "book-en/chapter6.md",
+          "chapters": [
+            "28"
+          ]
+        },
+        {
+          "path": "book-en/chapter7.md",
+          "chapters": [
+            "19",
+            "20"
+          ]
+        },
+        {
+          "path": "book-en/chapter8.md",
+          "chapters": [
+            "07",
+            "09"
+          ]
+        },
+        {
+          "path": "book-en/chapter9.md",
+          "chapters": [
+            "23",
+            "22"
+          ]
+        },
+        {
+          "path": "book-en/chapter10.md",
+          "chapters": [
+            "25"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "12-factor-agents",
+      "title": "12-Factor Agents",
+      "repo": "https://github.com/humanlayer/12-factor-agents",
+      "commit": "d20c728368bf9c189d6d7aab704744decb6ec0cc",
+      "license": "Apache-2.0",
+      "licenseLabel": "CC BY-SA 4.0 (text), Apache-2.0 (code)",
+      "author": "HumanLayer (Dex Horthy)",
+      "base": "content/",
+      "shareAlike": true,
+      "contentLicense": {
+        "spdx": "CC-BY-SA-4.0",
+        "file": "README.md",
+        "match": "CC BY-SA 4.0"
+      },
+      "licenseNote": "Share-alike: this text is licensed CC BY-SA 4.0. Anything adapted from it must credit the author and be released under the same licence. Code samples are Apache-2.0.",
+      "docs": [
+        {
+          "path": "content/factor-01-natural-language-to-tool-calls.md",
+          "chapters": [
+            "21",
+            "13"
+          ],
+          "title": "1. Natural language to tool calls"
+        },
+        {
+          "path": "content/factor-02-own-your-prompts.md",
+          "chapters": [
+            "27",
+            "12"
+          ]
+        },
+        {
+          "path": "content/factor-03-own-your-context-window.md",
+          "chapters": [
+            "27"
+          ]
+        },
+        {
+          "path": "content/factor-04-tools-are-structured-outputs.md",
+          "chapters": [
+            "13",
+            "21"
+          ]
+        },
+        {
+          "path": "content/factor-05-unify-execution-state.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/factor-06-launch-pause-resume.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/factor-07-contact-humans-with-tools.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/factor-08-own-your-control-flow.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/factor-09-compact-errors.md",
+          "chapters": [
+            "27"
+          ]
+        },
+        {
+          "path": "content/factor-10-small-focused-agents.md",
+          "chapters": [
+            "22",
+            "25"
+          ]
+        },
+        {
+          "path": "content/factor-11-trigger-from-anywhere.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/factor-12-stateless-reducer.md",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "content/appendix-13-pre-fetch.md",
+          "chapters": [
+            "27"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "agents-course",
+      "title": "Hugging Face Agents Course",
+      "repo": "https://github.com/huggingface/agents-course",
+      "commit": "9b3d6b3887bc489510da0239d4c1bc1ee23fd40f",
+      "license": "Apache-2.0",
+      "licenseLabel": "Apache-2.0",
+      "author": "Hugging Face",
+      "base": "units/en/",
+      "docs": [
+        {
+          "path": "units/en/unit1/what-are-llms.mdx",
+          "chapters": [
+            "09",
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit1/messages-and-special-tokens.mdx",
+          "chapters": [
+            "12",
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit1/what-are-agents.mdx",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit1/tools.mdx",
+          "chapters": [
+            "21"
+          ]
+        },
+        {
+          "path": "units/en/unit1/agent-steps-and-structure.mdx",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit1/thoughts.mdx",
+          "chapters": [
+            "22",
+            "24"
+          ]
+        },
+        {
+          "path": "units/en/unit1/actions.mdx",
+          "chapters": [
+            "21",
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit1/observations.mdx",
+          "chapters": [
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/bonus-unit1/what-is-function-calling.mdx",
+          "chapters": [
+            "21",
+            "13"
+          ]
+        },
+        {
+          "path": "units/en/bonus-unit1/fine-tuning.mdx",
+          "chapters": [
+            "09"
+          ]
+        },
+        {
+          "path": "units/en/bonus-unit2/what-is-agent-observability-and-evaluation.mdx",
+          "chapters": [
+            "30",
+            "20"
+          ]
+        },
+        {
+          "path": "units/en/unit3/agentic-rag/agentic-rag.mdx",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "units/en/unit3/agentic-rag/agent.mdx",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "units/en/unit3/agentic-rag/tools.mdx",
+          "chapters": [
+            "18"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mcp-course",
+      "title": "Hugging Face MCP Course",
+      "repo": "https://github.com/huggingface/mcp-course",
+      "commit": "dbfa79bf6f311ae50256912308e169661996aab1",
+      "license": "Apache-2.0",
+      "licenseLabel": "Apache-2.0",
+      "author": "Hugging Face",
+      "base": "units/en/",
+      "docs": [
+        {
+          "path": "units/en/unit1/key-concepts.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit1/architectural-components.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit1/communication-protocol.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit1/capabilities.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit1/sdk.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit1/mcp-clients.mdx",
+          "chapters": [
+            "26"
+          ]
+        },
+        {
+          "path": "units/en/unit2/tiny-agents.mdx",
+          "chapters": [
+            "26",
+            "22"
+          ]
+        },
+        {
+          "path": "units/en/unit3/build-mcp-server.mdx",
+          "chapters": [
+            "26"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "llm-course",
+      "title": "Hugging Face LLM Course",
+      "repo": "https://github.com/huggingface/course",
+      "commit": "8b893f0ede6c781045692a7f892f25a0c92b4805",
+      "license": "Apache-2.0",
+      "licenseLabel": "Apache-2.0",
+      "author": "Hugging Face",
+      "base": "chapters/en/",
+      "docs": [
+        {
+          "path": "chapters/en/chapter1/4.mdx",
+          "chapters": [
+            "05"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter1/8.mdx",
+          "chapters": [
+            "04",
+            "05"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter6/4.mdx",
+          "chapters": [
+            "02"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter6/5.mdx",
+          "chapters": [
+            "02"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter6/6.mdx",
+          "chapters": [
+            "02"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter6/7.mdx",
+          "chapters": [
+            "02"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter6/8.mdx",
+          "chapters": [
+            "02"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter11/2.mdx",
+          "chapters": [
+            "09",
+            "12"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter11/3.mdx",
+          "chapters": [
+            "09",
+            "07"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter11/4.mdx",
+          "chapters": [
+            "09"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter11/5.mdx",
+          "chapters": [
+            "09"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter12/2.mdx",
+          "chapters": [
+            "08",
+            "07"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter12/3.mdx",
+          "chapters": [
+            "08"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter12/3b.mdx",
+          "chapters": [
+            "08"
+          ]
+        },
+        {
+          "path": "chapters/en/chapter12/4.mdx",
+          "chapters": [
+            "08"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "prompt-engineering-guide",
+      "title": "Prompt Engineering Guide",
+      "repo": "https://github.com/dair-ai/Prompt-Engineering-Guide",
+      "commit": "57673726396dd94acb23bdb1e67f27c78ee85a8e",
+      "license": "MIT",
+      "licenseLabel": "MIT",
+      "author": "DAIR.AI",
+      "base": "pages/",
+      "licenseFile": "LICENSE.md",
+      "docs": [
+        {
+          "path": "pages/introduction/basics.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/introduction/elements.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/introduction/tips.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/techniques/zeroshot.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/techniques/fewshot.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/techniques/cot.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/techniques/consistency.en.mdx",
+          "chapters": [
+            "12"
+          ]
+        },
+        {
+          "path": "pages/techniques/prompt_chaining.en.mdx",
+          "chapters": [
+            "12",
+            "17"
+          ]
+        },
+        {
+          "path": "pages/techniques/rag.en.mdx",
+          "chapters": [
+            "17"
+          ]
+        },
+        {
+          "path": "pages/techniques/react.en.mdx",
+          "chapters": [
+            "12",
+            "22"
+          ]
+        },
+        {
+          "path": "pages/techniques/reflexion.en.mdx",
+          "chapters": [
+            "24"
+          ]
+        },
+        {
+          "path": "pages/guides/context-engineering-guide.en.mdx",
+          "chapters": [
+            "27"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "graphrag",
+      "title": "GraphRAG documentation",
+      "repo": "https://github.com/microsoft/graphrag",
+      "commit": "34b2b67ae4601ad0b47bcd179fbe3f2a23aa0857",
+      "license": "MIT",
+      "licenseLabel": "MIT",
+      "author": "Microsoft",
+      "base": "docs/",
+      "docs": [
+        {
+          "path": "docs/index/overview.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/index/default_dataflow.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/index/methods.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/index/architecture.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/query/overview.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/query/local_search.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/query/global_search.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/query/drift_search.md",
+          "chapters": [
+            "18"
+          ]
+        },
+        {
+          "path": "docs/prompt_tuning/overview.md",
+          "chapters": [
+            "18"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ai-agents-for-beginners",
+      "title": "AI Agents for Beginners",
+      "repo": "https://github.com/microsoft/ai-agents-for-beginners",
+      "commit": "4bcf574c06d3deb7d93566c0b69d40df1a3d1979",
+      "license": "MIT",
+      "licenseLabel": "MIT",
+      "author": "Microsoft",
+      "base": "",
+      "docs": [
+        {
+          "path": "06-building-trustworthy-agents/README.md",
+          "chapters": [
+            "29"
+          ]
+        },
+        {
+          "path": "16-deploying-scalable-agents/README.md",
+          "chapters": [
+            "32"
+          ]
+        },
+        {
+          "path": "18-securing-ai-agents/README.md",
+          "chapters": [
+            "33"
+          ]
+        }
+      ]
+    }
+  ]
+}

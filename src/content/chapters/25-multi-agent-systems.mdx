@@ -1,0 +1,458 @@
+---
+id: "25"
+title: "Multi-Agent Systems"
+summary: "Decide when splitting work across several agents pays for its extra tokens and coordination, then build it: an orchestrator with sub-agents, handoffs, shared state and critics, failure defences you can test, and an eval against a single-agent baseline."
+readingTime: "24 min"
+---
+
+Your research agent works. Then someone asks it to compare pricing, compliance and integrations across eight vendors. By search 25 its context holds 80,000 tokens of pages, it has forgotten that vendor three was already covered, and the run takes six minutes. The obvious fix is one agent per vendor, all at once, with a lead agent merging the results. Sometimes that is excellent. Often it is the most expensive way to make the system worse.
+
+Two posts published a day apart in June 2025 show both sides. Cognition's "Don't Build Multi-Agents" (Walden Yan, 12 June 2025) argued that agents working from partial context make conflicting decisions, and that one thread with good context management is more reliable. Anthropic's "How we built our multi-agent research system" (13 June 2025) reported that a lead agent with parallel sub-agents beat a single agent by about 90% on its internal research eval, while using roughly 15 times the tokens of a chat. Both are right, about different kinds of work. This chapter is about telling them apart, and building the multi-agent version properly when it is the right call.
+
+The neighbours cover the pieces: orchestrator-workers as single-loop code in [chapter 22](/22-agent-loop/#orchestrator-workers-evaluator-optimizer), the context arithmetic and brief for one sub-agent in [chapter 27](/27-context-engineering/#sub-agent-isolation), the deep-research architecture in [chapter 18](/18-advanced-and-agentic-rag/#deep-research-iterative-search), and the trace tree in [chapter 30](/30-observability/#agent-trajectory-tracing). This chapter adds what changes when the workers are themselves agents.
+
+## When multiple agents help (and don't)
+
+A **multi-agent system** has more than one model loop, each with its own context window and instructions, exchanging results. A pipeline that calls a model five times in a fixed order is a workflow. One agent calling a model-backed tool is still one agent. The distinction matters because this chapter's costs (lost context, conflicting decisions, multiplied tokens) come from separate contexts, not from separate calls.
+
+Separate contexts buy exactly three things a single agent cannot get:
+
+1. **Parallel breadth.** Independent subtasks run at once, so wall-clock time falls towards the slowest subtask instead of the sum.
+2. **Context isolation.** Each agent sees only its slice, so no context fills with 30 pages about other subtasks.
+3. **Separation of role and privilege.** Different tools, models and permissions per agent: a cheap model reads pages, a strong one writes the report, and only one agent holds the write tool.
+
+And they cost three things, every time:
+
+- **Coordination.** Sub-agents cannot see each other. Someone must decompose, brief, merge and resolve conflicts, usually another model call that can also be wrong.
+- **Error compounding.** If a report needs five sub-results and each is right 90% of the time, all five are right only 0.9^5 ≈ 59% of the time unless something checks them. Summaries passed between agents are lossy copies too: four hops at 95% fidelity keep 0.95^4 ≈ 81%.
+- **Token multiplication.** Every agent re-pays its system prompt and tools, re-reads its own growing context, and returns a result someone reads again. Anthropic put agents at about 4 times a chat's tokens and its multi-agent system at about 15 times, so roughly 15 / 4 ≈ 3.75 times a single agent.
+
+Anthropic's post names where the pattern fits badly: tasks where all agents need the same context or have many dependencies, and most coding, which has fewer truly parallel parts than research. Cognition's two principles say it from the other side: share full context (traces, not just messages), and remember that actions carry implicit decisions, so agents acting on partial context make conflicting ones. A working rule: **parallelise reading, serialise deciding.**
+
+| Task | Verdict | Why |
+|---|---|---|
+| Compare 8 vendors on public docs | multi-agent helps | independent, read-heavy, simple merge |
+| Answer one factual question | single agent | sub-agents only add overhead |
+| Build a feature across 5 files | single agent | every edit depends on the others |
+| Audit 200 contracts against one checklist | parallel workflow | fixed subtasks; no agent needs to decide the split |
+| Triage, then billing or tech support | handoff | one conversation, different tools per stage |
+
+<Callout type="interview">
+
+"When would you use multi-agent?" is a judgment question. Name the three things separate contexts buy and the three they cost, then say what you would measure against a single-agent baseline. "Agents are more capable together" fails it.
+
+</Callout>
+
+## Orchestrator/sub-agent
+
+Make each worker in [orchestrator-workers](/22-agent-loop/#orchestrator-workers-evaluator-optimizer) an agent with its own loop, tools and budget and you have the orchestrator/sub-agent pattern (Anthropic says lead agent and sub-agents). The orchestrator plans, spawns sub-agents with briefs, waits, reads results, decides whether gaps remain, and writes the answer.
+
+The **brief** is the interface, and a sub-agent knows nothing else. Anthropic reported that short briefs such as "research the semiconductor shortage" led sub-agents to duplicate each other: one covered the 2021 automotive chip crisis while two others both covered 2025 supply chains. A good brief has an **objective** (one question), **boundaries** (what is out of scope and what other sub-agents cover), an **output contract** (schema, length cap, a source id per claim), **tools and sources**, and a **budget** (steps, tokens, seconds).
+
+The orchestrator also needs **effort scaling rules** or it over-invests. Anthropic's guide: one agent with 3 to 10 tool calls for a simple fact, 2 to 4 sub-agents with 10 to 15 calls each for a comparison, more than 10 only for complex research. Early versions spawned 50 sub-agents for simple queries.
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Brief:
+    objective: str
+    excludes: list[str]                 # what other sub-agents cover
+    output_schema: dict
+    tools: list[str]
+    max_steps: int = 8
+
+@dataclass
+class SubResult:
+    brief: Brief
+    status: str                         # "ok" | "partial" | "failed" | "timeout"
+    findings: list[dict] = field(default_factory=list)   # {"claim", "source_id"}
+    tokens: int = 0
+
+async def orchestrate(task, plan_llm, run_subagent, write_llm, max_rounds=2, max_agents=5):
+    results: list[SubResult] = []
+    for _ in range(max_rounds):
+        briefs = await plan_llm(task, done=results)          # [] when nothing is missing
+        if not briefs:
+            break
+        results += await gather_with_limits(briefs[:max_agents], run_subagent)
+    gaps = [r.brief.objective for r in results if r.status != "ok"]
+    return await write_llm(task, results, say_missing=gaps)  # never present partial as complete
+```
+
+The agent cap lives in code, not the prompt. Failed and partial results reach the writer, who must say what is missing. Planning happens in rounds, so the orchestrator sees what came back before spawning more.
+
+**Model mixing** is normal. Anthropic's lead was Claude Opus 4 and its sub-agents Claude Sonnet 4; the 90.2% gain was against single-agent Opus 4. **Start synchronous**: the lead waits for each round. Anthropic notes the cost (one slow sub-agent blocks the round, and the lead cannot steer mid-flight), but asynchronous designs add the problems of the [coordination failures](#coordination-failures) section.
+
+The merge step fails too: the lead can restate a finding more strongly than the source supports, or drop a caveat. Anthropic's fix is for sub-agents to write outputs to storage and return lightweight references, so the writer works from the findings, not the lead's paraphrase.
+
+## Handoffs
+
+In delegation the orchestrator keeps control and gets a result back. In a **handoff**, control of the conversation moves to another agent, which now talks to the user and owns the outcome. The textbook case: a triage agent hands a refund request to a refund agent with the refund tool, the refund policy and stricter guardrails. Why not one agent with every tool? Instructions and tools compete for attention, and an agent with 40 tools picks wrong more often than one with 8 ([tool granularity](/21-tool-use/#granularity-and-consolidation)). A handoff is a [router](/22-agent-loop/#chaining-routing-parallelization) that keeps the conversation going.
+
+OpenAI's Agents SDK exposes each handoff to the model as a tool named `transfer_to_<agent_name>`, and by default the receiver sees the whole previous conversation; an input filter can rewrite it, for example stripping tool calls, and an opt-in beta setting (`nest_handoff_history`) collapses earlier turns into a summary block. Each choice fails differently. Full history costs tokens and lets the receiver follow instructions meant for the previous agent. A summary drops what the summariser did not know mattered, typically implicit decisions ("we already told the user the fee is waived").
+
+The defensible middle is a **structured handoff note** plus the last few turns verbatim, with code that refuses an incomplete note:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class HandoffNote:
+    to_agent: str
+    user_goal: str                  # in the user's words
+    facts: dict[str, str]           # order_id, plan, language...
+    decisions: list[str]            # what was promised or ruled out, and why
+    open_questions: list[str]
+    hops: int = 0
+
+REQUIRED = {"refund_agent": {"order_id", "amount", "language"}}
+MAX_HOPS = 3
+
+def validate(note: HandoffNote) -> list[str]:
+    problems = []
+    missing = REQUIRED.get(note.to_agent, set()) - note.facts.keys()
+    if missing:
+        problems.append(f"missing facts: {sorted(missing)}")   # ask the user first
+    if note.hops >= MAX_HOPS:
+        problems.append("too many handoffs: escalate to a human")
+    return problems
+```
+
+The hop counter stops **ping-pong** (triage to billing to tech back to triage); after a few hops the right receiver is a human with the note attached ([human escalation](/29-guardrails-and-safety/#human-escalation)). The note also gives you a test: a **handoff-loss probe** states a fact early ("I'm on the annual plan"), forces a handoff, then asks something that needs it. The pass rate is your handoff fidelity.
+
+When the receiver belongs to another team or company, a handoff becomes a network protocol, which is what A2A is for ([chapter 26](/26-mcp/#a2a)). Inside one codebase, it is a function call and a data structure.
+
+## Parallel sub-agents and context isolation
+
+[Chapter 27](/27-context-engineering/#sub-agent-isolation) shows why a sub-agent that reads 40,000 tokens and returns 1,500 keeps the parent clean. Here the question is how to run several at once without the fan-out becoming the problem.
+
+```text
+T_round ≈ T_plan + max(T_sub_1 ... T_sub_n) + T_merge
+```
+
+The `max` is a tail. If each sub-agent finishes within 60 s 95% of the time, then with 5 in parallel the chance that at least one is slower is 1 − 0.95^5 ≈ 23%; with 10 it is 1 − 0.95^10 ≈ 40%. The fan-out's p95 is worse than any one sub-agent's, so every sub-agent needs a deadline and the round finishes with what has arrived. Even so, parallel usually wins: 32 searches in sequence at about 6 s per step is around 190 s; four sub-agents doing 8 each take about 50 s plus planning and merging. Anthropic reported cutting research time by up to 90% on complex queries with 3 to 5 sub-agents at once.
+
+```python
+import asyncio
+
+async def gather_with_limits(briefs, run_subagent, concurrency=4, deadline_s=90):
+    sem = asyncio.Semaphore(concurrency)          # rate limits arrive before you expect
+
+    async def one(brief):
+        async with sem:
+            try:
+                return await asyncio.wait_for(run_subagent(brief), timeout=deadline_s)
+            except asyncio.TimeoutError:
+                return SubResult(brief, status="timeout")
+            except Exception as e:
+                return SubResult(brief, status="failed", findings=[{"error": str(e)[:200]}])
+
+    return await asyncio.gather(*(one(b) for b in briefs))
+```
+
+Ten sub-agents each firing three parallel searches is thirty concurrent requests, enough to turn a parallel design into a queue of 429 errors; hence the semaphore. Timeouts come back as statuses, so the writer can say "pricing for vendor 7 was not found in time".
+
+**Isolation is also a security boundary.** A sub-agent that reads untrusted pages should have read-only tools and return typed fields. An injected instruction can then corrupt one finding, which the citation check can catch, instead of steering the agent with write tools ([architectural defences](/33-security-prompt-injection/#architectural-defences-dual-llm-camel-plan-then-execute)). The price is shared understanding: anything the lead knows but did not write into the brief (the user wants Indian vendors; vendor 4 is ruled out) is invisible to the sub-agent. Repeat constraints in every brief, and check results against them in code.
+
+## Communication and shared state
+
+Agents exchange information in two ways, and real systems use both.
+
+**Message passing.** Each agent returns a structured, schema-validated result to whoever spawned it. Data flows as a tree, every result has one reader, and it is easy to trace. Siblings cannot learn from each other mid-run.
+
+**Shared state.** Agents read and write a common store: a task board, files, a database, a "blackboard". Siblings can avoid duplicate work, at the usual price of shared mutable state, with writers that are non-deterministic and do not reliably follow locking rules unless code enforces them.
+
+| | Message passing | Shared state |
+|---|---|---|
+| Duplicate work | parent prevents it in briefs | agents can check the board |
+| Conflicts | none between siblings | lost updates, overwrites |
+| Debugging | follow the tree | need a log of every write |
+| Injection spread | one branch | everything that reads the store |
+
+For shared state, borrow distributed-systems rules: **one writer per key** or **compare-and-set** (a write names the version it read and fails if someone wrote since); **claims with leases**, so a crashed agent's claim expires; an **append-only log** of writes; and **references, not content** (store the finding once, pass its id).
+
+```python
+import time
+
+class Board:
+    def __init__(self):
+        self.items, self.log = {}, []          # key -> {"value", "version", "owner", "until"}
+
+    def claim(self, key, agent, lease_s=300):
+        it = self.items.setdefault(key, {"value": None, "version": 0, "owner": None, "until": 0})
+        if it["owner"] not in (None, agent) and it["until"] > time.time():
+            return False                        # someone else holds it
+        it["owner"], it["until"] = agent, time.time() + lease_s
+        self.log.append(("claim", key, agent, time.time()))
+        return True
+
+    def write(self, key, agent, value, expected_version):
+        it = self.items[key]
+        if it["owner"] != agent or it["version"] != expected_version:
+            return False                        # stale read or not the owner: re-read, then decide
+        it["value"], it["version"] = value, it["version"] + 1
+        self.log.append(("write", key, agent, it["version"]))
+        return True
+```
+
+The board is deliberately dumb: it makes agreements enforceable. "Check before you write" in a prompt is not concurrency control. Anthropic's C compiler team ([agent teams](#agent-teams-for-long-tasks)) used an even simpler version: a lock file per task in a shared git repo, so git rejected the second claim.
+
+Shared state also carries trust. If a web-reading sub-agent can write to shared memory, a poisoned page can plant an "instruction" every other agent later reads. Scope stores by task, record the writer of each entry, and treat model-written state as data ([memory write policies](/23-memory/#write-policies)).
+
+## Debate/critic
+
+Three setups are common. **Generator and critic**: one agent produces, another reviews against criteria, the first revises ([evaluator-optimizer](/22-agent-loop/#orchestrator-workers-evaluator-optimizer) with agents on each side). **Multi-agent debate**: N agents answer, read each other's answers and revise over R rounds, then a vote picks the answer; "Improving Factuality and Reasoning in Language Models through Multiagent Debate" (Du et al., 2023) reported gains on arithmetic, grade-school maths and factuality. **Role panels**: personas such as "security reviewer" each critique a draft.
+
+The evidence is weaker than the idea. Huang et al., "Large Language Models Cannot Self-Correct Reasoning Yet" (2023, ICLR 2024), reran debate on GSM8K with gpt-3.5-turbo against **self-consistency** (sample answers independently, take the majority). At an equal number of responses, self-consistency won: 85.3% against 83.2% at 6, and 88.2% against 83.0% at 9. Their reading: the gain comes from sampling more, not from agents correcting each other. Smit et al., "Should we be going MAD? A Look at Multi-Agent Debate Strategies for LLMs" (ICML 2024), found debate did not reliably beat other ensembling methods, and results swung with settings such as how strongly agents were prompted to agree.
+
+Two lessons. **Compare at equal compute**: 3 agents over 3 rounds is 9 generations, so the baseline is 9 samples and a vote. And copies of one model share blind spots and tend to converge on the most confident answer, right or wrong.
+
+```python
+def compare_at_equal_compute(questions, sample, debate, n=9):
+    sc = deb = 0
+    for q in questions:
+        votes = [sample(q.text) for _ in range(n)]
+        sc += max(set(votes), key=votes.count) == q.gold
+        deb += debate(q.text, agents=3, rounds=3) == q.gold     # also 9 generations
+    return {"self_consistency": sc / len(questions), "debate": deb / len(questions)}
+```
+
+A critic earns its cost when it has something the generator lacks: **different information** (it runs the tests or fetches the cited page), a **checkable rubric** ("every number appears in its cited source"), or a **different model family**, which reduces shared blind spots and [self-preference](/20-evals-judges-and-ci/#judge-biases). To test a critic, **seed known errors** and measure how many it flags. A verification pass that never overturns anything tells you nothing until you know it could have.
+
+## Token cost
+
+Start with one agent loop. If its context starts at `c0` tokens (system, tools, brief) and each step adds `d` (a tool result plus reasoning), over `s` steps it reads:
+
+```text
+input tokens = s·c0 + d·(0 + 1 + ... + (s−1)) = s·c0 + d·s(s−1)/2
+```
+
+The second term is quadratic because every step re-reads everything before it ([token accounting](/31-cost-and-latency-engineering/#token-budget-accounting)). Now the vendor task two ways, 32 page reads of about 3,000 tokens:
+
+```text
+Single agent, 32 steps, c0 = 5,000, d = 3,000:
+  32 × 5,000 + 3,000 × 32·31/2 = 160,000 + 1,488,000 ≈ 1.65M input tokens
+  final context ≈ 98,000 tokens, mostly pages about other vendors
+
+Four sub-agents, 8 steps each, same c0 and d:
+  each: 8 × 5,000 + 3,000 × 8·7/2 = 40,000 + 84,000 = 124,000;  four: 496,000
+Lead, 5 steps, c0 = 6,000, d = 2,000:
+  5 × 6,000 + 2,000 × 5·4/2 = 30,000 + 20,000 = 50,000
+Total ≈ 546,000 input tokens
+```
+
+For the same work, the split version reads about a third of the tokens, because no context grows to 98,000. Caching narrows the gap ([chapter 27](/27-context-engineering/#sub-agent-isolation)), but the direction holds. So Anthropic's 15 times does not come from splitting itself. It comes from what splitting makes affordable:
+
+- **More total work.** Each sub-agent gets a full budget, so the system makes many more tool calls. On BrowseComp, Anthropic found token usage alone explained about 80% of performance variance, and tokens, tool calls and model choice together 95%. The architecture's value is that it **spends more tokens usefully**.
+- **Fixed overhead per agent.** Ten sub-agents with 5,000-token prefixes over 8 steps pay 400,000 tokens for prefixes alone.
+- **Duplication.** If a fraction `u` of sub-agent work overlaps, useful work costs `1 / (1 − u)` times as much: 25% overlap is 1.33 times.
+- **Retries, extra rounds, critics.** N debating agents over R rounds is N·R generations, each reading the others' answers from round 2.
+
+Keep prices as variables: `cost = Σ agents (uncached_in × p_in + cached_in × p_cache + out × p_out)`. At an illustrative $3 per million input tokens, 546,000 uncached tokens is about $1.64 per task before output (check the current price page); at 5,000 tasks a day, about $8,200 a day.
+
+The number that decides is **cost per successful task**. Suppose a single agent costs $0.40 and succeeds 60% of the time, and the multi-agent version costs $1.60 and succeeds 75%:
+
+```text
+single:   0.40 / 0.60 = $0.67 per success
+multi:    1.60 / 0.75 = $2.13 per success
+marginal: (1.60 − 0.40) / (0.75 − 0.60) = $8.00 per extra success
+```
+
+It is worth it if one extra correct report is worth more than $8. For analyst research, maybe; for FAQ answers, no. And budgets must be **shared across the tree**: a per-agent cap does not stop an orchestrator spawning twenty agents ([runaway control](/31-cost-and-latency-engineering/#agent-budgets-and-runaway-control)).
+
+## Coordination failures
+
+The most useful map is MAST, from "Why Do Multi-Agent LLM Systems Fail?" (Cemri et al., 2025, NeurIPS 2025). The authors annotated over 1,600 traces from seven popular multi-agent frameworks (inter-annotator κ = 0.88) and grouped 14 failure modes into three categories: **system design issues** (disobeying task or role specs, step repetition, losing history, not knowing when to stop), **inter-agent misalignment** (conversation reset, not asking for clarification, derailment, withholding information, ignoring another agent, reasoning-action mismatch) and **task verification** (premature termination, missing or incorrect verification). The most frequent were step repetition (15.7%), reasoning-action mismatch (13.2%), unawareness of termination conditions (12.4%) and disobeying the task specification (11.8%). Interventions such as better role specs and an added verification step helped (the best reported gain was +15.6% task success on one framework) but did not remove the failures.
+
+The ones you will debug in production:
+
+- **Duplicated work** from overlapping briefs or double claims.
+- **Conflicting actions.** Cognition's example: asked for a Flappy Bird clone, one sub-agent made a Super Mario-style background and another a bird that matched neither. In code, two agents edit one file or pick incompatible interfaces.
+- **Lost context in handoffs**: an early decision never reaches the agent that needed it.
+- **The telephone game**: the lead's summary of a finding is stronger or vaguer than the finding.
+- **Premature success**: an agent says "done" and the orchestrator believes it.
+- **Runaway cost**: recursive spawning, endless gap-filling rounds, searches for sources that do not exist.
+
+| Failure | Defence in code |
+|---|---|
+| Duplicated work | `excludes` in briefs; leased claims; measure query overlap |
+| Conflicting actions | one writer per resource; a merge step that checks interfaces |
+| Lost context | structured handoff notes; constraints repeated in every brief |
+| Telephone game | references to stored findings; citation check against the original |
+| Premature success | "done" needs evidence the harness checks (tests, a file, a status) |
+| Runaway cost | global budget, max depth, max agents, max rounds |
+
+```python
+class TreeBudget:
+    def __init__(self, tokens=600_000, agents=8, depth=2):
+        self.tokens, self.agents, self.depth = tokens, agents, depth
+
+    def spawn(self, parent_depth: int) -> bool:
+        if self.agents <= 0 or parent_depth + 1 > self.depth:
+            return False                   # refuse; the parent works with what it has
+        self.agents -= 1
+        return True
+
+    def charge(self, n: int):
+        self.tokens -= n
+        if self.tokens < 0:
+            raise RuntimeError("tree budget exhausted")   # orchestrator finishes with partials
+```
+
+## Agent teams for long tasks
+
+Some work takes days. No context lasts that long, so the work is split across agents or across sessions, and the question becomes how they stay coordinated without a human.
+
+Anthropic's "Building a C compiler with a team of parallel Claudes" (Nicholas Carlini, February 2026) is the most detailed public example. Sixteen Claude Opus 4.6 instances, each looping in its own container, ran for about two weeks: nearly 2,000 sessions, roughly 2 billion input and 140 million output tokens, just under $20,000. The result was about 100,000 lines of Rust that builds Linux 6.9 for x86, ARM and RISC-V, with stated limits (it calls GCC for 16-bit x86, and its output is less efficient than GCC's). The coordination design is the lesson:
+
+- **No orchestrator.** Each agent picked the next most obvious problem.
+- **Shared state was a git repo.** An agent claimed a task by writing a file into `current_tasks/`, and git's sync made a second claim fail. Merge conflicts were frequent; the agents resolved them.
+- **Tests were the coordinator**, and CI stopped new features breaking old ones.
+- **Parallelism needed a decomposable oracle.** On the Linux kernel, all 16 agents hit the same bug and overwrote each other's fixes. The fix was to compile most files with GCC and a random subset with the new compiler, so each failure pointed to a subset and agents could chase different bugs.
+- **Roles came later**: removing duplicate code, compiler speed, documentation, design critique.
+
+Anthropic's "Effective harnesses for long-running agents" (November 2025) is the sequential version, a relay across sessions. An initializer agent sets up the environment, a JSON feature list (all failing) and a progress file; each coding session reads them and the git log, implements one feature, tests it end to end and commits. Its failures are the multi-agent ones again: doing everything at once, declaring victory early, marking features done without testing. The post leaves open whether specialised QA agents would beat one general agent.
+
+```text
+durable shared state    task board / feature list / progress log / git history
+small units of work     one feature, one failing test, one file subset
+claims                  lock files or leases, so no unit is taken twice
+a verification gate     tests or CI decide "done", not the agent's report
+handoff artifacts       each session leaves notes the next one reads first
+```
+
+See also [checkpointing](/22-agent-loop/#long-running-agents-checkpointing-resumability) and [long-running coding sessions](/28-coding-and-computer-use-agents/#long-running-sessions). The compiler worked because the domain had an unusually good oracle. Without a cheap, trustworthy check, sixteen agents produce sixteen streams of plausible work nobody can verify.
+
+## Evaluation
+
+A multi-agent system is better only if it beats a single agent on your tasks. Anthropic's 90.2% was on its own research eval against single-agent Opus 4: evidence the pattern can work, not your expected gain.
+
+**Make the baseline fair**: same model and tools, and either the same token budget or a reported cost. Useful ablations: a single agent at default budget; a single agent with the multi-agent run's total budget (is the gain structure or spending?); orchestrator plus 1, 3 and 5 sub-agents; sub-agents for reading only.
+
+**Measure per task:**
+
+- **Outcome**: success graded by code where possible, otherwise by a validated judge ([agent evals](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory)); for agents that change state, check the final state, as Anthropic recommends.
+- **Cost per successful task**, tokens per agent, agents spawned, and wall-clock p50 and p95.
+- **Coordination metrics**: query overlap across sub-agents, handoff-probe pass rate, faithfulness of the answer to sub-agent findings, budget overruns.
+- **Failure labels** in MAST style, so you know whether you have design, misalignment or verification problems.
+
+Start small. Anthropic began with about 20 real queries, because early changes have large effects; its judge scored factual accuracy, citation accuracy, completeness, source quality and tool efficiency from 0.0 to 1.0, plus pass or fail. Runs vary a lot, so repeat each configuration and report the spread.
+
+```python
+def overlap_rate(subagent_queries: list[set[str]]) -> float:
+    seen, dup = set(), 0
+    for qs in subagent_queries:
+        dup += len(qs & seen)
+        seen |= qs
+    total = sum(len(qs) for qs in subagent_queries)
+    return dup / total if total else 0.0
+
+def summarise(runs, cfg):            # runs: [{"config", "success", "cost", "secs"}]
+    rs = [r for r in runs if r["config"] == cfg]
+    wins = sum(r["success"] for r in rs)
+    secs = sorted(r["secs"] for r in rs)
+    return {"success": wins / len(rs),
+            "cost_per_success": sum(r["cost"] for r in rs) / max(wins, 1),
+            "p95_s": secs[int(0.95 * (len(secs) - 1))]}
+```
+
+In production, trace every run as one tree, orchestrator at the root and each sub-agent a nested span ([chapter 30](/30-observability/#agent-trajectory-tracing)), so you can see which agent spent the tokens or caused the failure. Anthropic also used rainbow deployments, keeping old and new versions running while traffic shifts, so a deploy does not break agents mid-task.
+
+<Production>
+
+**Failure modes.** Duplicated work from overlapping briefs; conflicting edits when two agents write one resource; lost context in handoffs; the lead misreporting a finding; premature "done"; recursive spawning. Defend in code: leased claims, one writer per resource, structured handoff notes, references to stored findings, evidence-based completion, and caps on depth, agents and rounds.
+
+**Cost.** Multi-agent can multiply spend several times over: Anthropic reports about 15 times a chat's tokens for its research system against about 4 times for a single agent (vendor-reported, 2025). Most of it is extra work the architecture makes affordable, plus per-agent prefixes, duplication and retries. Track cost per successful task, cache the shared prefix, use a cheaper sub-agent model, and enforce one budget across the tree.
+
+**Latency.** Parallelism cuts wall-clock time towards the slowest sub-agent, but that is a tail: with a 5% chance of each being slow, 5 sub-agents have about a 23% chance that one is. Use per-agent deadlines and partial results, and run anything over a few minutes as an async job with progress events.
+
+**Observability.** A cross-agent trace tree per task: orchestrator root span, nested spans per sub-agent and step, briefs and handoff notes as attributes, tokens and cost per agent, trace context propagated across queues. Dashboards for agents per task, overlap rate, handoff count and budget exhaustion.
+
+**Security.** Privilege boundaries between agents: readers of untrusted content get read-only tools and return typed fields; only the agent that must write can; credentials are scoped per agent. Shared state written by one agent is untrusted data to the others. Across organisations, authenticate agent-to-agent calls (A2A declares auth in its agent card).
+
+</Production>
+
+<Interview>
+
+<Q q="When is multi-agent worth the cost?">
+
+- Separate contexts buy parallel breadth, context isolation and role or privilege separation. If the task needs none, use one agent.
+- They cost coordination, compounding errors (0.9^5 ≈ 0.59 if five unchecked sub-results must all be right) and tokens (Anthropic: about 15 times a chat, about 3.75 times a single agent).
+- Good fit: read-heavy, separable, checkable work. Bad fit: shared decisions, such as most coding. "Parallelise reading, serialise deciding."
+- Decide on cost per successful task and the marginal cost per extra success against what a success is worth.
+- Prove it against a single agent given the same total token budget.
+- **The trap:** "specialised agents are smarter together", or quoting the 90% as if it applied to every task.
+
+</Q>
+
+<Q q="Design a research system with parallel sub-agents.">
+
+- **Scope and SLOs:** broad-question reports; async job; p95 under about 5 minutes; every claim cited; a cost cap per report.
+- **Architecture:** lead plans sub-questions with effort scaling; 3 to 5 parallel sub-agents, each with a brief (objective, exclusions, schema, budget) and read-only search and fetch tools; findings stored with source ids and returned as references; at most 2 gap-filling rounds; a citation pass checks every claim against stored source text.
+- **Models:** strong model for the lead, cheaper for sub-agents, shared cached prefix.
+- **Evals:** 20 to 50 real queries, a validated rubric judge, a single-agent baseline at equal budget, overlap rate, report faithfulness to findings.
+- **Guardrails:** global token budget, agent cap, per-agent deadlines, partial results with stated gaps, injection containment in readers.
+- **Numbers:** about 4 × 124K + 50K ≈ 550K input tokens per report in the worked example; trace tree with tokens per agent.
+- **The trap:** briefs without exclusions, no tree-wide budget, or a lead writing from memory instead of stored sources.
+
+</Q>
+
+<Q q="How do agents share state without stepping on each other?">
+
+- Prefer message passing in a tree: schema-validated results to the parent; siblings never write shared data.
+- When siblings must share, enforce distributed-systems rules in code: leased claims, one writer per key or compare-and-set with versions, an append-only log.
+- Pass references to stored findings, not content, so nothing is re-summarised on the way.
+- Keep decisions and writes to shared artifacts in one agent; others read and propose.
+- Example: the C compiler team's lock files in a shared git repo, with tests deciding correctness.
+- Treat shared state as untrusted data: record the writer, never execute it as instructions.
+- **The trap:** "tell the agents in the prompt to check before writing". A prompt is not a lock.
+
+</Q>
+
+<Q q="Cognition says don't build multi-agents; Anthropic built one. Who is right?">
+
+- Both, about different tasks. Cognition's argument is about agents that act: actions carry implicit decisions, and agents with partial context make conflicting ones.
+- Anthropic's system does research: read-heavy, separable, merged by one writer with a citation check. Anthropic itself says it fits poorly where agents need shared context.
+- Synthesis: isolate exploration in sub-agents; keep decisions and writes in one thread that sees everything.
+- On debate as a special case: at equal compute, self-consistency often matches or beats it (Huang et al., 2023).
+- **The trap:** treating either post as a universal rule.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** split the "ask my repos" research agent from [Chapter 18's Apply-it](/18-advanced-and-agentic-rag/#deep-research-iterative-search) (`src/askrepos/agent.ts` in Memory Agent) into an orchestrator plus 3 parallel sub-agents, and compare quality, cost and wall-clock time with the single agent. Work in **Memory Agent** (`~/memory-agent`) on a branch; build the Chapter 18 agent first if you have not.
+
+**Runs offline.** Ollama with a 7B to 8B tool-capable instruct model for every agent, or a scripted mock model for deterministic tests. Count tokens with a tokenizer and apply a price table you set, so cost is comparable although nothing is billed.
+
+**Steps.**
+
+1. **Orchestrator** (`src/askrepos/orchestrator.ts`): one planning call returns up to 3 briefs (objective, `excludes`, output schema with `path:line` evidence, budget). Caps in code: 3 sub-agents, 2 rounds, one tree budget.
+2. **Sub-agents:** the Chapter 18 loop with read-only tools, 6 steps, a 60 s deadline. Each writes findings to `data/findings/<run>/<agent>.json` and returns the reference plus a short summary.
+3. **Parallel runner** with a concurrency limit; timeouts and failures return as statuses that the writer must list as gaps.
+4. **Writer and citation check:** code rejects any `path:line` citation that no sub-agent read.
+5. **Tracing:** one JSON trace per question, orchestrator root and a child span per sub-agent, with tokens and seconds.
+6. **Eval:** the Chapter 18 set of 30 questions, four configurations, three runs each: single agent; single agent at the multi-agent total budget; orchestrator plus 1 sub-agent; orchestrator plus 3. Record success per slice, cost per success, p50 and p95 seconds, overlap rate.
+7. **Label failures** MAST-style: duplicated work, lost constraint, premature stop, wrong merge, verification miss.
+
+**Definition of done.**
+- One command prints the four-configuration table, three runs each.
+- No answer cites an unread range (enforced in code, with a test).
+- A mock-model test proves a hung sub-agent times out, the answer lists the gap, and the tree budget refuses a fourth spawn.
+- `DECISIONS.md` states, with your numbers, whether multi-agent is worth it here and whether the gain survives the equal-budget baseline.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Say it plainly: none of your repos runs a multi-agent system.** No product path spawns sub-agents, hands off between agents or shares agent state. You have parallel model calls, a speculative call and an offline multi-agent eval workflow, and you can explain why each design stopped where it did.
+- **Memory Agent rejected sub-agents on purpose.** `DECISIONS.md` #2 chooses one writer call per turn that runs several searches in parallel inside the call: "No sub-agents". Its context line says research sub-agents in your own past work took a median of 8.6 minutes, too slow for a chat agent. Present that as the earlier observation behind the decision, not a benchmark: Memory Agent never measured a sub-agent version.
+- **Memory Agent's speculative writer is parallelism with a gate, not a second agent.** `src/agent.ts` (lines 105 to 137) can start the search writer alongside the planner, holding its events in a `Gate` (`src/gate.ts`); line 181 keeps it only if the planner chose a plain search with the same budget, otherwise it is cancelled unseen. It is off by default because it writes without the planner's notes and a discarded call still costs tokens: this chapter's two costs in miniature.
+- **Answer Grader runs the fact-check alongside the judge.** `backend/pipeline.py` lines 265 to 283 (yours per blame) run `check_claims` and `evaluate_answer` in a two-worker `ThreadPoolExecutor`, submit the Hindi translation while evaluation runs, and use `contextvars.copy_context()` so both threads write the same cost ledger. Fixed calls, not agents, but the ledger is per-branch cost attribution.
+- **Scheme Assistant's persona-critic eval is your one real multi-agent workflow, with a coordination failure to tell.** Your briefs in `docs/critic-eval/` (`BRIEF.md`, `JUDGE.md`, `VERIFY.md`) set critic agents writing persona questions per scheme area, judges grading transcripts against sources, and independent verifiers re-checking fails and partials, each agent writing only its own JSON file. Verifiers checked 127 items, overturned none and relabelled 7 failure types. Then `verified/deliverables_check.md` found the report claimed every fail and partial was independently re-checked, while 20 of the 24 small-talk non-passes were never re-checked and the other 4 got only an orchestrator spot-check: the telephone game, caught by your own fact-check and corrected in the report. Zero overturns stays ambiguous until you seed known errors. The chatbot graded is mostly Chiman's code; the eval workflow is yours.
+- **Build the gap in Memory Agent** with the Apply-it: an orchestrator, parallel sub-agents, a tree budget, a trace tree and an equal-budget baseline.
+
+</YourProject>

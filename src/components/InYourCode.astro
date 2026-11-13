@@ -1,0 +1,77 @@
+---
+import EvidenceCard from './EvidenceCard.astro';
+import { byStrength, repoBySlug, repos, type Evidence } from '../lib/data';
+
+interface Section { n: string; slug: string; title: string }
+interface Props { order: number; sections: Section[]; items: Evidence[]; titles: Record<string, string> }
+const { order, sections, items, titles } = Astro.props;
+const cc = String(order).padStart(2, '0');
+
+const groups = [
+  { n: '00', slug: '', title: 'Across the chapter', items: items.filter((e) => e.section === cc) },
+  ...sections.map((s) => ({ ...s, items: items.filter((e) => e.section === `${cc}.${s.n}`) })),
+].map((g) => ({ ...g, items: [...g.items].sort(byStrength) }));
+
+const repoCount = (list: Evidence[]) => new Set(list.map((e) => e.repo)).size;
+const chips = (list: Evidence[]) =>
+  repos.filter((r) => list.some((e) => e.repo === r.slug));
+const total = items.length;
+---
+<aside class="iyc" aria-label="In your code" data-iyc>
+  <div class="iyc-inner">
+    <header class="iyc-head">
+      <p class="iyc-kicker">In your code</p>
+      <button class="iyc-close" type="button" data-iyc-close aria-label="Close">×</button>
+    </header>
+    <p class="iyc-empty-chapter" hidden={total > 0}>No repo maps to this chapter yet.</p>
+    {groups.map((g) => (
+      <section class="iyc-group" data-section={g.n} data-slug={g.slug} data-count={g.items.length}
+        data-repos={repoCount(g.items)} hidden>
+        <div class="iyc-ghead">
+          <p class="iyc-gtitle"><span class="iyc-gnum">{g.n === '00' ? cc : `${cc}.${g.n}`}</span> {g.title}</p>
+          {g.items.length > 0 ? (
+            <p class="iyc-gstat">
+              <span>{g.items.length} {g.items.length === 1 ? 'example' : 'examples'} · {repoCount(g.items)} {repoCount(g.items) === 1 ? 'repo' : 'repos'}</span>
+              <span class="iyc-chips">{chips(g.items).map((r) => (
+                <button type="button" class="chip chip-btn" style={`--fam: var(--fam-${r.hue})`} data-filter={r.slug}
+                  title={`Show only ${r.name}`} aria-pressed="false">{r.chip}</button>
+              ))}</span>
+            </p>
+          ) : g.n === '00' ? (
+            <p class="iyc-gstat">{total} examples · scroll, or jump to a section</p>
+          ) : (
+            <p class="iyc-gstat is-gap">None of your repos demonstrates this section.</p>
+          )}
+          {g.n === '00' && (
+            <ol class="iyc-index">
+              {groups.slice(1).map((s) => (
+                <li class:list={{ 'is-empty': !s.items.length }}>
+                  <a href={`#${s.slug}`}>
+                    <span class="iyc-gnum">{s.n}</span>
+                    <span class="iyc-index-t">{s.title}</span>
+                    <span class="iyc-index-bar" aria-label={`${s.items.length} examples from ${repoCount(s.items)} repos`}>
+                      {chips(s.items).map((r) => <i style={`--fam: var(--fam-${r.hue})`} title={r.name}></i>)}
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ol>
+          )}
+          {repoCount(g.items) > 1 && <button type="button" class="iyc-compare" data-compare>Compare side by side</button>}
+        </div>
+        <div class="iyc-cards">
+          {g.items.map((e, i) => <EvidenceCard e={e} open={i < 2} titles={titles} />)}
+        </div>
+      </section>
+    ))}
+  </div>
+</aside>
+
+<dialog class="cmp" data-cmp aria-labelledby="cmp-title">
+  <header class="cmp-head">
+    <p class="iyc-kicker">Compare</p>
+    <h2 id="cmp-title" class="cmp-title" data-cmp-title></h2>
+    <button class="iyc-close" type="button" data-cmp-close aria-label="Close">×</button>
+  </header>
+  <div class="cmp-grid" data-cmp-grid></div>
+</dialog>

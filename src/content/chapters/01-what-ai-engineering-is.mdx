@@ -1,0 +1,373 @@
+---
+id: "01"
+title: "What AI Engineering Is"
+summary: "Explain what an AI engineer builds and owns in 2026, judge whether a feature should use an LLM at all, and plan the path from demo to product with an eval baseline, a cost and latency budget, and a cheap way to switch models."
+readingTime: "24 min"
+---
+
+Calling a language model takes about ten lines of code. You send text to an API and text comes back. If that were the job, there would be no job. The work starts when the output has to be right for a stranger you will never meet, at a cost you can afford, fast enough that they stay, and in a way you can explain when it goes wrong.
+
+Take Answer Grader, the answer-grading product Gaurav built most of with a teammate. A student photographs a handwritten UPSC Mains answer, and a model grades it against topper answers found by embedding search. The grading call is a small part of the code; the work that made the product trustworthy sits around it. A calibration module maps rubric scores to realistic marks using 143 real marksheets, because the raw score told the strongest user he had 9/10 and he said himself it was inflated. A hand-verified fact register overrides the model's memory. A second call checks every named claim in the model answer. And a provider switch exists because one vendor's billing problem once took the whole product down. That surrounding work is what this book means by AI engineering.
+
+A working definition: **AI engineering is building products on top of foundation models you mostly did not train. Your levers are the context you give the model, the tools you let it use, the evals that tell you whether it works, the guardrails around it, and the operations that keep it affordable and observable.** It takes its habits from backend engineering (APIs, queues, caches, rate limits) and its humility from ML (measure on held-out data, expect drift). It adds one problem of its own: the core component is probabilistic, so "correct" becomes a rate you measure rather than a property you prove.
+
+This chapter orients you. Each section gives the short version of a topic, points to the chapter that builds it, and covers the decisions that come before any code: whether a use case suits an LLM, what separates a demo from a product, and whether to buy, rent or build the model.
+
+## Foundation models vs classical ML
+
+Classical ML gives you one model per task. To detect spam you collect labelled emails, pick features or an architecture, train, evaluate on a held-out set and deploy. The model knows nothing else. Labels are the input to training, and most of the effort goes into them.
+
+A foundation model turns this around. It is pretrained once, at great cost, on a broad slice of text (often also code, images and audio) to predict the next token, then post-trained to follow instructions. You adapt it to your task at request time, by writing instructions and supplying context. The same model that classifies the spam also drafts the reply, extracts the invoice total and plans a database migration. The term comes from the Stanford report "On the Opportunities and Risks of Foundation Models" (Bommasani et al. 2021).
+
+Three consequences shape everything after this chapter.
+
+- **Labels move from training to evaluation.** You often need no training data to ship a first version. You still need labelled examples, but you spend them on an eval set that tells you whether a change helped. Teams that hear "no training needed" and skip the labels ship blind.
+- **The interface is language.** Inputs and outputs are open-ended, so the output can be wrong in a way a classifier's cannot: fluent, confident, well formatted and false. A spam filter can mislabel an email. It cannot invent a statute.
+- **The cost moves from training to inference.** You pay per token on every request, for as long as the feature runs, instead of once for a training run. Unit economics becomes a design input, not an afterthought ([cost per task](/31-cost-and-latency-engineering/#unit-economics-per-task-user)).
+
+| | Classical ML | Foundation-model application |
+|---|---|---|
+| Unit of work | one model per task | one model, many tasks |
+| How you adapt it | train on labelled data | instructions and context; sometimes fine-tune |
+| Where labels go | training set | eval set |
+| Typical output | a class or a number | free text, JSON, tool calls |
+| Main cost | data and training | tokens on every request |
+| Typical failure | wrong label | plausible and wrong |
+
+Certificate Assistant is a useful contrast because it is classical ML on purpose. It links a caste or domicile certificate applicant to relatives' archived records with a Fellegi–Sunter record-linkage model trained with Splink, evaluates on held-out synthetic families, and recalibrates from officers' "same family" labels. Its API docstring is blunt: "No auth, no network calls, no LLM." When you need to match names across scripts with a probability you can calibrate and explain field by field, a small learned model beats a prompt. Knowing when the older tools win is part of the job.
+
+What happens inside the model is Part I: [tokens](/02-tokenization/#why-discrete-tokens), [next-token prediction and sampling](/04-language-modeling-and-sampling/#next-token-prediction), [the transformer](/05-transformer-intuition/#attention-as-soft-lookup-q-k-v), [pretraining](/06-pretraining-and-scaling/#base-vs-chat-models) and [post-training](/07-post-training-and-alignment/#what-post-training-implies-for-app-builders).
+
+## Three-layer AI stack (app/model/infra)
+
+Chip Huyen's *AI Engineering* (O'Reilly 2025) splits the field into three layers, and the split is a good map of who does what.
+
+- **Application layer.** Prompts, context assembly, retrieval, tools, agents, evals, guardrails and the user experience. This is where most AI-engineering work at product companies happens.
+- **Model layer.** Choosing, adapting and building models: fine-tuning, distillation, post-training, and inference optimisations such as quantization.
+- **Infrastructure layer.** GPUs and accelerators, serving engines, model gateways, vector stores, data pipelines and monitoring.
+
+An AI engineer at a product company lives in the application layer and reaches down when cost, latency or privacy forces it. Deciding to self-host an open model because the API bill crossed a line is model and infrastructure work, and you are expected to make that call with numbers.
+
+Here is the shape of almost every LLM application, from a support bot to Answer Grader's grader:
+
+```text
+                    one request
+user --> [input guard] --> [context assembly] --> [model call] --> [output checks] --> reply
+          scope, size,      system prompt,         chosen model      schema, citations,
+          rate limit        retrieved passages,    behind one        grounding, length,
+                            memory, tool specs     wrapper           fallback if bad
+                                                      |   ^
+                                                      v   |
+                                                    [tools]
+
+always on:  trace per request (tokens, cost, latency, outcome)
+            --> sampled into eval sets --> fixes to prompt, retrieval, guards --> redeploy
+```
+
+Six parts, each with its own chapter:
+
+- **Model:** which model, from whom, at what price ([model selection](/11-serving-and-model-economics/#model-selection-workflow)).
+- **Context:** what the model sees on this call ([context engineering](/27-context-engineering/#anatomy-of-agent-context), [RAG](/17-rag-pipelines/#architecture-end-to-end), [memory](/23-memory/#why-stateless-models-need-memory)).
+- **Tools:** what it can do beyond writing text ([tool use](/21-tool-use/#tools-text-to-action), [the agent loop](/22-agent-loop/#workflows-vs-agents)).
+- **Evals:** how you know it works ([evals as the core loop](/19-evals-methodology/#evals-as-the-core-loop)).
+- **Guardrails:** what you refuse to let through ([guardrails](/29-guardrails-and-safety/#taxonomy-input-output-sync-async), [prompt injection](/33-security-prompt-injection/#threat-model)).
+- **Ops:** traces, cost, rollout ([observability](/30-observability/#traces-and-spans-for-llm-calls), [deployment](/32-deployment-and-llmops/#reference-architecture)).
+
+### How this book is organised
+
+Part I (chapters 01 to 09) covers how models work, from [tokenization](/02-tokenization/#why-discrete-tokens) to [fine-tuning](/09-fine-tuning-in-practice/#prompt-vs-rag-vs-fine-tune-decision). Part II (10 and 11) is [inference](/10-inference-mechanics/#prefill-vs-decode) and [serving economics](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights). Part III (12 to 14) is talking to models: [prompting](/12-prompting-fundamentals/#system-user-assistant-anatomy), [structured output](/13-structured-output/#llm-as-a-typed-function), [multimodal and voice](/14-multimodal-and-realtime-voice/#vision-inputs-images-screenshots). Part IV (15 to 18) is retrieval, from [BM25](/15-information-retrieval-foundations/#bm25) to [agentic RAG](/18-advanced-and-agentic-rag/#retrieval-as-a-tool-agentic-rag). Part V (19 and 20) is [evaluation](/19-evals-methodology/#trace-review). Part VI (21 to 28) is agents: tools, the loop, memory, planning, multi-agent systems, [MCP](/26-mcp/#the-n-m-integration-problem), context engineering and [coding agents](/28-coding-and-computer-use-agents/#why-coding-is-the-flagship-domain). Part VII (29 to 34) is production: guardrails, observability, cost, deployment, security and [product UX](/34-product-ux-and-feedback/#designing-for-probabilistic-output).
+
+Every chapter ends with production notes, interview answer outlines, an offline exercise, and how the topic shows up in your repos.
+
+## AI eng vs ML eng vs full-stack
+
+The titles blur, but the questions each role owns are different.
+
+| Role | Builds | The question it owns | What it measures |
+|---|---|---|---|
+| ML engineer | training pipelines, features, models, model serving | Is the model good? | offline metrics (loss, AUC, recall), training cost |
+| Data scientist | analyses, experiments, forecasts | What is true about the business? | effect sizes, confidence intervals |
+| Backend / full-stack engineer | services, APIs, data stores, UI | Does the system work reliably? | p95 latency, error rate, uptime |
+| AI engineer | products on top of foundation models | Does the feature do the user's task well enough, at this cost and speed? | task success rate on evals, faithfulness, cost per task, p95 latency |
+
+Day to day, an AI engineer looks more like a backend engineer than an ML engineer. In Gaurav's repos every LLM call sits inside a FastAPI or Node service, next to background jobs, retries, rate limits and caches. Health Triage's backend (mostly a teammate's) runs its Gemini triage, speech-to-text and OCR as Celery jobs behind auth, plan entitlements and rate limits; Gaurav's piece there is the Flutter client that follows triage progress over SSE and falls back to polling when the stream drops. What a backend engineer does not usually do is the eval work: a labelled set from real traffic, failure reading, judges checked against human labels. What an ML engineer does not usually do is context design: what the model sees on each call, and in what order. The AI engineer owns both, plus cost per task.
+
+**How interviews test this.** No company publishes its loop, so treat this as the pattern prep sites report, not a rule: a recruiter screen, a coding screen, a **build round** (a small RAG or agent app, usually with an eval section), an **LLM system design** round, sometimes an ML-fundamentals deep dive (fine-tuning, quantization, RLHF and DPO), and a behavioural round. One MIT-licensed question bank says the eval harness in a take-home is graded about as heavily as the app. Candidate reports from Indian services firms describe conceptual RAG questions plus long questioning about the candidate's own project. Anthropic's engineering blog (January 2026) says its general guidance is to do take-homes without AI unless told otherwise. The thread: interviewers test the application layer, plus enough of the model layer to reason about cost and failure.
+
+## Probabilistic software: non-determinism as a design constraint
+
+Ordinary code is a function: same input, same output. An LLM call is a sample from a distribution. Three things make that hard.
+
+- **The same input gives different outputs.** With temperature above zero you are sampling on purpose. Even at temperature 0, hosted models can vary between runs because the server batches your request with others and floating-point sums are not associative ([determinism and batch invariance](/04-language-modeling-and-sampling/#determinism-seeds-batch-invariance)). A model alias you do not pin can also change under you.
+- **The inputs are unbounded.** Users type anything, in any language, at any length.
+- **Failures are partial.** The output parses, has the right fields and reads well, and is still wrong.
+
+Answer Grader hit the third one in production. A comment in `backend/model_answer.py` records that at temperature 0.7 the generator sometimes returned only the introduction: valid JSON, non-empty, so it passed the old "is there an answer?" check. One run gave 49 words against a 250-word target; the same question on another run gave 249. The fix was a quality predicate, not a better prompt: a length band the answer must land in, with a second generation when it misses.
+
+So the engineering responses are structural.
+
+1. **Evals as well as unit tests.** A unit test asserts one output; an eval measures a pass rate over a set of inputs, often with repeats. Keep unit tests for the deterministic code around the model.
+2. **Wrap the model in deterministic code.** Validate, guard, retry a bounded number of times, then fall back to something that cannot fail. Chat Insights's hint path does exactly this in `chatService.js`: generate once and run a code guard, which accepts, falls back to a template, or asks for one re-ask with the violations listed; the second reply is accepted with its violations flagged, or replaced by the template. At most two calls, and a no-model path always exists.
+3. **Isolate the randomness.** Chat Insights's `replay.js` reruns the whole domain pipeline twice and exits 1 if any output hash differs. The LLM is the only non-deterministic stage, and the script checks that everything else is reproducible.
+4. **Define "correct" as a predicate you can compute.** "It returned something" is not a predicate.
+
+Here is the difference between the two kinds of test, with a mocked model:
+
+```python
+import math
+import random
+
+def mock_llm(question: str) -> dict:
+    # Stands in for a real call: usually a full answer, sometimes only the intro.
+    words = 249 if random.random() > 0.15 else 49
+    return {"answer": "word " * words}
+
+def acceptable(out: dict, target: int = 250) -> bool:
+    # "Parsed OK" is not "correct": require a length band, not just non-empty.
+    n = len(out.get("answer", "").split())
+    return 0.85 * target <= n <= 1.15 * target
+
+def test_one_sample():
+    # A unit test on one sample fails by luck about 15% of the time.
+    assert acceptable(mock_llm("Discuss the role of MSMEs in exports."))
+
+def run_eval(questions: list[str], repeats: int = 3) -> tuple[float, float]:
+    results = [acceptable(mock_llm(q)) for q in questions for _ in range(repeats)]
+    p = sum(results) / len(results)
+    se = math.sqrt(p * (1 - p) / len(results))
+    return p, se
+
+if __name__ == "__main__":
+    p, se = run_eval([f"q{i}" for i in range(50)])
+    print(f"pass rate {p:.2f} +/- {1.96 * se:.2f} (95%)")
+```
+
+The error bar matters more than people expect. With 50 cases and an 80% pass rate, the standard error is √(0.8 × 0.2 / 50) = √0.0032 ≈ 0.057, so the 95% interval is about ±11 points. A prompt change that moves you from 80% to 85% on 50 cases is inside the noise. [Chapter 19](/19-evals-methodology/#noise-statistics-sample-sizes) covers sample sizes properly.
+
+**Cost and latency are design inputs too.** Every request has a price you can compute:
+
+```text
+cost per request = input_tokens × input_price + output_tokens × output_price
+
+Illustrative prices (check the current price page): $1 per million input, $5 per million output.
+3,000 input + 500 output  = 3,000 × $0.000001 + 500 × $0.000005 = $0.003 + $0.0025 = $0.0055
+1,000 requests            = $5.50
+one user, 20 a day × 30   = 600 requests = $3.30 a month
+
+latency ≈ TTFT + output_tokens × time per output token
+        ≈ 0.5 s + 500 × 0.02 s = 10.5 s   (illustrative; output tokens dominate)
+```
+
+If your plan price per user is below that $3.30, the feature loses money on every active user, and you need to know that before launch. Price per token is also the wrong comparison. Answer Grader's `backend/llm.py` records that, with hidden reasoning uncapped, Gemini spent about 10,300 output tokens on a model answer plus evaluation against gpt-4o's 2,400, which made the cheaper-per-token model dearer per evaluation. Compare cost per task. The levers live in [Cost and Latency Engineering](/31-cost-and-latency-engineering/#token-budget-accounting) and the latency terms (TTFT, time per output token) in [Inference Mechanics](/10-inference-mechanics/#ttft-tpot-itl-throughput).
+
+## Use-case taxonomy (coding, extraction, support, search, automation)
+
+Most LLM products fall into a handful of shapes. What separates them is how cheaply you can check the output and what a wrong output costs.
+
+| Use case | What "good" means | How checkable | Cost of a miss | Go deeper |
+|---|---|---|---|---|
+| Coding | tests pass, reviewer accepts | high: compilers and tests | medium: review catches most | [coding agents](/28-coding-and-computer-use-agents/#why-coding-is-the-flagship-domain) |
+| Extraction | every field right | high per field, given labels | depends on what consumes it | [structured output](/13-structured-output/#extraction-and-classification-patterns) |
+| Support and Q&A | correct, grounded, right language and tone | medium: judges plus human labels | high for government, health, money | [RAG](/17-rag-pipelines/#grounding-faithfulness) |
+| Search and research | relevant, cited, current | medium | medium | [agentic RAG](/18-advanced-and-agentic-rag/#deep-research-iterative-search) |
+| Automation and agents | task done, no harmful side effects | outcome checks on the end state | high once tools write or spend | [agent loop](/22-agent-loop/#workflows-vs-agents) |
+
+The rule that falls out of the table: **the more checkable the output, the more autonomy you can afford.** Coding became the flagship agent domain because tests give a cheap, objective verdict on every attempt. Support answers have no compiler, so they need citations, abstention and evals built from human judgement.
+
+Your repos cover most rows. Answer Grader extracts the question from a photographed answer and grades it. Scheme Assistant is citizen Q&A over government documents (core RAG mostly a teammate's; Gaurav built the vision OCR lane and the persona-critic eval). Memory Agent is search: a web-search writer with a code guard on cited numbers. LeetCode Coach is tutoring, a sixth shape: the model must help without giving the answer away, so a policy function sets how much help each turn may give. None is a coding agent or a write-capable automation agent yet.
+
+## Evaluating a use case; setting expectations
+
+Before writing a prompt, answer six questions. They take an hour and save weeks.
+
+1. **What does the user do today, and what is the non-LLM baseline?** A rule, a search box, a template, a form. If the baseline gets 90% of the value, ship the baseline.
+2. **What does a wrong answer cost, and who catches it?** A bad hint wastes a minute. A wrong eligibility answer about a government scheme can cost a family money. If nobody reviews the output before it acts, the bar is much higher.
+3. **Can you check the output cheaply?** Tests, a schema, a source to cite, a calculation to redo, a human in the loop.
+4. **What are the volume, latency and cost budgets per task?** Do the arithmetic from the previous section with your own numbers.
+5. **Do you have 30 to 100 real inputs to start an eval set?** If you cannot get them, you cannot tell whether the feature works.
+6. **May the data leave your infrastructure?** Student answers, citizen questions and medical notes all raise this.
+
+**When not to use an LLM.** When the logic is exact and known (tax, permissions, pricing). When a rule or lookup is about as good. When the latency budget is tens of milliseconds. When there is no tolerance for error and no human review. When the output must be identical on every run for an audit. Your repos make this call often, and correctly. Chat Insights decides how much help a student gets with `decideRung`, a pure function over stored facts, not a model. Certificate Assistant drafts citizen messages from reviewed templates and checks every number and name against the source record. Memory Agent checks prices and percentages with plain string matching; the header of `src/guard.ts` says its earlier research agents' LLM judges "missed every wrong number; plain string matching does not."
+
+**Setting expectations.** State quality as a measured rate with known failure modes, not as "it's accurate". Then design the product for the misses: show sources, abstain when evidence is thin, and keep a human on decisions that matter. Answer Grader's calibration is an expectation-setting fix as much as a scoring fix: under each score the page shows what real toppers score on that paper and where the Mains cut-off sits, so a 5/10 is not read as failure. Certificate Assistant's trace UI always ends on a step that waits for the officer. [Product UX](/34-product-ux-and-feedback/#expectation-setting) covers the patterns.
+
+## Demo-to-production gap; milestones; maintenance
+
+A demo works on the ten inputs its builder chose, judged by eye. Production gets the long tail: other languages, small talk, empty messages, pasted essays, hostile input, provider rate limits, cold starts and a bill that scales with users. The gap between the two is where most of an AI engineer's time goes.
+
+Four examples from your repos show what the gap looks like.
+
+- **Fallbacks that look like success.** In Answer Grader, a failed model-answer generation returned `None`, the run was still written as "completed", and the result page fell back to its hardcoded demo answer, which a student saw as their own. The fix in `backend/pipeline.py` raises so the run is marked failed. Make failure louder than the happy path.
+- **The users do something else first.** Gaurav's persona-critic eval of Scheme Assistant had critic agents write 177 questions as villagers, self-help-group members and sarpanches, in Devanagari Hindi, Hinglish and English, and ran them through the real API. The bot invented no amount, date or phone number in 232 turns. But 48 passed, 63 were incomplete and 66 failed, mostly on everyday things: greetings got the out-of-scope list (4 pass, 7 partial, 17 fail on the small-talk items), users typing Hindi in Roman letters got refusals in English, and it claimed "the documents don't say" when they did. A teammate then shipped a small-talk path. The RAG was good at the task it was built for and weak at what real users did first.
+- **Production settings differ from dev.** The team's Cloud Run deploy script records that the LLM reranker added about 10 seconds per question, pushing answers past the app's 45-second limit with a cold start, so production runs without it. Config follows measurement, and the number sits next to the setting.
+- **Unit-tested is not live-verified.** Chat Insights's `RECALL.md` keeps an honest list: at the time of writing, Gemini's free tier allowed 20 requests a day for the whole project while the per-user cap was 60, and the Anthropic adapter had never made a live call.
+
+Milestones with exit criteria keep the gap visible:
+
+```text
+M0 prototype      hand-picked inputs, one prompt                 exit: works on the happy path
+M1 eval baseline  50-200 real inputs, failure taxonomy           exit: a pass rate with an error bar
+M2 hardened       guards, fallbacks, timeouts, traces, cost      exit: every failure is visible and bounded
+M3 limited beta   real users, sampled trace review, feedback     exit: the rate holds on live traffic
+M4 general use    budgets, alerts, eval-gated rollouts           exit: you can change it safely
+```
+
+The practitioners behind applied-llms.org (Yan et al. 2024) give advice that fits this ladder: start with prompting and a strong model, write simple assertion-style checks from real outputs early, and look at your data constantly.
+
+**Maintenance never ends** because things change without your commit. Providers retire model versions and change prices ([deprecation and migration](/11-serving-and-model-economics/#deprecation-and-migration)). Your documents go stale ([freshness](/17-rag-pipelines/#freshness-and-incremental-updates)). Users drift. Prompts accrete rules: Scheme Assistant's generation prompt has fourteen numbered rules, the newest tagged with the end-to-end test cases that prompted them. Those cases are replayed offline against the code gate, but nothing re-runs them through the model after a prompt edit. Every model or prompt change needs a re-run of the eval set before it ships ([model upgrades](/32-deployment-and-llmops/#model-upgrade-regression-management)), and production traces need to flow back into that set ([the trace-eval-fix loop](/30-observability/#the-trace-eval-fix-loop)).
+
+## Build vs buy at the model layer
+
+You have five options, roughly in order of how much you own:
+
+1. **Buy:** a closed model through the vendor's API.
+2. **Rent:** an open-weight model through a hosted inference provider.
+3. **Operate:** self-host open weights on your own GPUs (vLLM, SGLang, llama.cpp or Ollama).
+4. **Adapt:** fine-tune with LoRA, or distil a large model into a small one.
+5. **Build:** pretrain your own model. Almost never right for a product team.
+
+Choose on six factors: quality **on your eval set** (not a leaderboard), cost per task at your volume, latency, data residency and privacy, control (pinned versions, no surprise deprecations), and whether your team can run GPUs at 3 a.m. For knowledge, the usual order is prompt first, then retrieval, then fine-tuning. Fine-tuning is good at teaching format, style and narrow behaviour, and at making a small model do a big model's job cheaply. It is a poor way to add facts that change ([prompt vs RAG vs fine-tune](/09-fine-tuning-in-practice/#prompt-vs-rag-vs-fine-tune-decision), [RAG vs long context vs fine-tuning](/17-rag-pipelines/#rag-vs-long-context-vs-fine-tuning)).
+
+Self-hosting has a break-even you can compute:
+
+```text
+break-even tokens per month = (GPU cost per month + ops cost) / API price per token
+
+Illustrative: one GPU at $2/hour × 720 hours = $1,440 a month, ops ignored.
+API blended price $2 per million tokens.
+break-even = 1,440 / 2 = 720 million tokens a month ≈ 24 million a day ≈ 280 tokens/second, sustained
+```
+
+Below that volume the API is cheaper even before you count engineering time, and the open model still has to pass your eval. [Chapter 11](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights) and [chapter 31](/31-cost-and-latency-engineering/#self-host-break-even) work through real cases.
+
+Whatever you choose, **keep the switch cheap.** Put every call behind one wrapper whose model comes from config, and record usage on every call:
+
+```ts
+type ChatRequest = { system: string; user: string; maxTokens: number };
+type ChatResult = { text: string; inputTokens: number; outputTokens: number; latencyMs: number };
+interface Provider { complete(req: ChatRequest, model: string): Promise<ChatResult> }
+
+const providers: Record<string, Provider> = {}; // real adapters in prod, a mock in tests
+declare function recordUsage(provider: string, model: string, res: ChatResult): void; // your usage table
+
+export async function complete(req: ChatRequest): Promise<ChatResult> {
+  const name = process.env.LLM_PROVIDER ?? "mock";
+  const model = process.env.LLM_MODEL ?? "default";
+  const provider = providers[name];
+  if (!provider) throw new Error(`unknown provider: ${name}`);
+  const res = await provider.complete(req, model);
+  recordUsage(name, model, res); // tokens, cost and latency per call, from day one
+  return res;
+}
+```
+
+Answer Grader learned this the hard way. The docstring of `backend/llm.py` says three modules each hardcoded gpt-4o, "so an OpenAI billing problem took the whole product down even though a working Gemini key" was available. Now one variable, `LLM_PROVIDER`, picks the vendor; the docstring notes the switch is safe for chat, which has no stored state, but not for embeddings, which would need the corpus re-embedded. Memory Agent shows the measured version of the choice: `DECISIONS.md` compares Opus, Sonnet and Haiku writers on the same scenarios and judge, and routes by turn type because the routed setup matched or beat every single-model pass rate while using Opus only for re-checks. Scheme Assistant keeps a local `bge-m3` embedder in the code as the "residency-safe option", though production uses the hosted APIs.
+
+<Production>
+
+**Failure modes.** Demos that fail on the long tail: other languages, small talk, empty or huge inputs, hostile text. No eval baseline before launch, so nobody can say whether a later change helped. Fallbacks that look like success, and partial failures that parse and look fine.
+
+**Cost.** Per-user token spend gets underestimated because people price one call, not a user's month. Multiply out tokens per call × calls per task × tasks per day × 30 × price, then add what the first estimate misses: reasoning tokens billed as output, retries, verifier calls and your heaviest users. Cap spend per user per day, as Chat Insights does with an atomic daily counter that returns 429.
+
+**Latency.** Users arrive with chat-speed expectations set by consumer apps. Output tokens dominate: 500 tokens at 20 ms each is 10 s. Budget p95 including cold starts, stream tokens or progress, and cut output length before shopping for a faster model.
+
+**Observability.** Traces from day one: per call, the model, prompt version, input, output and cached tokens, latency, cost, outcome and a request id. You cannot build an eval set from traffic you never recorded, or explain a bill you never metered.
+
+**Security.** Every hosted call sends your user's data to a third party. Know what leaves, the vendor's retention terms, and whether residency rules apply; redact PII you do not need; keep a local-model path for sensitive data. Once the model reads untrusted content or calls tools, prompt injection becomes an architecture problem, not a prompt problem ([chapter 33](/33-security-prompt-injection/#the-lethal-trifecta)).
+
+</Production>
+
+<Interview>
+
+<Q q="How is AI engineering different from ML engineering?">
+
+- ML engineering trains and serves models for a task; the question is "is the model good?", measured with offline metrics on held-out data.
+- AI engineering builds products on foundation models someone else trained; the question is "does the feature do the user's task, at this cost and latency?"
+- The work shifts to context (prompts, retrieval, memory), tools, evals, guardrails and operations. Labels go into eval sets instead of training sets.
+- Cost moves from training to inference: every request has a token price, so cost per task is a design input.
+- It overlaps heavily with backend engineering (queues, caches, rate limits, streaming) plus eval and context design.
+- Example: "In Answer Grader the grading call is a few lines; the work was calibration against 143 marksheets, a fact register and a claim checker."
+- **The trap:** "AI engineers just call APIs" or "it's prompt engineering", which skips evals, cost and failure handling.
+
+</Q>
+
+<Q q="Walk me through taking an LLM feature from prototype to production.">
+
+- Scope: the user task, the non-LLM baseline, the cost of a wrong answer, and latency and cost budgets with arithmetic.
+- Prototype with a strong model to learn whether the task is possible at all.
+- Collect 50 to 200 real inputs, read the outputs, build a failure taxonomy, and get a baseline pass rate with an error bar (50 cases at 80% is about ±11 points at 95%).
+- Harden: schema validation, guards, bounded retries, a fallback that cannot fail, timeouts, a per-user cap, and tracing with tokens and cost per call.
+- Limited beta on real users; sample traces weekly and feed failures back into the eval set.
+- Then optimise: a cheaper or routed model, prompt caching, shorter outputs, each change gated on the eval set.
+- Plan maintenance: pinned model versions, an eval run on every prompt or model change, staged rollout.
+- **The trap:** describing only the prompt and the deploy, with no eval baseline or rollout gate.
+
+</Q>
+
+<Q q="When should you not use an LLM?">
+
+- When the logic is exact and known: tax, pricing, permissions, date arithmetic. Code is cheaper, faster and always right.
+- When a rule, lookup, search box or template gets most of the value. Measure the baseline first.
+- When the latency budget is tens of milliseconds or the volume makes per-token cost absurd.
+- When there is zero tolerance for error and no human or verifier can check the output.
+- When the output must be identical every time for audit or legal reasons.
+- Mixed designs are common: code decides, the model phrases (a policy function picks the hint level; the model writes the hint).
+- **The trap:** "almost never, models are good enough now", or the opposite, refusing LLMs for tasks where they plainly beat rules (open-ended language).
+
+</Q>
+
+<Q q="Tell me about an LLM feature you shipped: what broke after launch?">
+
+- Pick one real incident and tell it as: symptom, how you found it, root cause, fix, the guard or eval that stops it recurring.
+- Answer Grader examples: a failed generation marked "completed" showed a hardcoded demo answer as the student's own (fix: raise, so failure is louder than success); an intro-only answer of 49 of 250 words passed a non-empty check (fix: a completeness band); one provider's billing problem took the product down (fix: a config switch between providers).
+- End with what you measure now and what you would do differently (an eval set run on every change, alerts on failure rate).
+- **The trap:** "nothing broke", or a story with no measurement and no prevention.
+
+</Q>
+
+<Q q="Estimate the monthly cost of an LLM feature before you build it.">
+
+- Formula: (input tokens × input price + output tokens × output price) × calls per task × tasks per user per day × 30 × active users.
+- Worked example with illustrative prices: 3,000 in and 500 out at $1 and $5 per million is $0.0055 a call; 20 a day for 30 days is $3.30 per user per month.
+- Add the hidden multipliers: reasoning tokens billed as output, retries, verifier or judge calls, and heavy users.
+- Compare against revenue per user; if it does not fit, cut output length, cache the stable prefix, route easy turns to a smaller model.
+- Say you would confirm with metered usage in a beta, and cap spend per user per day.
+- **The trap:** comparing models by price per token instead of cost per completed task.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** write a one-page design doc for one LLM feature in your own repo, and back its two riskiest claims with numbers. It becomes the running project for later chapters.
+
+**Where:** Chat Insights (`~/chat-insights`), which you own outright. A good candidate is a weekly review that tells a student which habits are costing them, built on what `computeHabits` (`backend/src/lc/domain/habits.js`) already derives. Answer Grader or Memory Agent work too.
+
+**Model:** offline only. Use a mock function for the first pass and Ollama with a small instruct model (for example a 3B to 8B Llama or Qwen) for the second. No paid API.
+
+**Steps**
+
+1. **User problem** in two sentences, and who reads the output.
+2. **Success metric** you can compute: for example, the share of reviews whose top habit matches what a human (you) would pick, on a labelled set.
+3. **Failure cost:** what a wrong review costs the student, and who catches it.
+4. **Budget:** tokens per call, calls per user per week, cost per user per month with the arithmetic from this chapter (illustrative prices, marked as such), and a p95 latency target.
+5. **Non-LLM baseline:** implement it. A template that names the top two habits from `computeHabits` output is about 30 lines.
+6. **Eval set:** 30 real or fixture students. Label the right top habit for each.
+7. **Compare:** run the baseline and the Ollama version over the set, with three repeats for the model; report pass rates with a 95% error bar.
+8. **Decision:** ship the baseline, the model, or a hybrid (code picks the habit, the model words it), and say why.
+
+**Definition of done:** a one-page `docs/design/weekly-review.md` in Chat Insights with every section filled; a script that prints both pass rates with error bars from one command; a cost-per-user figure with the arithmetic shown; and a one-paragraph decision you could defend out loud in two minutes.
+
+</ApplyIt>
+
+<YourProject>
+
+- **"Most of the work is around the call."** In Answer Grader (your code, team repo): `backend/calibration.py` (rubric scores mapped to realistic marks from 143 real marksheets), `backend/facts.py` (a verified register that overrides model memory) and `backend/verify.py` (a second call lists named claims; code removes the wrong ones).
+- **Non-determinism, handled structurally.** Answer Grader `backend/model_answer.py` (lines 544 to 550) and the completeness threshold; Chat Insights's bounded generate-guard-retry-template path in `chatService.js` and the determinism check in `backend/src/lc/scripts/replay.js`.
+- **The demo-to-production gap, with numbers.** Answer Grader `backend/pipeline.py` (lines 231 to 241) is the demo-answer bug and fix. In Scheme Assistant the persona-critic eval is yours (`scripts/critic_run.py`, `scripts/critic_api.py`, `docs/critic-eval/`); the core RAG and the deploy script are mostly Chiman's, so say "our pipeline" and "my eval found".
+- **Build vs buy.** Answer Grader `backend/llm.py`: the `LLM_PROVIDER` switch and the cost-per-task note on reasoning tokens (around lines 348 to 351). Memory Agent `DECISIONS.md` #2: a routed writer chosen from a measured table.
+- **Knowing when not to use a model.** Certificate Assistant has no LLM by design; Memory Agent's `src/guard.ts` and Chat Insights's `decideRung` (`backend/src/lc/domain/policy.js`) keep exact decisions in code.
+- **Gaps to name honestly:** none of your repos fine-tunes or self-hosts a model in production, none uses an LLM tracing tool, and none has a write-capable agent. Say so, and say which chapter's exercise is closing each one.
+
+</YourProject>

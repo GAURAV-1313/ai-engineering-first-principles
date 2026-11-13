@@ -1,0 +1,649 @@
+---
+id: "11"
+title: "Serving, Model Selection and Economics"
+summary: "Decide between an API and self-hosted open weights with arithmetic you can show, pick a model by measuring it on your own task, and put a gateway in front of providers so outages, rate limits, price changes and deprecations stop being emergencies."
+readingTime: "36 min"
+---
+
+Every LLM feature you ship eventually turns into three questions from someone who is not an engineer. Which model is it running on, and why that one? What does it cost per user per month? What happens when the provider goes down, raises the price or retires the model? None of these is answered by prompt engineering. They are answered by a small amount of arithmetic, an eval set, and a thin layer of infrastructure between your code and the model.
+
+[Chapter 10](/10-inference-mechanics/) explained what happens inside the box: prefill and decode, the KV cache, batching, quantization. This chapter is about the decisions around the box. Where does the model run (a vendor API, your own GPUs, the user's laptop)? How is it priced, and how do you turn prices into a cost per task? How do you pick one model out of dozens when every launch post claims the top benchmark score? And how do you build the layer that routes, retries, falls back, counts money and survives a model's retirement date?
+
+A rule for the whole chapter: prices, rate limits and benchmark scores change every few months, so every number here is arithmetic you can redo, a formula, or an order of magnitude marked "roughly". Prices below are illustrative; for a real one, check the provider's current price page.
+
+## API vs self-hosted open weights
+
+The problem: you can rent intelligence by the token from a vendor, or rent (or buy) GPUs by the hour and run an open-weights model yourself. The two have different cost shapes, and that shape difference is the whole decision.
+
+- **API cost is variable.** You pay per input token and per output token. Zero traffic costs zero. Double traffic costs double. The vendor absorbs utilization, batching, upgrades and on-call.
+- **Self-hosting cost is mostly fixed.** You pay per GPU-hour whether the GPUs are busy or idle, plus the engineers who keep them running. The marginal cost of one more request is close to zero until you need another GPU.
+
+Variable cost wins at low and spiky volume. Fixed cost wins at high, steady volume, if you can keep the GPUs busy and if an open model you can run is good enough for the task. The second condition is the one people forget.
+
+### The break-even formula
+
+Start with cost per request on an API, with prices in dollars per million tokens:
+
+```text
+api_cost_per_request = (T_in × p_in + T_out × p_out) / 1,000,000
+```
+
+Then the fixed daily cost of self-hosting, sized for your peak, not your average:
+
+```text
+gpus_needed     = ceil(peak_output_tokens_per_sec / sustained_tokens_per_sec_per_gpu) + spare
+selfhost_daily  = gpus_needed × gpu_hourly × 24 + ops_people_daily
+break_even_reqs_per_day = selfhost_daily / api_cost_per_request
+```
+
+The key input is `sustained_tokens_per_sec_per_gpu`: the throughput one GPU delivers for your model, your prompt lengths and your latency SLO, measured under load. [Chapter 10's arithmetic](/10-inference-mechanics/#inference-arithmetic-worked-examples) shows why it ranges over two orders of magnitude: a single unbatched stream on an 8B model gets a couple of hundred tokens per second; a well-batched engine gets thousands. Do not guess it from a blog; load-test your engine.
+
+### Worked example: 10M requests per day
+
+Say a feature gets 10M requests per day, each with about 1,500 input tokens and 300 output tokens.
+
+```text
+input tokens/day  = 10M × 1,500 = 15 billion  = 15,000 million
+output tokens/day = 10M × 300   = 3 billion   = 3,000 million
+average req/s     = 10M / 86,400 ≈ 116
+average output tok/s = 3e9 / 86,400 ≈ 34,700
+peak (assume 3× average) ≈ 104,000 output tok/s
+```
+
+API cost per day is `15,000 × p_in + 3,000 × p_out`. Now plug in two illustrative price points, not any vendor's:
+
+- A frontier-tier model at $3 in and $15 out: `45,000 + 45,000 = $90,000` per day, roughly $2.7M per month.
+- A small, cheap model at $0.10 in and $0.40 out: `1,500 + 1,200 = $2,700` per day, roughly $81K per month.
+
+Self-hosting: assume your load test shows a mid-size open model sustains about 1,000 output tokens per second per GPU, prefill included, at your p95 latency target. Peak needs `104,000 / 1,000 = 104` GPUs; add spares for failures and deploys, call it 120. At an illustrative $2.50 per GPU-hour, `120 × 24 × 2.5 = $7,200` per day, roughly $216K per month, plus two or three engineers.
+
+So the answer is "it depends which tier you are replacing". Self-hosting beats the frontier-tier API by an order of magnitude if the open model passes your eval. It loses badly to the small-model API, which is already cheaper than the GPUs. With these inputs the break-even (the code below adds spares and people) is about 1M requests per day against the frontier tier and over 30M against the small tier. That is the answer interviewers want: the method, both sides of the comparison, and the quality condition.
+
+```python
+def per_request(t_in, t_out, p_in, p_out):          # prices: $ per million tokens
+    return (t_in * p_in + t_out * p_out) / 1e6
+
+def selfhost_daily(peak_out_tps, tps_per_gpu, gpu_hour, spare=0.15, ops_daily=1500):
+    gpus = -(-peak_out_tps // tps_per_gpu)          # ceil
+    gpus = int(gpus * (1 + spare)) + 1
+    return gpus, gpus * gpu_hour * 24 + ops_daily
+
+reqs, t_in, t_out = 10_000_000, 1500, 300
+peak = reqs * t_out / 86_400 * 3                    # 3x peak-to-average
+gpus, fixed = selfhost_daily(peak, 1000, 2.50)
+for name, p_in, p_out in [("frontier", 3, 15), ("small", 0.10, 0.40)]:
+    api = reqs * per_request(t_in, t_out, p_in, p_out)
+    be = fixed / per_request(t_in, t_out, p_in, p_out)
+    print(f"{name}: api ${api:,.0f}/day, self-host ${fixed:,.0f}/day ({gpus} GPUs), "
+          f"break-even {be/1e6:.1f}M req/day")
+```
+
+### What the arithmetic leaves out
+
+- **Quality gap.** The comparison is only valid between options that pass the same eval. If the best open model you can serve scores below your bar, its cost is irrelevant.
+- **Utilization.** The GPU bill assumes you sized for peak and pay for the trough. A feature with a 10× day-night swing wastes most of its GPU-hours unless you autoscale, and autoscaling GPUs is slow (see cold starts below).
+- **People.** On-call for a GPU fleet, engine upgrades, driver issues and capacity planning are real headcount. At low volume that headcount alone exceeds the API bill.
+- **Control and data.** Self-hosting gives you pinned weights that never change underneath you, no third-party data flow, and the option to fine-tune. Sometimes one of those decides the matter regardless of cost.
+
+Middle options exist: hosted open-weights models billed per token, dedicated endpoints on GPUs reserved for you, and serverless GPUs billed per second.
+
+<Callout type="interview">
+
+When asked "API or self-host?", do not answer with a preference. Write the per-request API cost formula, the self-host daily cost sized for peak, divide one by the other, and then say the condition: only if an open model you can serve passes the same eval.
+
+</Callout>
+
+## Engines (vLLM, SGLang, TGI, llama.cpp/Ollama)
+
+If you self-host, you do not write the serving loop yourself. An **inference engine** is the server that loads weights onto accelerators and turns HTTP requests into batched forward passes. Underneath, every serious engine does the same jobs, all covered in chapter 10: a scheduler doing [continuous batching](/10-inference-mechanics/#static-vs-continuous-batching), a paged [KV cache](/10-inference-mechanics/#pagedattention), [prefix caching](/10-inference-mechanics/#prefix-prompt-caching), quantized kernels, tensor parallelism across GPUs, and an OpenAI-compatible HTTP API on top. What differs is which workloads each one is tuned for, how broad its model and hardware support is, and how easy it is to run.
+
+| Engine | What it is good at | Typical use |
+|---|---|---|
+| vLLM | PagedAttention (Kwon et al., 2023), broad model and hardware support, large community | Default choice for GPU serving of open models |
+| SGLang | RadixAttention prefix cache (Zheng et al., 2024), fast structured output, strong on shared-prefix and agent workloads | Many requests sharing long prefixes; heavy JSON-schema output |
+| TGI | Hugging Face's server, tight Hub integration | Existing deployments only: Hugging Face put it into maintenance mode in late 2025 (minor fixes only) and points new projects to vLLM or SGLang |
+| TensorRT-LLM | NVIDIA's compiled engines, very high throughput on NVIDIA GPUs | Large fleets willing to pay a compile step per model and GPU |
+| llama.cpp | C/C++, GGUF quantized weights, runs on CPU, Apple Metal, CUDA | Laptops, edge boxes, CPU-only servers |
+| Ollama | A friendly wrapper around llama.cpp with a model registry and one-command pulls | Local development, single-user tools, offline demos |
+
+The useful property they share is the OpenAI-compatible endpoint. Your application code can stay identical whether it talks to a vendor, a vLLM cluster or Ollama on your laptop; only the base URL and model name change.
+
+```python
+import json, urllib.request
+
+def chat(base_url: str, model: str, prompt: str, api_key: str = "none") -> str:
+    body = json.dumps({"model": model, "max_tokens": 200,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(f"{base_url}/chat/completions", data=body, headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.load(r)
+    usage = data.get("usage", {})          # same usage fields everywhere: log them
+    print(model, usage.get("prompt_tokens"), usage.get("completion_tokens"))
+    return data["choices"][0]["message"]["content"]
+
+# Same code, three backends:
+# chat("http://localhost:11434/v1", "qwen2.5:3b", "hi")          # Ollama
+# chat("http://gpu-box:8000/v1", "Qwen/Qwen2.5-7B-Instruct", "hi")  # vllm serve
+# chat("https://api.vendor.example/v1", "vendor-model", "hi", key)  # hosted
+```
+
+How to choose: start with vLLM on GPUs; try SGLang if your traffic shares long prefixes (agents, few-shot templates, multi-turn chat); use llama.cpp or Ollama when there is no datacenter GPU. Decide with a load test on your own traces reporting p50 and p95 TTFT, inter-token latency and throughput at several concurrency levels; published engine benchmarks use someone else's prompts and hardware.
+
+### How engines fail in production
+
+- **Chat template mismatch.** The engine must format messages with the model's own chat template. A wrong or missing template does not error; it quietly degrades quality. Always run your eval against the served endpoint, not against a notebook.
+- **Engine upgrades change outputs.** New kernels, new defaults for sampling or prefix caching, and new quantization paths can shift outputs slightly. Pin the engine version like a dependency and re-run evals on upgrade.
+- **Context length set too high.** Setting the maximum model length to the model's full context reserves KV memory for requests you never see and shrinks your batch. Set it to what your traffic needs.
+- **Cold starts.** Loading weights is a disk or network read. Roughly, `load_time ≈ weight_bytes / read_bandwidth`: 16 GB of 8B-model weights at about 1 GB/s is around 16 seconds, and 140 GB of 70B weights is over two minutes, before the engine warms up its kernels. Autoscaling from zero cannot absorb a sudden spike. Keep warm replicas, or cache weights on local NVMe.
+
+## Local and edge
+
+Sometimes the right place to run the model is not a datacenter. Local and edge inference means running on the user's laptop, phone, browser or an on-premises box. Reasons that justify it:
+
+- **Privacy and residency.** The data never leaves the device or the building.
+- **Offline or poor connectivity.** Field apps, factories, rural deployments.
+- **Latency floor.** No network round trip; useful for small, frequent calls like autocomplete or classification.
+- **Zero marginal cost.** The user's hardware pays for inference. At very large user counts this matters.
+- **Developer loop.** Iterating against a local model is free and needs no key.
+
+The constraints come straight from chapter 10. Memory decides what fits: `weight_bytes ≈ parameters × bits / 8`, so a 3B model at about 4.5 bits is roughly 1.7 GB and a 70B model at 4 bits is roughly 35 GB. Memory bandwidth decides speed: single-stream decode is capped near `bandwidth / weight_bytes` tokens per second. [Example 5 in chapter 10](/10-inference-mechanics/#inference-arithmetic-worked-examples) runs this for a laptop.
+
+```python
+def fits_and_speed(params_b, bits, device_mem_gb, bandwidth_gbs, overhead_gb=1.5):
+    weights_gb = params_b * bits / 8              # 1e9 params x bits / 8 bits = GB
+    fits = weights_gb + overhead_gb <= device_mem_gb * 0.75   # leave room for the OS and apps
+    tok_s = bandwidth_gbs / weights_gb            # decode ceiling, one stream
+    return round(weights_gb, 1), fits, round(tok_s)
+
+print(fits_and_speed(3, 4.5, 16, 100))    # laptop: (1.7, True, 59)
+print(fits_and_speed(8, 4.5, 6, 50))      # phone-class: (4.5, False, 11)
+print(fits_and_speed(70, 4, 64, 400))     # high-end workstation: (35.0, True, 11)
+```
+
+Operating systems now ship on-device models with an API, browsers run small models over WebGPU, and llama.cpp runs on almost anything. The trade-off is constant: a model that fits on a phone is much weaker than a frontier API model, uses battery, must be downloaded and updated, and runs where you cannot observe or fix it.
+
+The common production pattern is **hybrid**: a small local model handles the easy, frequent or private part (classification, redaction, short completions), and escalates to a cloud model when the task is hard and the user allows it. That is a [cascade](#routing-and-cascades) where the first tier happens to run on the device.
+
+<Callout type="warn">
+
+The dev/prod gap: if you develop against a local model and ship a hosted one (or the other way round), the model you evaluated is not the model you ship. Run the same eval set against every candidate before you lock the production choice.
+
+</Callout>
+
+## Pricing (input/output/cached/thinking)
+
+A hosted model's bill is a sum over several meters, and every provider names and prices them a little differently. Know the meters and you can read any price page.
+
+- **Input tokens.** Everything you send: system prompt, tool definitions, history, retrieved documents, the user's message, images (converted to tokens by a provider-specific formula).
+- **Output tokens.** Everything the model generates. Output is priced several times higher than input on most price pages (roughly 4 to 8 times across current vendors; check the current page). The reason is mechanical: [decode](/10-inference-mechanics/#prefill-vs-decode) produces one token per forward pass and is memory-bandwidth-bound, while prefill processes the whole prompt in parallel.
+- **Cached input reads.** Tokens served from the provider's prompt cache, billed at a steep discount (often around a tenth of the input price, and lower still on some newer models). Some providers also charge a premium to write an entry into the cache, so a prefix used once costs more than it would uncached. The mechanism is [prefix caching](/10-inference-mechanics/#prefix-prompt-caching); the tactics are in [chapter 31](/31-cost-and-latency-engineering/#prompt-caching).
+- **Thinking or reasoning tokens.** Reasoning models generate hidden or summarized reasoning before the answer. Those tokens are billed as output, whether or not you see them. A short answer can carry thousands of thinking tokens.
+- **Tool and feature fees.** Hosted web search, code execution and similar server tools often charge per use on top of tokens.
+- **Modifiers.** Batch processing discounts (commonly about half price), long-context tiers that cost more past a prompt-length threshold, priority or provisioned-throughput tiers, regional endpoints with different prices.
+
+Two subtleties. **Tokenizers differ**: the same paragraph can be a noticeably different token count on two providers, and Indic scripts often tokenize far less efficiently than English, so compare cost per task, never price per token. And **thinking tokens dominate quietly**: 400 visible output tokens plus 3,000 thinking tokens bill as 3,400.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Price:            # $ per million tokens; fees in $ per use
+    inp: float; out: float; cache_read: float; cache_write: float = 0.0; search: float = 0.0
+
+def call_cost(p: Price, inp, out, thinking=0, cache_read=0, cache_write=0, searches=0, batch=False):
+    uncached = inp - cache_read - cache_write          # here inp = ALL prompt tokens (see note below)
+    usd = (uncached * p.inp + cache_read * p.cache_read + cache_write * p.cache_write
+           + (out + thinking) * p.out) / 1e6 + searches * p.search
+    return usd * (0.5 if batch else 1.0)              # illustrative batch discount
+
+P = Price(inp=3, out=15, cache_read=0.3, cache_write=3.75, search=0.01)   # illustrative
+print(call_cost(P, inp=8000, out=400))                                    # cold
+print(call_cost(P, inp=8000, out=400, cache_read=6000))                   # warm cache
+print(call_cost(P, inp=8000, out=400, thinking=3000, cache_read=6000))    # with reasoning
+```
+
+Read the usage fields carefully before you feed them in, because providers disagree on what "input" means. OpenAI-style `prompt_tokens` includes the cached tokens (reported again under `cached_tokens`); Anthropic's `input_tokens` is only the uncached part, with `cache_read_input_tokens` and `cache_creation_input_tokens` reported beside it. Subtract cache reads from a field that already excludes them and your estimate silently drifts.
+
+Running this: the cold call is `(8,000 × 3 + 400 × 15) / 1e6 = $0.030`; the warm call is `(2,000 × 3 + 6,000 × 0.3 + 400 × 15) / 1e6 = $0.0138`; adding 3,000 thinking tokens adds `3,000 × 15 / 1e6 = $0.045`, roughly quadrupling the warm call. Cache and reasoning effort are the two biggest dials on most bills.
+
+Read the price page as data with an expiry date. A promotional price, a price change on a new model version, or a new long-context tier can move your cost per task by 2× overnight. Store prices in config with a "last checked" date, and reconcile your estimates against the provider's usage export every month.
+
+## Cost-per-task modelling
+
+Providers bill per call. Your business pays per task: one answered question, one graded essay, one resolved ticket. A task is usually several calls (a router, retrieval, the main generation, a verifier, a background extraction), and some tasks fail and get retried. **Cost per task** is the number that belongs on a dashboard and in a pricing discussion.
+
+```text
+cost_per_attempt = Σ over calls in the task: call_cost(call)
+cost_per_success = cost_per_attempt × (1 + retry_rate) / success_rate
+cost_per_user_month = tasks_per_user_month × cost_per_success
+```
+
+The useful shortcut for capacity and pricing conversations is **cost per 1K requests**. With prices in dollars per million tokens, 1,000 requests of `T` tokens is `T / 1,000` million tokens, so:
+
+```text
+cost per 1K requests = (T_in / 1,000) × p_in + (T_out / 1,000) × p_out
+```
+
+A RAG answer with 4,000 input tokens and 400 output tokens at illustrative $3 / $15 costs `4 × 3 + 0.4 × 15 = $18` per 1K requests, or 1.8 cents each. Swap in today's prices and you have the real figure in your head.
+
+### A routed task, worked
+
+Take a chat turn shaped like Memory Agent's: a small-model planner, then a writer whose model depends on the turn type, with web searches inside the writer call. Illustrative prices: small model $0.10 / $0.50, mid model $2 / $10, large model $4 / $20, $0.01 per search.
+
+```python
+PRICES = {"small": (0.10, 0.50), "mid": (2.0, 10.0), "large": (4.0, 20.0)}   # illustrative
+def c(model, t_in, t_out): p = PRICES[model]; return (t_in * p[0] + t_out * p[1]) / 1e6
+
+ROUTES = {  # share of turns, writer model, writer tokens in/out, searches
+    "smalltalk": (0.30, "small", 2_000, 150, 0),
+    "search":    (0.60, "mid",  12_000, 600, 3),
+    "recheck":   (0.10, "large", 15_000, 800, 4),
+}
+FAST_PATH = {"smalltalk"}          # a regex skips the planner for these
+
+def turn_cost(route):
+    share, model, t_in, t_out, searches = ROUTES[route]
+    planner = 0 if route in FAST_PATH else c("small", 600, 150)
+    return planner + c(model, t_in, t_out) + searches * 0.01
+
+avg = sum(ROUTES[r][0] * turn_cost(r) for r in ROUTES)
+for r in ROUTES: print(r, round(turn_cost(r), 4))
+print("blended per turn", round(avg, 4), "per 1K turns", round(avg * 1000, 2))
+print("all-large per turn", round(c("large", 12_000, 600) + 3 * 0.01, 4))
+```
+
+The blended cost is dominated by the search route, because it is both common and mid-priced, and the searches themselves cost as much as the tokens. Sending every turn to the large model would roughly double the search route's token cost and multiply small talk by about forty. The model shows you where a change pays: a 10% cut in search-route input tokens is worth more than any change to small talk.
+
+### What makes the model wrong in practice
+
+- **Hidden calls.** A discarded speculative call, a judge, a background extractor or a retry that is not in the estimate. Every call must go through one place that records usage, or the estimate is a lower bound.
+- **Averages hide tails.** Agent tasks have heavy-tailed cost: most runs take three steps, a few take thirty, and because history is re-sent each step, input grows faster than linearly with steps ([the agent loop chapter](/22-agent-loop/#stop-conditions-and-budgets) shows the formula). Track p50 and p95 cost per task, and cap the maximum.
+- **Price tables drift.** An estimate from a hand-kept price table can be off by a factor of two from the invoice. Calibrate against billed usage, and when a gateway reports the actual charge per call, prefer it over your table.
+
+[Chapter 31](/31-cost-and-latency-engineering/#unit-economics-per-task-user) takes unit economics further: per-user cost, margins and budget alerts.
+
+## Model selection workflow
+
+"Which model should we use?" has a repeatable answer, and it is not "the one at the top of the leaderboard". It is: the cheapest model that passes your own eval for this task type, within your latency and data constraints, chosen by measurement and written down.
+
+The workflow:
+
+1. **Write the constraints first.** Quality bar (pass rate on your eval), latency SLO (p95 TTFT and total time), cost ceiling per task, context length needed, modalities (images, audio), tool use and structured output reliability, data residency and retention terms, and whether you need open weights.
+2. **Build the eval set before shortlisting.** Fifty to a few hundred real or realistic cases with pass criteria, covering the hard cases and the failure modes you care about. [Chapter 19](/19-evals-methodology/#building-eval-sets) covers how.
+3. **Shortlist across tiers.** One or two frontier models, one or two mid-tier, one small model, and an open-weights option if self-hosting or residency is on the table. Hard constraints (residency, context length) remove candidates before any eval.
+4. **Run every candidate through the same harness.** Same prompts (adapted only where a model needs it), same judge, same scoring, several repeats. Record pass rate, p50 and p95 latency, and cost per task from the usage fields.
+5. **Pick per task type, not per app.** Routing chat, search and verification to different models is often both cheaper and better than one model everywhere.
+6. **Write down the table and the date.** The next model launch triggers a re-run, not a debate.
+
+```python
+results = [  # from your eval harness; repeat runs averaged
+    {"model": "large", "pass": 0.74, "p95_s": 14.0, "usd_task": 0.061},
+    {"model": "mid",   "pass": 0.73, "p95_s": 9.1,  "usd_task": 0.024},
+    {"model": "small", "pass": 0.61, "p95_s": 6.8,  "usd_task": 0.003},
+    {"model": "open-70b-selfhost", "pass": 0.66, "p95_s": 8.0, "usd_task": 0.008},
+]
+BAR = {"pass": 0.70, "p95_s": 10.0, "usd_task": 0.05}
+NOISE = 0.03          # pass rates closer than this are a tie at your sample size
+
+ok = [r for r in results if r["pass"] >= BAR["pass"] and r["p95_s"] <= BAR["p95_s"]
+      and r["usd_task"] <= BAR["usd_task"]]
+best = max(r["pass"] for r in ok)
+choice = min((r for r in ok if r["pass"] >= best - NOISE), key=lambda r: r["usd_task"])
+print(choice["model"])     # "mid": large is not measurably better and fails the latency bar
+```
+
+The `NOISE` term matters. With an eval set of 100 cases, a pass rate of 0.73 versus 0.74 is one case: noise. The next section shows how to size that margin.
+
+Think of it as a **Pareto frontier**: plot quality against cost per task, drop any model another beats on both axes, and pick where your quality bar crosses the frontier.
+
+Production traps: choosing on a demo of five prompts; choosing the biggest model "to be safe"; never re-running when cheaper models arrive; and comparing models through prompts tuned for one of them (give each candidate a short adaptation pass).
+
+## Reading benchmarks critically
+
+Public benchmarks are useful for building a shortlist and almost useless for the final decision.
+
+**What a benchmark score is.** A fixed set of tasks, a prompt format, a scoring rule and a harness, run by someone. Change any of the four and the number moves. The same model can gain or lose several points from few-shot formatting, whether chain-of-thought is allowed, the answer-extraction regex, or the agent scaffold around it.
+
+The questions to ask of any number:
+
+- **Who ran it?** Self-reported launch numbers use the vendor's best harness. Independent evaluations with a fixed harness are more comparable.
+- **Is it contaminated?** Test questions leak onto the web and into training data. When Zhang et al. (2024) built GSM1k, a fresh set of grade-school maths problems in the style of GSM8K, some models scored noticeably lower on it than on the original, a sign of memorization. See [benchmarks and contamination](/19-evals-methodology/#benchmarks-and-contamination).
+- **Is it saturated?** When top models all score in the high 90s, differences are mostly noise and label errors.
+- **pass@1 or pass@k, one attempt or best of many?** A coding score with many samples and a verifier is not the score you get from one call.
+- **What does it measure?** A multiple-choice knowledge test says little about tool-calling reliability, and nothing about your domain or your language.
+- **Preference leaderboards.** Chatbot Arena (Chiang et al., 2024; now LMArena) ranks models by crowd pairwise votes. It measures what people prefer in open chat, which rewards style, length and formatting as well as correctness. "The Leaderboard Illusion" (Singh et al., 2025) argued that private testing of many variants before public release skews such rankings.
+
+### Is the difference even real?
+
+A benchmark accuracy is a proportion, so it has a standard error:
+
+```text
+SE = sqrt(p × (1 − p) / n)
+p = 0.80, n = 500   ->  SE = sqrt(0.16 / 500) ≈ 0.018   ->  95% CI ≈ ±3.5 points
+p = 0.80, n = 100   ->  SE = 0.04                       ->  95% CI ≈ ±7.8 points
+```
+
+Two models at 81% and 79% on a 500-question benchmark are not distinguishable from that number alone. Your own 100-case eval set has error bars of about ±8 points, which is why you run repeats, prefer paired comparisons (both models on the same cases, count where they differ), and treat small gaps as ties. Run-to-run variance from sampling adds to this: the same agent on the same scenarios can pass a different number of cases on two runs.
+
+```python
+from math import comb
+
+def paired_sign_test(a_only: int, b_only: int) -> float:
+    """Cases where only A passed vs only B passed. Two-sided p-value."""
+    n, k = a_only + b_only, min(a_only, b_only)
+    return min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+print(paired_sign_test(9, 4))    # ~0.27: A looks better, but it could easily be chance
+print(paired_sign_test(18, 4))   # ~0.004: now it is a real difference
+```
+
+The rule: use public benchmarks to decide which three to five models to test, and your own eval to decide which one to ship.
+
+## Gateways and multi-provider abstraction
+
+Once you call more than one model, or call one model from more than one feature, the same cross-cutting needs appear in every call site: keys, retries, fallbacks, timeouts, cost accounting, logging, rate limiting, caching, and the mapping from "the model this feature should use" to a concrete model id. A **gateway** (also called an LLM proxy or router) is the one place that owns them.
+
+```text
+ features                       gateway                          providers
++-----------+   alias:       +-------------------------+      +--------------+
+| chat      | "chat-fast" -> | resolve alias -> chain  | ---> | provider A   |
+| grading   | "grader"    -> | auth, quotas, rate limit|      | model a-1    |
+| extract   | "extractor" -> | retries + jitter        | ---> | provider B   |
++-----------+   + feature tag| fallback on outage      |      | model b-2    |
+                             | usage -> cost ledger    | ---> | self-hosted  |
+                             | traces, redaction       |      | vLLM         |
+                             +-------------------------+      +--------------+
+```
+
+It can be a library in your process, a sidecar or service you run (LiteLLM's proxy is the common open-source one), or a managed service (OpenRouter and the cloud vendors' AI gateways). What it does for you is the code below, plus format translation between provider APIs.
+
+```ts
+type Call = { alias: string; feature: string; messages: { role: string; content: string }[] };
+type Target = { provider: string; model: string; inPerM: number; outPerM: number };
+type Result = { text: string; inTok: number; outTok: number };
+type Provider = (model: string, c: Call, signal: AbortSignal) => Promise<Result>;
+
+const ALIASES: Record<string, Target[]> = {          // pinned versions, ordered fallback chain
+  "chat-fast": [{ provider: "a", model: "a-small-2026-05-01", inPerM: 0.1, outPerM: 0.5 },
+                { provider: "b", model: "b-mini-0815", inPerM: 0.15, outPerM: 0.6 }],
+};
+const retryable = (e: any) => [408, 429, 500, 502, 503, 529].includes(e?.status) || e?.name === "TimeoutError";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function complete(c: Call, providers: Record<string, Provider>, ledger: any[]) {
+  for (const t of ALIASES[c.alias]) {                 // next target only when this one is down
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await providers[t.provider](t.model, c, AbortSignal.timeout(30_000));
+        const usd = (r.inTok * t.inPerM + r.outTok * t.outPerM) / 1e6;
+        ledger.push({ feature: c.feature, alias: c.alias, ...t, inTok: r.inTok, outTok: r.outTok, usd });
+        return r;
+      } catch (e: any) {
+        if (!retryable(e)) throw e;                   // bad request, auth, refusal: do not retry or fall back
+        const retryAfter = Number(e?.headers?.["retry-after"]) * 1000;
+        await sleep(retryAfter || Math.random() * Math.min(20_000, 500 * 2 ** attempt));   // full jitter
+      }
+    }
+  }
+  throw new Error(`all targets failed for ${c.alias}`);
+}
+```
+
+Three decisions in that sketch matter more than the code. **Aliases** decouple features from model ids, so a migration is a reviewed config change. **Only availability errors fall back**: a malformed request, an auth error or an out-of-credit error will fail identically on the next provider, and a refusal or a parse failure is a quality problem, not an outage. **Every call writes a ledger row with a feature tag**, which is how you later answer "which feature is spending the money?"
+
+### Where abstraction leaks
+
+Providers are not interchangeable behind a common interface. Message formats, tool-call schemas, structured-output modes, streaming event formats, prompt-caching controls, reasoning-effort settings, and which sampling parameters each model accepts all differ, sometimes between models of the same vendor. A lowest-common-denominator gateway throws away the features that save the most money (prompt caching) or make output reliable (native structured output). A fallback model also needs its own prompt adaptation and its own eval pass; an untested fallback is a quality incident waiting for an outage. And the gateway itself becomes a dependency on the hot path: it adds a few milliseconds, needs its own redundancy, and holds every key, so treat it as critical infrastructure.
+
+## Routing and cascades
+
+Most traffic is easier than your hardest case. Routing and cascades exploit that by sending each request to the cheapest model that can handle it.
+
+- **Routing** decides before the call. A classifier (rules, a small model, an embedding nearest-neighbour, or a learned router) labels the request and picks a model. RouteLLM (Ong et al., 2024) trains routers on human preference data to choose between a strong and a weak model per query.
+- **A cascade** decides after the call. Try the cheap model; check its answer with a verifier (a schema check, a confidence score, a rule, a judge); escalate to a stronger model only if the check fails. FrugalGPT (Chen, Zaharia and Zou, 2023) studied cascades across LLM APIs and showed large cost savings at similar quality on their tasks.
+
+The arithmetic is simple and worth saying out loud. With a cheap model costing `c_s`, a strong model `c_l`, a verifier `c_v`, and an acceptance rate `a` (share of requests the cheap answer passes):
+
+```text
+cascade cost per request = c_s + c_v + (1 − a) × c_l
+cascade beats "always strong" when  c_s + c_v < a × c_l
+example: c_s = 0.1, c_v = 0.05, c_l = 1.0 (relative units)
+         a = 0.7  ->  0.15 + 0.3 = 0.45 of the strong-only cost
+         break-even acceptance  a > 0.15
+```
+
+Latency moves the other way for escalated requests: they pay the cheap call plus the strong call. If 30% of requests escalate and each escalation adds two seconds, p95 latency can get worse even while the average cost falls.
+
+```python
+def cascade(prompt, cheap, strong, verify, log):
+    draft = cheap(prompt)
+    ok, reason = verify(prompt, draft)          # schema valid? cites sources? confidence high?
+    log({"route": "cheap" if ok else "escalated", "reason": reason})
+    return draft if ok else strong(prompt)
+
+def route(intent: str) -> str:                  # routing: decide first, from a cheap classification
+    return {"smalltalk": "small", "search": "mid", "recheck": "large"}.get(intent, "mid")
+```
+
+The danger in both is the **false accept**: the router sends a hard request to the small model, or the verifier passes a wrong cheap answer, and the user gets a worse answer silently. Measure it: on your eval set, compare the routed system's pass rate with the strong model's, broken down by route, and watch the escalation rate in production (a sudden drop often means the verifier broke, not that traffic got easier). Also note that an LLM-based router is itself a call with its own latency; a rules-based fast path in front of it for obvious cases (greetings, exact commands) is cheap and common. Tactics for production cost cutting are in [chapter 31](/31-cost-and-latency-engineering/#routing-and-cascades).
+
+## Rate limits, quotas, batch APIs
+
+Hosted providers protect shared capacity with limits, and at scale your throughput is set by those limits as much as by your code. Typical dimensions (names and values vary; read your account's limits page):
+
+- **Requests per minute (RPM).**
+- **Input tokens per minute and output tokens per minute (TPM)**, sometimes combined, sometimes with cached tokens counted differently.
+- **Concurrent requests**, and for some products a daily or monthly spend cap.
+- **Tiers.** Limits rise with spend history, so a new account at launch has its lowest limits.
+
+When you exceed a limit you get HTTP 429, usually with a `retry-after` header and headers describing remaining quota. Overload on the provider's side shows up as 5xx codes (some providers use 503 or 529 for "overloaded"). These are different situations: a 429 is your quota and will clear on schedule; an overload is their capacity and may last minutes.
+
+### Size it before launch
+
+```text
+needed input TPM  = peak requests/sec × 60 × input tokens per request
+10M req/day, 3× peak: 116 × 3 ≈ 350 req/s  ->  350 × 60 × 1,500 ≈ 31.5M input tokens/min
+```
+
+If your tier allows a small fraction of that, no retry logic will save the launch. Request a limit increase or provisioned throughput weeks ahead, or split traffic across regions or providers.
+
+### Retry without making it worse
+
+A naive retry loop turns a short overload into a **retry storm**: every client retries at the same moments, the provider stays overloaded, and your own queue grows. The fixes are standard distributed-systems practice ("Exponential Backoff and Jitter", AWS Architecture Blog, 2015):
+
+- **Exponential backoff with full jitter**: wait a random time between zero and `min(cap, base × 2^attempt)`, so clients spread out.
+- **Honour `retry-after`** when the provider sends it.
+- **A retry budget**: cap retries as a share of traffic (say 10%), so retries cannot multiply load during an incident.
+- **Do not retry what cannot succeed**: 400s, auth errors, and out-of-credit errors.
+- **Client-side rate limiting**: a token bucket in your gateway that keeps you under your TPM, so you queue locally instead of collecting 429s.
+
+```python
+import random, time
+
+class TokenBucket:
+    def __init__(self, tokens_per_min: float):
+        self.rate, self.cap = tokens_per_min / 60, tokens_per_min
+        self.level, self.t = tokens_per_min, time.monotonic()
+    def take(self, n: int):                       # block until n tokens of quota are available
+        while True:
+            now = time.monotonic()
+            self.level = min(self.cap, self.level + (now - self.t) * self.rate); self.t = now
+            if self.level >= n: self.level -= n; return
+            time.sleep((n - self.level) / self.rate)
+
+def backoff(attempt, base=0.5, cap=20.0, retry_after=None):
+    return retry_after if retry_after else random.uniform(0, min(cap, base * 2 ** attempt))
+```
+
+Per-tenant quotas belong in the same layer: one customer's bulk import should not consume the whole account's TPM and starve everyone else. Give interactive traffic priority over background jobs.
+
+### Batch APIs
+
+Much LLM work does not need an answer in seconds: running eval suites, backfilling summaries, re-classifying a corpus, generating synthetic data. **Batch APIs** accept a file of requests and return results asynchronously, commonly within a day, at a substantial discount (often around half the normal price; check). They also usually run against a separate limit pool, so they do not compete with live traffic. The trade-offs: no latency guarantee, partial failures you must reconcile request by request, and a results file to join back to your records by a custom id. Move every job that can wait into a batch path. See [batch APIs in chapter 31](/31-cost-and-latency-engineering/#batch-apis).
+
+## Data residency, confidential inference
+
+Every API call ships your prompt, which may include user messages, retrieved documents and personal data, to someone else's computer. Three questions decide whether that is acceptable.
+
+**Where is it processed and stored?** Data residency rules (from a customer contract, a sector regulator, or a law) may require that data stays in a country or region. India's Digital Personal Data Protection Act, 2023 governs personal data processing, and government buyers often add their own requirements about where data may be hosted. Options, from most to least convenient: a provider's regional processing option, the same model served through a cloud platform in your region (several frontier models are available through the major clouds' model services), a hosted open-weights model in-region, or self-hosting. Note that the RAG pipeline usually moves more data than the generation call: embedding every chunk with a hosted embedding API, or sending every candidate passage to a hosted reranker, is a permanent, high-volume flow of your documents.
+
+**How long is it kept, and is it used for training?** API terms typically differ from consumer apps: many providers do not train on API data by default but retain it for some period for abuse monitoring, and offer zero-data-retention arrangements for eligible customers. Defaults differ by provider and change over time. Read the current data-usage and retention terms, get the contractual answer in writing for regulated data, and record which features send what to whom.
+
+**Can the provider see it while processing?** In principle yes: the data is decrypted in their memory. **Confidential inference** narrows that. The model runs inside a trusted execution environment (CPU enclaves plus GPU confidential-computing modes, which recent datacenter GPUs support), the data is encrypted except inside it, and the client verifies a hardware **attestation** that proves which code is running before sending anything. Apple's Private Cloud Compute (2024) applied this idea to a consumer assistant, and Anthropic's "Confidential Inference" report (2025) describes how a model provider can design for it. It is still an emerging option; ask a vendor what is actually attested, not whether they "support confidential computing".
+
+What you control in your own code today:
+
+```python
+import re
+PATTERNS = {   # order matters: match the 12-digit Aadhaar before a 10-digit phone eats part of it
+    "aadhaar": r"\b\d{4}\s?\d{4}\s?\d{4}\b",
+    "email": r"[\w.+-]+@[\w-]+\.[\w.]+",
+    "phone_in": r"(?:\+91[\s-]?)?\b[6-9]\d{9}\b"}
+
+def redact(text: str):
+    found = {}
+    for name, pat in PATTERNS.items():
+        for i, m in enumerate(re.findall(pat, text)):
+            tag = f"[{name.upper()}_{i}]"; found[tag] = m; text = text.replace(m, tag)
+    return text, found          # send `text`; re-insert `found` locally if the answer needs it
+```
+
+Plus the basics of **key management**: keys live in a secret manager, never in client code or the repo; one key per environment and per service so a leak is contained and spend is attributable; rotation without a deploy; a spend cap on each key; and alerts on unusual spend, which is often the first sign a key has leaked.
+
+## Deprecation and migration
+
+Hosted models have a lifespan. Providers publish deprecation and retirement dates, and after retirement calls to that model id fail. Even before that, a model can change under you in two ways:
+
+- **Aliases move.** Many providers offer a floating name that points to the latest snapshot and a dated or versioned id that stays fixed. Code that calls the floating name gets a new model on the provider's schedule, with no change on your side, and with new behaviour: different formatting, different refusal patterns, different parameter support.
+- **Parameters and features change.** A newer or smaller model may reject a parameter the old one accepted, or accept it with different effect.
+
+So **pin versions in production**, behind your own alias (`"grader"` maps to an exact model id), and treat changing that mapping as a release. For embeddings the stakes are higher: a new embedding model's vectors are not comparable to the old one's, so the whole corpus must be re-embedded, and the model id should be stored with every vector so a mismatch is detectable.
+
+### The migration checklist
+
+1. **Inventory.** From gateway logs, list every feature and call site that uses the model, with volume and cost. Unlogged direct calls are the ones that break on retirement day.
+2. **Shortlist the replacement** with the [selection workflow](#model-selection-workflow), including the vendor's recommended successor.
+3. **Run the full eval suite** on the candidate. Diff per case, not only the aggregate: a migration that keeps the pass rate but fails different cases changes which users get hurt.
+4. **Adapt prompts and parameters** for the new model, then re-run. Re-calibrate anything tuned to the old model's outputs: judge thresholds, confidence cut-offs, parsers, max-token limits (a model that writes longer answers gets truncated).
+5. **Shadow traffic.** Send a sample of real requests to both, compare offline. Then a canary: a small percentage of live traffic on the new model, with quality, error-rate and cost dashboards split by model.
+6. **Roll out with a rollback switch** (the alias), and only retire the old mapping after the new one has run cleanly for a while.
+
+```python
+def migration_report(cases, old, new, grade):
+    rows = [(c["id"], grade(c, old(c)), grade(c, new(c))) for c in cases]
+    regressed = [i for i, o, n in rows if o and not n]
+    fixed = [i for i, o, n in rows if n and not o]
+    print(f"old {sum(o for _, o, _ in rows)}/{len(rows)}  new {sum(n for _, _, n in rows)}/{len(rows)}")
+    print("regressed:", regressed)          # read every one of these before shipping
+    print("fixed:", fixed)
+    return len(regressed) <= len(fixed) and not any(c.get("critical") for c in cases if c["id"] in regressed)
+```
+
+The failure that bites hardest is the silent one: the new model rejects a parameter, the error is caught by a generic fallback, and users get a degraded template answer with no alarm. Make every fallback path log and count, and alert when the fallback rate moves. [Chapter 32](/32-deployment-and-llmops/#model-upgrade-regression-management) covers regression management across releases.
+
+<Production>
+
+**Failure modes.** Provider outages (a tested fallback chain across providers or regions, with an eval-passed fallback model). 429 storms at launch or during a backfill (client-side token bucket, retry budget, full jitter, batch on a separate pool). Silent behaviour change when a floating alias moves (pin dated versions behind your own alias). A new model rejecting a parameter and dropping every call into a generic fallback (alert on fallback rate).
+
+**Cost.** Know the break-even for your volume, `selfhost_daily / api_cost_per_request`, with GPUs sized for peak, spares and people included, and the open model passing the same eval. Track cost per successful task (p50 and p95) per feature. Thinking tokens, cache misses and search fees are the usual surprises. Reconcile estimates with the usage export monthly.
+
+**Latency.** Regional latency: serve from a region near users and near your data; a cross-continent round trip adds on the order of a couple of hundred milliseconds. Self-hosted cold starts are dominated by weight loading (`bytes / read bandwidth`), so keep warm capacity. Cascades and fallbacks add latency to the requests they touch; watch p95, not the mean.
+
+**Observability.** Per provider and per model: request count, error rate by status code (429 vs 5xx vs 4xx), p50 and p95 TTFT and total latency, tokens in, out, cached and thinking, and spend. Per feature: cost per task and fallback and escalation rates. Alert on spend anomalies, fallback-rate jumps and rising 429s before they become an outage.
+
+**Security.** Read each vendor's data-retention and training terms and record them per feature; prefer zero-retention or in-region options for personal data; redact before sending. Keys in a secret manager, one per service and environment, spend caps on every key, rotation without deploys, never in the browser or the repo. The gateway holds every key, so lock it down and log access to it.
+
+</Production>
+
+<Interview>
+
+<Q q="API or self-host for 10M requests/day? Walk through the math.">
+
+- Ask for token shapes first: say 1,500 input and 300 output tokens. That is 15,000M input and 3,000M output tokens per day; about 116 req/s average, around 350 at a 3× peak.
+- API: `15,000 × p_in + 3,000 × p_out` dollars per day. At illustrative frontier prices ($3 / $15) that is about $90K a day; at small-model prices ($0.10 / $0.40) about $2.7K a day.
+- Self-host: peak output is about 104K tokens/s. At a load-tested 1,000 tok/s per GPU, about 104 GPUs plus spares (say 120); at an illustrative $2.50 an hour that is about $7.2K a day, plus two or three engineers.
+- Conclusion: self-hosting beats a frontier API by about 10× at this volume, and loses to a small-model API. Break-even is `selfhost_daily / api_cost_per_request`.
+- The condition: only valid if an open model you can serve passes the same eval as the API model. Then add utilization (traffic shape), cold starts, residency, fine-tuning needs and on-call cost.
+- Mention the middle options: hosted open-weights per token, dedicated endpoints, batch APIs for the non-interactive share.
+- **The trap:** comparing an API price to a GPU-hour at 100% utilization, ignoring peak sizing, people and the quality gap.
+
+</Q>
+
+<Q q="How do you choose a model for a new feature?">
+
+- Write constraints first: quality bar, p95 latency, cost ceiling per task, context length, modality, tool use, residency and retention.
+- Build a task eval set before shortlisting (50 to a few hundred cases with pass criteria, including hard cases).
+- Shortlist across tiers using public benchmarks only as a filter; hard constraints remove candidates early.
+- Run all candidates through the same harness, several repeats; record pass rate, p50 and p95 latency and cost per task from usage fields.
+- Choose the cheapest model whose pass rate is within noise of the best and meets the latency bar; consider routing different task types to different models.
+- Keep the results table with a date and re-run it on every model launch or price change.
+- **The trap:** "the top of the leaderboard" or "the biggest model to be safe", chosen from a handful of demo prompts.
+
+</Q>
+
+<Q q="How do you make your app resilient to a provider outage?">
+
+- All calls go through one gateway with model aliases, so a failover is config, not code.
+- Classify errors: 429 and 5xx/overloaded and timeouts are retryable; 4xx, auth, out-of-credit, refusals and parse failures are not and should not fall back.
+- Retries with exponential backoff and full jitter, honour `retry-after`, and a retry budget so retries cannot amplify load.
+- After N failures, fall back to a second provider or region running a model that has passed your eval with its own adapted prompt; a circuit breaker stops hammering a dead provider.
+- Degrade gracefully when everything fails: a cached answer, a simpler path, or a clear message, never a hang.
+- Test failover regularly (inject faults), and alert on per-provider error rate and fallback rate.
+- **The trap:** "we'll just switch to another provider" with no tested fallback prompt, no eval on the fallback model, and retries that turn an overload into a storm.
+
+</Q>
+
+<Q q="How do you migrate safely when a model is deprecated?">
+
+- Pin dated versions behind your own aliases so nothing changes without a release; track deprecation dates.
+- Inventory every call site and its volume from gateway logs.
+- Run the full eval on candidates, diff per case (regressed vs fixed), not just the aggregate.
+- Adapt prompts and parameters, re-calibrate thresholds and parsers, check parameter support (a rejected parameter can silently push traffic into a fallback).
+- Shadow traffic, then a canary with dashboards split by model, then roll out with the alias as a rollback switch.
+- For embeddings, store the model id per vector and plan a full re-embed with dual indexes during the switch.
+- **The trap:** changing the model string on retirement day and watching the aggregate score only.
+
+</Q>
+
+<Q q="Design an LLM gateway with routing, caching and fallbacks.">
+
+- **Scope and SLOs:** internal service for all features; added latency under about 10 ms at p95; availability higher than any single provider; every call attributed to a feature and tenant.
+- **Architecture:** stateless gateway replicas behind a load balancer; config store for aliases (alias to ordered list of pinned provider/model targets), prices, quotas; provider adapters translating one internal request format.
+- **Routing:** per-alias static routing plus optional rules or a small classifier for routed aliases; cascades as an opt-in policy with a verifier hook.
+- **Caching:** pass through provider prompt caching (keep native cache controls; do not flatten them away); exact-match response cache for deterministic calls; semantic cache only per feature and with a measured false-hit rate.
+- **Fallbacks and limits:** error classification, jittered retries with a retry budget, circuit breakers per provider, token-bucket rate limiting per tenant and per provider key, priority for interactive over batch.
+- **Observability and cost:** one trace span per call with tokens (in, out, cached, thinking), cost, latency, status and fallback reason; dashboards per provider, model and feature; spend alerts.
+- **Evals:** every target in an alias chain, fallbacks included, has passed the feature's eval with its own adapted prompt; an alias change is a reviewed config change that re-runs that eval in CI and goes out behind a canary.
+- **Security:** keys only in the gateway via a secret manager, redaction hooks, per-feature data policies (which providers a feature may use).
+- **The trap:** a lowest-common-denominator interface that drops prompt caching and structured output, or a gateway that is itself a single point of failure.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Put a small gateway in front of two "providers" in **Memory Agent** (`~/memory-agent`), which today wires the Anthropic SDK directly with model ids in `src/config.ts`. Everything runs offline: the two providers are two local models served by Ollama (for example `qwen2.5:3b` and `llama3.2:3b`) through Ollama's OpenAI-compatible endpoint, plus a mock provider that fails on demand.
+
+1. Create `src/gateway.ts` with a `complete(call)` function. A call has an `alias`, a `feature` tag and messages. Aliases map to an ordered list of targets, each with a provider, a pinned model id and illustrative prices.
+2. Implement two providers: `ollama` (POST to `http://localhost:11434/v1/chat/completions`) and `flaky`, a mock that returns 429 with a `retry-after`, 503, or a 400 according to an environment variable or a seeded random rate.
+3. Add error classification, retries with exponential backoff and full jitter honouring `retry-after`, a retry budget, and fallback to the next target only on availability errors.
+4. Write one ledger row per call: feature, alias, provider, model, tokens in and out from the usage fields, estimated cost, latency, attempt count and fallback reason. Print a per-feature cost summary at the end of a run.
+5. Pin every alias to an exact model id (an Ollama tag such as `qwen2.5:3b`, never `latest`), and add a test that fails if any alias uses an unpinned id.
+6. Test with the mock provider: a 429 then success retries once with the advertised delay; three 503s fall back to the second target; a 400 neither retries nor falls back; the ledger has one row per call with the right feature tag.
+
+Definition of done: `npx tsx --test` passes with no network access beyond localhost; a 100-call run with the flaky provider at 30% failure completes with every call answered, a printed fallback rate, and a per-feature cost table; changing one alias in config moves a feature to the other model without code changes.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent chooses models by measurement.** `DECISIONS.md` (decision 2) has a table running the same scenarios and judge with Opus-only, Sonnet-only, Haiku-only and routed writers: Opus everywhere passed 7/10 at a 10.5 s median, Haiku everywhere 6/10 at 5.3 s and failed all three re-checks, and the routed setup passed 7 to 8 out of 10 at about 6.6 to 6.9 s. `src/agent.ts` (lines 173 to 175) routes by the Haiku planner's intent, and a regex fast path (`src/fastpath.ts`) skips the planner for small talk. In an interview this is your model-selection and routing story, with real numbers.
+- **Memory Agent's cost per turn, and why price tables drift.** `src/agent.ts` sums the planner estimate, writer tokens with cache reads discounted, and a per-search fee (lines 230 to 233) from a hand-kept price table (lines 18 to 24). `DESIGN.md` admits the estimates ran at least 2× high against the console and proposes calibrating against the usage export. Say both halves: you modelled cost per task, and you learned to reconcile with the bill. The discarded speculative call is not in the estimate. Check one line before you quote it: the formula subtracts `0.9 × cacheRead` from `input_tokens`, but Anthropic's `input_tokens` already excludes cache reads, so the right form is `input + 0.1 × cacheRead` (at that model's cache-read rate, plus cache writes at their premium). Fixing that is a concrete calibration story.
+- **Answer Grader has a real fallback policy and a cost ledger.** `backend/llm.py` falls back to a second provider after `LLM_FALLBACK_AFTER` (default 2) overload failures, and only for unavailability: an unparseable reply, a refusal or an out-of-credit error does not fall back. `_is_retryable` refuses to retry credit exhaustion and `_backoff_seconds` prefers the provider's own retry delay. It can route the same Gemini model through OpenRouter, and the per-evaluation ledger prefers OpenRouter's reported charge over its `PRICES` table, recording `cost_source` and counting unpriced calls. The comment on `PRICES` notes a promotional price that will change, which is exactly why prices belong in config with a date.
+- **Chat Insights is your migration story.** Its provider abstraction (`backend/src/lc/services/llm/index.js`) switches between Gemini and Anthropic by config. Commit `5a289f8` ("Let the Anthropic provider run on Haiku") records that pointing it at a Haiku model turned every reply into the canned template: the provider always sent `effort: low`, that model returned 400, and the existing fallback did not recognise the error. The fix withholds effort from Haiku up front and drops it on a 400 that names it. The lesson for interviews: parameter support differs between models, and a quiet fallback hides migrations that break.
+- **Scheme Assistant's `claude files/MODELS.md` is a residency and selection document.** It keeps embeddings and the reranker self-hosted (BGE-M3, bge-reranker-v2-m3) because they would send every chunk and every candidate passage abroad, leaves the production generator behind an `LLMClient` interface as a config flag pending the department's residency decision, and names the dev/prod gap of developing on local Qwen2.5 and shipping a hosted model. `src/app/core/providers.py` builds either a Gemini or an Ollama client.
+- **Gaps to name honestly.** None of your repos uses a batch API, and none has a shared gateway with aliases, a circuit breaker or per-feature cost tags across providers; Memory Agent has no fallback provider and no rate limit on its paid endpoint. Your configs use ids like `claude-opus-5` (Chat Insights's default) and `claude-haiku-5-5` (Memory Agent). Recent Anthropic models have only these undated ids, where older ones had a short alias pointing at a dated snapshot (`claude-haiku-4-5` and `claude-haiku-4-5-20251001`); confirm on the models page what each id guarantees before you claim version pinning, and pin the behaviour you rely on with your own eval. The Apply-it gateway in Memory Agent closes the first gap.
+
+</YourProject>

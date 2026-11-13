@@ -1,0 +1,511 @@
+---
+id: "24"
+title: "Planning and Reasoning in Agents"
+summary: "Decide when an agent should plan before it acts, represent plans as structured data that code validates, run them as dependency graphs, replan and verify when they break, and measure whether planning paid for itself."
+readingTime: "25 min"
+---
+
+Give a [ReAct agent](/22-agent-loop/#react-loop) the task "compare the cheapest paid plan of eight project-management tools and recommend one for a team of twelve". It searches for the first tool, reads the page, thinks, searches for the second, and so on. By the sixth tool the context holds five pricing pages, the model has half-forgotten that the team size was twelve, and two tools never get searched because the step budget ran out. Nothing went wrong in any single step. The task failed because nobody decided up front what the whole job looked like.
+
+Planning makes that decision explicit: before acting, describe the steps, their order and dependencies, then act against them. It is not free. A plan costs a model call and adds delay before the first useful action. It is written before the agent has seen anything, so it can be wrong in ways a step-by-step agent would have noticed. And a plan the model writes in prose is a wish list unless something checks that it was followed.
+
+This chapter treats planning as an engineering choice with a cost: when to plan, how to represent a plan so code can check it, how to replan and verify, and how to tell from data whether the planner earns its latency. It assumes the [agent loop](/22-agent-loop/#react-loop), [structured output](/13-structured-output/#pydantic-zod-validation) and [test-time compute](/08-reasoning-models/#self-consistency-and-best-of-n) chapters.
+
+## Planning vs reacting
+
+A **reactive** agent is a policy over history: given everything so far, pick the next action. ReAct is the standard form. A **planning** agent first produces an artefact (a list, a graph or a program of steps) and then executes against it. Most systems sit between the two, and naming where is half the design:
+
+| Level | What the plan is | Who enforces it | Example |
+|---|---|---|---|
+| 0. No plan | nothing; next step chosen each turn | nobody | plain ReAct |
+| 1. Plan as advice | text placed in the executor's context | the executor, if it wants to | "suggested searches: ..." |
+| 2. Plan as checklist | a todo list the agent updates | the harness checks it before stopping | coding agents' task lists |
+| 3. Plan as contract | a validated list or DAG of tool calls | code runs it step by step | ReWOO, LLMCompiler |
+| 4. Plan as program | code written by a model or a human | an interpreter | CaMeL, deterministic planners |
+
+Moving down the table buys predictability, parallelism and checkability, and gives up the ability to react to what the agent finds.
+
+### When a plan pays
+
+- **Many independent steps.** Eight vendors to price are eight searches that can fan out in parallel instead of running one at a time.
+- **Long horizons.** A plan written down and re-read keeps the goal in view as the context grows.
+- **A decision before acting.** A cost estimate, a human approval, or a guarantee that the tool calls are fixed before untrusted data is read.
+- **Repeated structure.** If every request of a type has the same shape, plan it once (or in code).
+
+Reacting pays for **exploration** (debugging, open research, anything where step 3 depends on what step 2 found, so a plan written earlier is a guess) and for **short tasks**, where the planning call costs as much as the work.
+
+### The token arithmetic
+
+ReAct re-sends the growing history on every call. With a fixed prompt of P tokens, each observation adding o tokens, and n steps, the input tokens are roughly:
+
+```text
+ReAct input  ≈ n·P + o·(0 + 1 + ... + (n-1)) = n·P + o·n(n-1)/2
+
+P = 2,000, o = 500, n = 8:
+  8·2,000 + 500·28 = 16,000 + 14,000 = 30,000 input tokens
+
+Plan-then-execute (one planner call, workers that see only their step, one solver call):
+  planner  ≈ P + plan output           ≈ 2,000 + 300
+  workers  ≈ 8 tool calls, no model    ≈ 0   (or 8 small calls of ~300 each = 2,400)
+  solver   ≈ P + all observations      ≈ 2,000 + 8·500 = 6,000
+  total    ≈ 8,300 to 10,700 input tokens
+```
+
+Planning removes the quadratic term: workers never re-read each other's observations. ReWOO (Xu et al., 2023) reports about 5x token efficiency on HotpotQA against interleaved reasoning, with a small accuracy gain. Compute P, o and n from your own traces rather than quoting 5x.
+
+<Callout type="tip">
+
+Default to a workflow you can draw. If you cannot draw it because the steps depend on content, use ReAct with a budget. Add an explicit planner when traces show the agent wandering, repeating searches or forgetting part of the goal, not before.
+
+</Callout>
+
+## Plan-then-execute
+
+The pattern has three roles. A **planner** reads the task and emits a plan. An **executor** runs the steps: often plain code calling tools, sometimes a cheap model per step. A **solver** (or synthesiser) reads the task and the step results and writes the answer. The planner does not see observations, the executor does not reason about the whole task, and the solver sees everything once.
+
+Plan-and-Solve prompting (Wang et al., ACL 2023) is the single-call version: a zero-shot prompt asking the model to devise a plan of subtasks and then carry it out, aimed at the missing-step errors of plain "let's think step by step". ReWOO (Xu et al., 2023) is the multi-call version: the planner writes steps whose arguments reference earlier results as variables (`#E1`, `#E2`), workers fill them in, and a solver combines them. ReWOO also tuned a much smaller model for the planner role.
+
+### Plans as structured output that code validates
+
+A plan in prose is advice. A plan as JSON against a schema is something your code can check before a single tool runs. The checks are cheap and catch the classic planner failures: a tool that does not exist, a reference to a step that has not run, too many steps, or a plan whose estimated cost exceeds the budget.
+
+```python
+import json
+
+TOOLS = {"search": 0.01, "fetch_page": 0.0, "extract_price": 0.002}   # USD per call
+MAX_STEPS, BUDGET_USD = 10, 0.15
+
+def llm_plan(task: str) -> str:            # mocked planner call (cheap model, schema-enforced)
+    return json.dumps({"steps": [
+        {"id": "E1", "tool": "search", "args": {"q": "site:notion.so pricing"}},
+        {"id": "E2", "tool": "fetch_page", "args": {"url": "#E1.top_url"}},
+        {"id": "E3", "tool": "extract_price", "args": {"page": "#E2", "plan": "Plus"}},
+    ]})
+
+def validate(plan: dict) -> list[str]:
+    errs, seen = [], set()
+    steps = plan.get("steps", [])
+    if not 1 <= len(steps) <= MAX_STEPS:
+        errs.append(f"{len(steps)} steps; allowed 1-{MAX_STEPS}")
+    for s in steps:
+        if s["tool"] not in TOOLS:
+            errs.append(f"{s['id']}: unknown tool {s['tool']}")
+        for v in map(str, s["args"].values()):
+            if v.startswith("#") and v[1:].split(".")[0] not in seen:
+                errs.append(f"{s['id']}: uses {v} before it exists")
+        seen.add(s["id"])
+    cost = sum(TOOLS.get(s["tool"], 0) for s in steps)
+    if cost > BUDGET_USD:
+        errs.append(f"estimated ${cost:.3f} > budget ${BUDGET_USD}")
+    return errs
+
+plan = json.loads(llm_plan("Notion Plus price per seat"))
+print(validate(plan) or "plan ok")
+```
+
+When validation fails, send the error list back to the planner once (the [repair loop](/13-structured-output/#retry-and-repair-loops)), and if it fails again fall back to a safe default plan or to ReAct. Use schema-enforced output so the tool name is an enum and cannot be invented in the first place.
+
+### A planner is a separate, usually cheap, call
+
+The planner's job is often easier than the executor's (classify the request, list entities, draft queries), which suits a small fast model with thinking off. Its cost is latency: it runs first, so its time lands on time-to-first-token. A deterministic **fast path** skips it for obviously simple requests, and **speculative execution** starts the likely executor alongside it and keeps the output only if the plan agrees. Both appear in Memory Agent.
+
+### Trade-offs and failure
+
+Plan-then-execute is blind by construction: if step 2 shows the "Plus" plan no longer exists, step 3 still asks for it, which is why you need [replanning](#replanning). Its bonus is security: with the plan fixed before untrusted content is read, injected text can change values (still dangerous when a value is a recipient) but not add a "send email" step ([security chapter](/33-security-prompt-injection/#architectural-defences-dual-llm-camel-plan-then-execute)).
+
+## Decomposition and todo lists
+
+Decomposition is the core skill a planner provides: break a task into subtasks small enough that each one can be done and checked. Least-to-Most prompting (Zhou et al., 2022) showed the value in reasoning tasks: first reduce the problem to a sequence of simpler subproblems, then solve them in order, each answer feeding the next. In agents the subtasks become tool calls or sub-agent jobs, and their relationships become a **dependency graph**.
+
+### Plans as DAGs
+
+Write each step with the ids it depends on. If the graph has no cycles, a topological sort gives you **layers**: every step in a layer depends only on earlier layers, so the whole layer can run in parallel. LLMCompiler ("An LLM Compiler for Parallel Function Calling", Kim et al., 2023, ICML 2024) built exactly this: a planner emits a task graph, a dispatcher runs tasks as soon as their dependencies resolve, and a joiner decides whether to answer or replan. Against ReAct it reports up to 3.7x lower latency and up to 6.7x lower cost on its benchmarks.
+
+```python
+import asyncio
+
+async def run_dag(steps: dict[str, dict], run_tool) -> dict[str, object]:
+    """steps: id -> {"tool":..., "args":..., "deps": [ids]}"""
+    done: dict[str, object] = {}
+    pending = dict(steps)
+    while pending:
+        ready = [i for i, s in pending.items() if all(d in done for d in s["deps"])]
+        if not ready:
+            raise ValueError(f"cycle or missing dependency among {sorted(pending)}")
+        results = await asyncio.gather(
+            *(run_tool(pending[i]["tool"], pending[i]["args"], done) for i in ready),
+            return_exceptions=True)
+        for i, r in zip(ready, results):
+            done[i] = r            # exceptions are kept as results; the solver must see them
+            del pending[i]
+    return done
+
+steps = {f"P{k}": {"tool": "search", "args": {"vendor": v}, "deps": []}
+         for k, v in enumerate(["notion", "linear", "asana", "clickup", "trello"])}
+steps["CMP"] = {"tool": "compare", "args": {}, "deps": list(steps)}
+```
+
+The latency arithmetic is the critical path. Five independent searches at about 3 s each plus a 2 s comparison take 5·3 + 2 = 17 s in sequence and 3 + 2 = 5 s as a DAG. Add the planner's own latency (say 2 s) and the DAG still wins at 7 s. With one search the planner is pure overhead.
+
+### Todo lists: the plan the agent keeps re-reading
+
+Long tasks (a change across a repo, a research report) cannot be specified as a DAG up front, so harnesses give the model a **todo list**: items with a status, written early and updated as it goes. Claude Code began with a `TodoWrite` checklist, replaced it with `TaskCreate`/`TaskUpdate`/`TaskList`/`TaskGet` (status plus dependencies), and by late 2026 leaves them off by default on its newest models, which track multi-step work without a written list and save the context the tool definitions cost (check the current tools reference). Two mechanisms make it work:
+
+- **Recitation.** Rewriting the list puts the goal and remaining steps at the end of the context, where attention is strongest: [structured note-taking](/27-context-engineering/#structured-note-taking).
+- **A stop gate.** The harness can refuse to end the task while items are open, turning "declared victory early" into a checkable condition.
+
+```ts
+type Status = "pending" | "in_progress" | "done" | "blocked";
+type Todo = { id: string; text: string; status: Status; doneWhen: string; note?: string };
+
+export function applyUpdate(list: Todo[], next: Todo[]): string | null {
+  if (next.filter((t) => t.status === "in_progress").length > 1) return "only one item may be in progress";
+  for (const t of next) {
+    if (!t.doneWhen.trim()) return `${t.id}: every item needs a done-when check`;
+    if (t.status === "blocked" && !t.note) return `${t.id}: say why it is blocked`;
+  }
+  const dropped = list.filter((o) => o.status !== "done" && !next.some((n) => n.id === o.id));
+  if (dropped.length) return `open items removed without being done: ${dropped.map((d) => d.id).join(", ")}`;
+  return null; // accepted
+}
+
+export function mayStop(list: Todo[]): boolean {
+  return list.every((t) => t.status === "done" || (t.status === "blocked" && !!t.note));
+}
+```
+
+### Granularity
+
+A good step is small enough to verify and big enough to be worth a call. "Research competitors" has no way to tell when it is done; "extract the per-seat monthly price of each vendor's cheapest paid plan from its pricing page" does. Planners over-decompose when asked open-endedly, so cap the step count in the schema and the prompt, as the [orchestrator](/22-agent-loop/#orchestrator-workers-evaluator-optimizer) does.
+
+## Tree/graph search
+
+A single plan is one sample from the model. If plans vary in quality and you can score them, sampling several and keeping the best is the cheapest form of search. The research versions go further.
+
+- **Tree of Thoughts** (Yao et al., 2023) treats each intermediate "thought" as a node. The model proposes several next thoughts, a model-based evaluator scores them, and breadth-first or depth-first search with pruning explores the tree. On the Game of 24 puzzle, the abstract reports GPT-4 with chain-of-thought solving 4% of tasks and Tree of Thoughts 74%.
+- **Graph of Thoughts** (Besta et al., 2023) allows thoughts to be merged and refined, not only branched, which suits tasks like combining partial sorts or summaries.
+- **LATS** ("Language Agent Tree Search", Zhou et al., 2023) runs Monte Carlo Tree Search over agent actions, with model-based value estimates, self-reflection and, crucially, real feedback from the environment.
+
+All of them need a **value function** that says which partial plan is better, and search is only as good as that scorer. With a weak one, more search mostly spends more money.
+
+### The cost arithmetic
+
+```text
+Branching factor b, depth d.
+Full tree:   b + b² + ... + b^d nodes      b=3, d=3: 3 + 9 + 27 = 39 nodes
+Each node:   1 generation + 1 evaluation   ≈ 78 model calls
+Beam search (keep k per level): b + (d−1)·k·b generations, as many evaluations
+             k=2, b=3, d=3: 15 + 15 = 30 calls
+Best-of-N plans, scored by code:  N calls  (N=5: 5 calls, no evaluator calls)
+```
+
+Against one planner call, a full tree is two orders of magnitude more expensive and slower, which is why tree search lives in offline jobs, benchmarks and high-value tasks, not in a chat turn.
+
+### The practical form: best-of-N plans with a code scorer
+
+[Self-consistency](/08-reasoning-models/#self-consistency-and-best-of-n) applied to plans: sample N plans at a non-zero temperature, drop the invalid ones, and pick by a score you can compute.
+
+```python
+def pick_plan(task, sample_plan, validate, est_cost, n=5):
+    candidates = []
+    for _ in range(n):                       # in production: run these in parallel
+        p = sample_plan(task, temperature=0.8)
+        if validate(p):                      # non-empty error list = invalid
+            continue
+        score = (len(p["covered_entities"]) * 10   # coverage of what the task names
+                 - len(p["steps"])                 # prefer shorter
+                 - est_cost(p) * 100)              # prefer cheaper
+        candidates.append((score, p))
+    if not candidates:
+        return None                          # caller falls back to ReAct or a default plan
+    return max(candidates, key=lambda c: c[0])[1]
+```
+
+A reasoning model already explores and backtracks inside one call, so explicit tree search on top of it rarely pays in production.
+
+## Reflexion
+
+Search explores alternatives within one attempt. Reflexion learns across attempts. In "Reflexion: Language Agents with Verbal Reinforcement Learning" (Shinn et al., 2023), an agent attempts a task, receives a signal (a failed unit test, a wrong answer, a stuck environment), writes a short verbal reflection on what went wrong, stores it in an episodic memory, and tries again with the reflections in its prompt. No weights change. The abstract reports 91% pass@1 on HumanEval against 80% for GPT-4 alone.
+
+[Reflection](/22-agent-loop/#reflection) without an external signal often does not help (Huang et al., 2023); Reflexion works because it has one. The planning point is that a useful reflection is about the plan: "I assumed the API returns everything in one page; it paginates, so the plan needs a loop step" generalises. "Be more careful" does not.
+
+```python
+def reflexion(task, attempt, evaluate, reflect, max_trials=3, max_lessons=3):
+    lessons: list[str] = []
+    for trial in range(1, max_trials + 1):
+        out = attempt(task, lessons=lessons)          # plan + execute, lessons in the prompt
+        ok, feedback = evaluate(out)                  # tests, env reward, validator: NOT the model
+        if ok:
+            return out, {"trial": trial, "lessons": lessons}
+        lesson = reflect(task, out, feedback)         # "the plan missed X because Y; next time Z"
+        lessons = (lessons + [lesson])[-max_lessons:] # keep the newest few; old ones go stale
+    return out, {"trial": max_trials, "status": "failed", "lessons": lessons}
+```
+
+### Where it fits in production
+
+Inside a request, Reflexion multiplies latency and cost by the number of trials, so it suits tasks with a cheap automatic evaluator: code with tests, transformations with a checker, batch jobs. Across requests it becomes [procedural memory](/23-memory/#episodic-semantic-procedural-stores): lessons from failed traces turn into planner rules, often written by a human reading the failures, which is Reflexion with you as the reflector. It fails through contradictory lessons, lessons overfitted to one task, and a lesson store nobody prunes.
+
+## Replanning
+
+A plan is a prediction about how the task will go. Replanning is what happens when the prediction is wrong. Do it too rarely and the agent executes a dead plan; do it on every step and you have rebuilt ReAct with an extra call per step.
+
+### Triggers worth replanning on
+
+- **A step failed** after its own retries (the tool errored, the page is gone).
+- **An assumption broke.** The observation contradicts something the plan relied on: the "Plus" plan no longer exists, the file is not where the plan said.
+- **The budget is at risk.** Steps cost more than estimated, and the remaining plan will not fit in what is left.
+- **New information arrived** from the user or a verifier ("the comparison is missing Asana").
+
+Make the second trigger checkable: each step can carry an `assumes` field ("pricing page lists per-seat price") that the executor tests against the observation.
+
+### Mechanism
+
+Keep what worked. Send the planner the original goal, the current plan, the completed steps with their results (summarised if long), and the reason for replanning, and ask for the remaining steps only. Validate the new plan exactly as you validated the first. Cap the number of replans.
+
+```python
+def execute_with_replanning(task, planner, validate, run_step, budget, max_replans=2):
+    plan, done, replans = planner(task, done=[], reason=None), [], 0
+    while plan:
+        step = plan.pop(0)
+        if budget.remaining() < step["est_cost"]:
+            reason = f"budget: {budget.remaining():.3f} left, step needs {step['est_cost']:.3f}"
+        else:
+            ok, result = run_step(step)
+            if ok:
+                done.append((step, result)); continue
+            reason = f"{step['id']} failed: {result}"
+        if replans == max_replans:
+            return {"status": "partial", "done": done, "stopped_because": reason}
+        replans += 1
+        new = planner(task, done=done, reason=reason)       # remaining steps only
+        if validate(new):
+            return {"status": "partial", "done": done, "stopped_because": "invalid replan"}
+        plan = new
+    return {"status": "complete", "done": done, "replans": replans}
+```
+
+Note the honest exit: when replanning runs out, return a partial result that says what was not done.
+
+### Stale plans and plans that ignore budgets
+
+A **stale plan** was right when written and is wrong now, for example a job planned yesterday whose tool has since changed. Store the plan's creation time and tool versions, and re-validate before resuming from a [checkpoint](/22-agent-loop/#long-running-agents-checkpointing-resumability). A **budget-blind plan** asks for ten searches when four are allowed. Put the budget in the planner's prompt, estimate the plan's cost in code, and reject it before execution.
+
+## Verification
+
+Planning gets you a structure; verification tells you whether the structure was followed and whether the result is right. There are three layers, in decreasing order of trust:
+
+1. **Code checks.** Schema validation, unit tests, a number in the answer that must appear in a cited source, a date computed by a library. Deterministic, cheap, and they do not share the model's blind spots.
+2. **Environment checks.** The command exited 0, the HTTP call returned 200, the file now exists, the test suite passes.
+3. **Model checks.** A judge, ideally a different model or at least a different prompt with different information, scoring against explicit criteria. Necessary for open-ended quality, and the weakest of the three.
+
+Checking is often easier than doing (confirming a price is on a page is easier than finding it), but do not lean on the model checking itself. Kambhampati et al. ("LLMs Can't Plan, But Can Help Planning in LLM-Modulo Frameworks", ICML 2024) argue that autoregressive models cannot reliably self-verify plans, and that the verifiers should be external.
+
+### Verify steps and the whole
+
+Each plan step should carry a **done-when** postcondition the executor can test, and the final answer should be checked against the original goal (coverage: did it address every entity and every part of the question?). A step without a checkable postcondition is an **unverifiable step**, and it is where agents quietly fail.
+
+```python
+CHECKS = {
+    "fetch_page":    lambda step, r: r.get("status") == 200 and len(r.get("text", "")) > 500,
+    "extract_price": lambda step, r: r.get("price") is not None and str(r["price"]) in r.get("evidence", ""),
+    "write_file":    lambda step, r: r.get("exists") and r.get("bytes", 0) > 0,
+}
+
+def verify_step(step, result) -> bool:
+    check = CHECKS.get(step["tool"])
+    if check is None:
+        raise ValueError(f"no postcondition for {step['tool']}: unverifiable step")
+    return bool(check(step, result))
+
+def verify_final(goal_entities: list[str], answer: str) -> list[str]:
+    return [e for e in goal_entities if e.lower() not in answer.lower()]   # missing coverage
+```
+
+### Plan conformance
+
+A separate question is "did the executor do what the plan said". If the plan asked for three sections and a verdict, count the sections and look for the verdict. Crude, cheap checks on every request make a dashboard: if conformance drops after a model upgrade, the executor stopped following plans. Decide per check whether a failure triggers a repair, a fallback or only a metric.
+
+The trap is that a verifier creates confidence. Measure its recall on known-bad outputs, as you would [validate a judge](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans).
+
+## Planning with reasoning models
+
+Reasoning models change where planning happens. A model that thinks before answering already decomposes, tries alternatives and backtracks inside its hidden reasoning, so a hand-built Plan-and-Solve prompt or a tree search on top of it often adds little. The [reasoning-models chapter](/08-reasoning-models/#when-reasoning-helps-vs-hurts) covers when that thinking helps; with tools, [interleaved thinking](/08-reasoning-models/#interleaved-thinking-with-tools) blurs plan and act further, since the model can rethink after every tool result.
+
+What remains is an economic pattern: **an expensive reasoning model plans once, a cheap model executes many steps**. The planner makes the hard decisions (what to do, in what order, what counts as done) and writes them into a structured plan precise enough that a small model, or plain code, can carry each step out.
+
+### The arithmetic
+
+Let the strong model cost S per call for this task size and the cheap model C, with N executor steps:
+
+```text
+All strong:            (1 + N)·S                 (planner + every step on the big model)
+Strong plan, cheap run: S + N·C
+Saving:                 N·(S - C)
+
+Example with a price ratio S = 20·C and N = 10:
+  all strong      = 11·20C = 220C
+  split           = 20C + 10C = 30C       → about 7x cheaper
+```
+
+Tier price ratios change; check the current price pages and redo the sum. Reasoning tokens are billed as output, so a planner that thinks for 8,000 tokens can cost more than all the executor calls together. Cap its thinking budget.
+
+### Put the strong model where the hard decision is
+
+If planning is easy (classify, list entities) and execution is hard (a careful, sourced answer), invert the split: cheap planner, strong executor, as Memory Agent does. Which step a weaker model fails on is a question for an eval, not intuition.
+
+### Prompting the planner and failure modes
+
+Give a reasoning planner the goal, constraints, tools with their costs and the output schema, not the steps. It fails by **overthinking** simple requests, by writing **plans too subtle for the executor** ("use judgement on ambiguous rows"), and through **unchecked handoff**, where the executor silently does something else. Ask for steps with explicit inputs, outputs and done-when checks, and route any step that fails verification back to the strong model.
+
+## Neuro-symbolic
+
+The research evidence on LLMs as standalone planners is sobering. PlanBench (Valmeekam et al., NeurIPS 2023 Datasets and Benchmarks) built plan-generation problems from classical planning-competition domains and found state-of-the-art models performed poorly. The response is to let each side do what it is good at: the model translates messy language into a formal problem and proposes candidates, and symbolic code solves, checks or computes.
+
+- **LLM+P** (Liu et al., 2023) has the model translate a natural-language planning problem into PDDL (the standard planning-problem language), runs a classical planner to get an optimal plan, and translates it back.
+- **LLM-Modulo** (Kambhampati et al., 2024) is a generate-and-test loop: the model proposes plans, a bank of external critics (hard constraint checkers, cost models, style critics) accept or reject them with feedback, and the loop repeats until a plan passes.
+
+Few product teams write PDDL, but most use the humbler form: **the model proposes, code disposes**. Dates, arithmetic, budgets and constraint checks go to code; the model handles language. Extract constraints as structured output, then solve them deterministically:
+
+```python
+def llm_extract(msg: str) -> dict:                # mocked: schema-enforced extraction
+    return {"people": ["asha", "ravi"], "duration_h": 1,
+            "busy": {"asha": [(9, 11), (14, 15)], "ravi": [(10, 12)]},
+            "window": (9, 18)}
+
+def free_slot(c: dict) -> tuple[int, int] | None:  # code, not the model, does the scheduling
+    lo, hi = c["window"]
+    for start in range(lo, hi - c["duration_h"] + 1):
+        end = start + c["duration_h"]
+        clash = any(s < end and start < e
+                    for p in c["people"] for (s, e) in c["busy"].get(p, []))
+        if not clash:
+            return start, end
+    return None
+
+print(free_slot(llm_extract("Find an hour for Asha and Ravi tomorrow")))   # (12, 13)
+```
+
+The extreme case is a deterministic planner: when the rules are known, write them as code and skip the planning model. The trade-off is that code covers only what you formalised, and translation becomes the new failure point: extract Ravi's meeting as 10 to 11 instead of 10 to 12 and the solver confidently books a clash. Validate the extraction and, when stakes justify it, show it to the user.
+
+## Evaluating plans
+
+"The answers look more organised" is not a measurement. Evaluate at three levels, following the [outcome vs trajectory split](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory).
+
+**Outcome.** Task success with and without the planner on the same tasks and checks, plus cost per successful task and p50/p95 latency: two points of success for two seconds of latency may not be worth it.
+
+**Plan quality**, scored on the plan itself before execution:
+- **Validity rate:** share of plans that parse and pass validation on the first try.
+- **Coverage:** share of the task's entities and sub-questions that some step addresses.
+- **Efficiency:** steps (or estimated cost) relative to a reference plan or the cheapest successful plan seen.
+- **Constraint satisfaction:** for tasks with hard constraints (budget, dates, ordering), the share satisfied. TravelPlanner (Xie et al., ICML 2024) is the cautionary benchmark: its abstract reports GPT-4 reaching a success rate of only 0.6% on multi-constraint travel plans.
+
+**Execution against the plan**, from logs: **adherence** (planned steps executed, unplanned steps added), **replan rate**, and **verification pass rate per step type**.
+
+```python
+import json
+
+def adherence(planned: list[dict], executed: list[dict]) -> dict:
+    key = lambda s: (s["tool"], json.dumps(s["args"], sort_keys=True))
+    p, e = [key(s) for s in planned], [key(s) for s in executed]
+    followed = sum(1 for k in p if k in e)
+    return {"planned": len(p), "followed": followed,
+            "skipped": len(p) - followed, "unplanned": sum(1 for k in e if k not in p),
+            "adherence": followed / len(p) if p else 1.0}
+```
+
+### Noise
+
+The standard error of a success rate p over n tasks is √(p(1−p)/n); at p = 0.6 and n = 20 that is √(0.24/20) ≈ 0.11, so 12/20 rising to 14/20 is noise. Run each arm several times, compare paired on the same tasks, and read the traces of the tasks that flipped ([sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+<Production>
+
+**Failure modes.**
+- Over-planning: a planning call and ten steps for a request that needed one search.
+- Plans never revisited: the executor follows a dead plan after step 2 broke an assumption; stale plans resumed after tools changed.
+- Unverifiable steps ("research the market") that cannot fail, so never get fixed.
+- Planner hallucinations (unknown tools, references to outputs not yet produced), caught by schema enums and a validator; silent partial completion when four of six branches succeed.
+
+**Cost.** A planner is one extra call per task, plus one per replan (cap it). Tree search multiplies calls: a full tree with b = 3, d = 3 is about 78 calls against 1. Plan-then-execute removes ReAct's quadratic re-reading (n·P + o·n(n−1)/2), which can pay for the planner on long tasks; a strong planner with a cheap executor costs S + N·C, not (1 + N)·S.
+
+**Latency.** Planning adds an upfront delay that lands on time-to-first-token. Mitigations: a fast path that skips the planner for obvious requests, a small planner with thinking off, speculative execution, and DAG execution so latency is the critical path, not the sum.
+
+**Observability.** Log the plan as a structured artefact on the trace, and each executed step with a pointer to the planned step it implements. Dashboards: plan validity, adherence, replan rate and reasons, verification failures by step type, planner p50/p95 latency, fast-path hit rate.
+
+**Security.** Plan-then-execute is an injection defence when the plan is fixed before untrusted data is read: injected text can change values but cannot add steps. It weakens when tool outputs can trigger replanning, because then a fetched page can influence the next plan; treat replanning on untrusted content as an untrusted input to the planner, and keep consequential sinks (send, pay, delete) behind provenance checks or approval ([architectural defences](/33-security-prompt-injection/#architectural-defences-dual-llm-camel-plan-then-execute)).
+
+</Production>
+
+<Interview>
+
+<Q q="Plan-then-execute vs ReAct: trade-offs?">
+
+- ReAct picks each step after the last observation: adaptive, good for exploration, but it re-reads the growing history every call and drifts on long tasks.
+- Plan-then-execute commits first: parallel independent steps, cost and approval checked before acting, no re-reading of other steps' results, tool sequence fixed before untrusted data arrives.
+- Cost formula to quote: ReAct input ≈ n·P + o·n(n−1)/2; plan-then-execute is roughly linear in n. ReWOO (2023) reported about 5x token savings on HotpotQA; LLMCompiler (2023) reported up to 3.7x lower latency against ReAct via a parallel DAG.
+- Its weakness is blindness: a plan written before step 2 cannot react to step 2. Fix with replanning on explicit triggers (step failure, broken assumption, budget), capped.
+- **The trap:** saying planning is always better, or that ReAct "doesn't plan". The right answer depends on whether later steps depend on what earlier steps find.
+
+</Q>
+
+<Q q="How do you make an agent verify its own work?">
+
+- Do not rely on the model checking itself; self-critique without external signal often fails to improve and can flip right answers (Huang et al., 2023; Kambhampati et al., 2024).
+- Layer checks by trust: code (schemas, tests, numbers that must appear in sources, computed dates), environment (exit codes, HTTP status, file exists), then a model judge with different information and explicit criteria.
+- Give every plan step a done-when postcondition; treat a step without one as unverifiable and redesign it.
+- Check the whole against the goal: coverage of every entity and sub-question, plan conformance (did it do what the plan said).
+- On failure: one bounded revision with the specific failures, then a visible partial or fallback.
+- Validate the verifier: measure its recall on known-bad outputs, because a verifier that misses errors creates false confidence.
+- **The trap:** "add a second LLM call that asks if the answer is correct" with no external signal and no measurement of what that judge misses.
+
+</Q>
+
+<Q q="How would you use a reasoning model as planner and a cheap model as executor?">
+
+- Reasoning model makes the hard decisions once: decomposition, order, dependencies, done-when checks; output is schema-enforced JSON with tool names as enums.
+- Code validates the plan (tools exist, references resolve, step cap, estimated cost under budget) before anything runs.
+- Cheap model (or code) runs each step with only its inputs; independent steps run in parallel.
+- Arithmetic: all-strong costs (1 + N)·S; split costs S + N·C. With S = 20C and N = 10, 220C against 30C. Cap the planner's thinking tokens: they bill as output.
+- Escalation: if a step fails verification twice, rerun that step on the strong model or trigger a replan.
+- Say when to invert it: if planning is easy and execution is hard, use a cheap planner and a strong executor; decide by eval which step the weak model fails.
+- **The trap:** sending a vague prose plan to a small model and assuming it follows it; without structure and per-step checks, adherence silently drops.
+
+</Q>
+
+<Q q="A plan becomes invalid halfway through execution. What does your agent do?">
+
+- Detect it: step failure after retries, an explicit assumption that the observation contradicts, budget overrun, or a verifier failure.
+- Keep completed steps and their results; send the planner goal, current plan, results so far and the reason, and ask for remaining steps only.
+- Validate the new plan as strictly as the first; cap replans (one or two) and the total budget.
+- If the cap is hit, return a partial result that names what was not done, rather than a confident answer.
+- **The trap:** replanning after every step (that is ReAct with an extra call per step) or never replanning and executing a dead plan.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** add an explicit todo-list plan and a verifier step to an agent, and A/B it against a plain ReAct loop on 20 multi-step tasks. Do it in **Memory Agent** (`~/memory-agent`), next to `src/agent.ts`, building on the hand-rolled loop from the [agent-loop chapter](/22-agent-loop/#react-loop) if you built it. Run everything offline: either a local model through Ollama (a 7B to 8B instruct model that supports tool calls or JSON output) or a mocked model function plus mocked tools, so no paid API is called.
+
+1. **Tasks.** 20 multi-step tasks with checkable answers over mocked tools: a fake `search` and `fetch_page` over a fixture of vendor pricing pages, and a calculator. Mix sizes: 5 tasks of 1 to 2 steps, 10 of 3 to 5, 5 with six or more independent entities. Store the expected values.
+2. **Baseline.** A ReAct loop with a step cap and a token budget. Record success, calls, tokens, wall time and the trace.
+3. **Planner.** A planner call returning a Zod `Plan`: steps with `id`, `tool` (enum), `args`, `deps`, `doneWhen`. Validate in code (tools exist, references resolve, at most 10 steps, cost under budget); one repair attempt, then fall back to ReAct.
+4. **Executor and todo list.** Run the plan as a DAG; keep a todo list and refuse to finish while items are open.
+5. **Verifier.** Per-tool postconditions in code (page fetched, price present in the page text, arithmetic recomputed) and a final coverage check. One replan on a verification failure.
+6. **Measure.** Both arms, three runs each. Report success with its standard error, tokens, p50/p95 latency, plan validity, adherence and replan rate; read the traces of the tasks that flipped.
+
+**Definition of done:** a script that runs both arms offline and prints one table (success, tokens, p50/p95 latency, validity, adherence, replans) per arm; a short note in `DECISIONS.md` stating on which task sizes planning helped, hurt or made no difference, with the flipped tasks named; and at least one test with a fake model that proves the stop gate refuses to finish with an open todo item.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent has a real planner, and you wrote it.** `src/planner.ts` defines a `Plan` Zod schema (`intent` as an enum of `smalltalk`, `memory_only`, `recheck`, `search`, `clarify`, plus `entities`, `search_queries`, `topic_keywords`, `clarify_question`) and calls `messages.parse` with `zodOutputFormat(Plan)` on `config.fastModel` (Haiku) with thinking disabled and low effort. In `src/agent.ts` the planner is awaited before the writer, its output becomes a plain-text "planner note" (`planNote`: turn type, entities, "Suggested searches (run in parallel, adjust as needed)"), and any planner failure except an auth or billing error falls back to `fallbackPlan`, which defaults to search. That is level 1 in the table: the plan is advice to the writer, not a contract.
+- **Memory Agent is the inverted split: cheap planner, routed executor.** The intent picks the writer model (`config.models` in `src/config.ts`); `DECISIONS.md` #2 has the eval table: routed Haiku/Sonnet/Opus passed 7 to 8 of 10 scenarios at 6.6 to 6.9 s median, against Opus everywhere at 7/10 and 10.5 s. The search budget is planned too, `min(maxSearchesCap, max(maxSearchesPerTurn, entities + 2))`, after a flat cap of 6 made an eight-product question skip two products (#8).
+- **Memory Agent shows the planner's latency cost and two mitigations.** `src/fastpath.ts` skips the roughly 2 s planner for whole-message small talk with a deliberately narrow regex; `src/gate.ts` holds a speculative writer's events until the plan agrees. The speculative writer is off by default in `src/config.ts` because its quality effect is unmeasured: say so plainly.
+- **Answer Grader plans in code, then checks conformance, and it is your code.** `backend/answer_plan.py` has no model call: `plan_answer` splits the question into asks, routes by paper family, sets openings, closings, points per block and whether a verdict is required, using rules derived from 624 hand-labelled topper answers; `to_prompt` renders it for the model, and `check` (imported as `plan_check` in `backend/model_answer.py`) counts body sections against planned blocks, flags an unasked way-forward section and a missing verdict, and stores the result on the run as `plan_check`. That is a deterministic planner plus plan conformance, the neuro-symbolic end of this chapter.
+- **Scheme Assistant's multi-scheme fan-out is a teammate's code you should be able to defend.** In `src/app/core/retrieval.py`, a question naming two or more schemes reruns every retrieval leg per scheme and shares the fused top-n between them: a fixed decomposition in code. The reply gate `summary_failures` in `generate.py` (every number must occur in a cited clause) is a code verifier. Blame gives the fan-out to Chiman and splits `summary_failures` between you and him; say "our pipeline".
+- **Gaps to name honestly.** No repo replans (Memory Agent plans once per turn, with a default plan on failure) or executes a plan as a DAG (Memory Agent's parallel searches run inside one provider-side web-search call). Memory Agent records `intent` and `planMs` per turn, but its eval cases have no labelled intent, so planner accuracy is unmeasured; a 30-row labelled intent set would fix that.
+
+</YourProject>

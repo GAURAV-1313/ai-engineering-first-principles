@@ -1,0 +1,809 @@
+---
+id: "32"
+title: "Deployment and LLMOps"
+summary: "Ship and change an LLM system safely: version prompts and models as release artifacts, roll changes out through eval gates, shadow traffic and canaries, run long jobs on queues and streams that survive deploys, and protect paid endpoints with rate limits, timeouts, circuit breakers and failover."
+readingTime: "34 min"
+---
+
+A normal web service changes when you deploy new code. An LLM service also changes when someone edits a prompt, when a provider moves a model alias, when the retrieval index is rebuilt, or when a threshold in an env var is nudged. None of those show up as a failing test. The service still returns HTTP 200; the answers are just worse, or longer, or more expensive, and you find out from a user screenshot a week later.
+
+The other half of the problem is shape. A typical API request takes 50 ms and costs nothing per call. An LLM request takes 2 to 30 seconds, an agent run can take minutes, and every call spends money with a vendor whose limits, outages and deprecations you do not control. Long requests break assumptions in load balancers, proxies, deploy scripts and autoscalers that were built for short ones.
+
+LLMOps is the set of habits that handles both: treat every behaviour-changing input as a versioned release artifact, move it through environments with an eval gate and a staged rollout, run slow work where a deploy cannot kill it, and put limits, timeouts and fallbacks around every paid dependency. This chapter builds those pieces from plain code. It leans on neighbours rather than repeating them: the [gateway](/11-serving-and-model-economics/#gateways-and-multi-provider-abstraction), [provider rate limits and retries](/11-serving-and-model-economics/#rate-limits-quotas-batch-apis) and the [deprecation checklist](/11-serving-and-model-economics/#deprecation-and-migration) are in chapter 11; [eval gates in CI](/20-evals-judges-and-ci/#evals-in-ci) are in chapter 20; traces and dashboards are in [chapter 30](/30-observability/#traces-and-spans-for-llm-calls).
+
+## Reference architecture
+
+Start with the picture, because every later section is one box in it.
+
+```text
+  clients (web, mobile, extension)
+        |  HTTPS, SSE for streams
+  [edge]        TLS, auth, per-user rate limit, body size cap, WAF
+        |
+  [API]         stateless; validates, creates a job or a turn, opens the stream
+        |                         \
+        |  short turns             \  long runs
+        v                           v
+  [orchestrator]  <---------  [queue] --> [workers]  (agent runs, ingestion, batch)
+   workflow steps, budgets,                 |  checkpoints per step
+   guards, tool calls                       |
+        |                                   |
+  [LLM gateway]  aliases -> pinned models, retries, circuit breakers, fallback chain,
+        |        cost ledger, provider keys
+        v
+  providers (A, B, self-hosted)
+
+  side stores:  Postgres (users, runs, query log)   vector index   Redis (limits, streams)
+  control plane: prompt + config registry (git)   feature flags   eval service   secrets manager
+  telemetry:     traces with release id -> dashboards, sampled online evals
+```
+
+Most of this is an ordinary web stack. Four things are specific to LLM systems and drive the design.
+
+1. **Behaviour lives in data, not only in code.** Prompts, model ids, sampling parameters, retrieval settings and guard thresholds all change outputs. The **control plane** at the bottom (registry, flags, eval service) exists to version and gate them.
+2. **Requests are slow.** That changes capacity planning, deploys and proxies.
+3. **Every call costs money,** so abuse is a billing problem, not only a load problem.
+4. **Your most important dependency is outside your control.** The provider can be slow, rate-limited, down, or silently different.
+
+### Little's law sizes the box
+
+The number of requests in flight equals arrival rate times time in system: `L = λ × W`. It is the one formula you need for LLM capacity, because `W` is large.
+
+```text
+web API:   200 req/s × 0.05 s =  10 in flight
+LLM chat:  200 req/s × 8 s    = 1,600 in flight   (160× more open connections, same traffic)
+
+Scheme Assistant on Cloud Run: max 3 instances × concurrency 20 = 60 in flight
+  mean answer ≈ 6.4 s  ->  max throughput ≈ 60 / 6.4 ≈ 9.4 req/s
+  above that, requests wait briefly at the platform, then are rejected or time out
+```
+
+The Scheme Assistant numbers come from its deploy script, `scripts/deploy_cloud_run.sh`, whose header records a 9-question mean of 6.4 seconds. For LLM services the concurrency limit (connections, worker slots, instance concurrency) is usually the binding constraint, not CPU. Size it with Little's law at the real `W`, using p95 rather than the mean.
+
+The first production failures of an LLM app are rarely the model. They are a proxy that buffers the stream, a deploy that kills in-flight answers, a load-balancer timeout shorter than an agent run, an endpoint with no rate limit, or a provider outage with no fallback. The rest of the chapter takes them one at a time.
+
+## Prompts and config as code
+
+### What a release is
+
+For a normal service a release is a commit. For an LLM service a release is a tuple:
+
+```text
+release = (code sha, prompt versions, model ids + parameters, retrieval config + index version,
+           tool schemas, guard thresholds, feature-flag state)
+```
+
+If you cannot say which tuple produced an answer, you cannot reproduce a bug or roll back with confidence. So the first rule of LLMOps: **compute a release id from everything that changes behaviour, and stamp it on every trace and stored result.** It extends chapter 12's [content-addressed prompt ids](/12-prompting-fundamentals/#versioning-and-management) to the whole tuple.
+
+```python
+import hashlib, json, os, subprocess
+
+PROMPTS = {"answer": open("prompts/answer.txt").read(), "judge": open("prompts/judge.txt").read()}
+CONFIG = {
+    "models": {"answer": "provider-a/model-x-2026-05-01", "fallback": "provider-b/model-y-0815"},
+    "params": {"temperature": 0.2, "max_tokens": 800},
+    "retrieval": {"k": 8, "reranker": os.getenv("RERANKER", "none"), "index": "chunks_v14"},
+    "guards": {"abstain_below": 0.35},
+}
+
+def h(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:10]
+
+def release_manifest() -> dict:
+    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    m = {"code": sha or os.getenv("GIT_SHA", "dev"),
+         "prompts": {k: h(v) for k, v in PROMPTS.items()},
+         "config": h(CONFIG)}
+    m["release_id"] = h(m)
+    return m
+
+RELEASE = release_manifest()      # computed once at startup, logged, exposed on /health
+# every trace and stored answer gets RELEASE["release_id"], and the prompt ids it actually used
+```
+
+Expose the release id on the health endpoint and attach it to every span. Chat Insights already does a small version of this: `backend/src/lc/routes/health.js` returns `version` as the package version plus the commit sha read from the host's environment, which is exactly the **release marker** you want on dashboards.
+
+### Config vs code: three places a setting can live
+
+| Where | Changed by | Takes effect | Good for | Risk |
+|---|---|---|---|---|
+| In the repo (prompts, schemas, defaults) | PR + review | next deploy | prompts, tool schemas, model aliases | slow to change in an incident |
+| Deploy-time env vars | deploy command | next deploy or restart | provider choice, model id, timeouts, caps | drift between environments; not reviewed |
+| Runtime flags (DB or flag service) | admin UI or API | next request | kill switches, cohort rollout, percentages | bypasses review and evals unless you gate it |
+
+The rule that sorts them: **anything that changes model behaviour must pass the same eval gate, wherever it lives.** A prompt edited in a hosted prompt registry is a production change with no CI run unless you wire one in, so treat a registry publish as a deploy: run the smoke eval and require approval for the label production reads. Runtime flags earn their place for things that must change in seconds: kill switches, a percentage dial, a cohort allowlist. Chat Insights's `backend/src/lc/config.js` is a clean example of the env-var tier: one header comment documents every switch (provider, model per provider, LLM timeout, daily hint cap, `LC_KILL_LLM`, a pilot-user allowlist, a minimum extension version, the highest pedagogy rung allowed), and the parsed config is frozen so nothing mutates it at runtime.
+
+### Secrets are not config
+
+Keys live in a secrets manager, are injected at deploy or start, never sit in the repo, image, browser or prompt, and differ per environment so a leaked staging key cannot spend production quota. Scheme Assistant's deploy mounts provider keys from Google Secret Manager with `--set-secrets` rather than plain env vars. Chapter 11 has the [key-management checklist](/11-serving-and-model-economics/#data-residency-confidential-inference) (rotation, spend caps, alerts); the LLMOps addition is that the release manifest records secret names, never values.
+
+## Environments and staged rollout
+
+### What each environment is for
+
+- **Local / dev:** mocked or local models (Ollama), fixtures, fast iteration.
+- **CI:** scripted-model unit tests, offline replays, a cached tier-1 smoke eval ([tiers in chapter 20](/20-evals-judges-and-ci/#evals-in-ci)).
+- **Staging:** the same model ids, provider, region and index version as production, with its own keys and quota. It catches integration problems: a parameter the pinned model rejects, a stream a proxy buffers, a migration that locks a table.
+- **Production,** where changes arrive in stages.
+
+Staging rarely has realistic traffic, so it cannot tell you how a prompt change behaves on the long tail of real queries. That is why shadow and canary run on production traffic.
+
+### The rollout ladder
+
+```text
+PR  ->  CI: unit + tier-1 smoke eval (gate)  ->  merge
+    ->  staging deploy: smoke eval + integration checks
+    ->  shadow: candidate runs on sampled prod traffic, outputs hidden, compared offline
+    ->  canary: 1% -> 5% -> 25% -> 100%, sticky per user, guard metrics checked at each step
+    ->  bake: keep the old release one switch away for a few days
+```
+
+Not every change needs every rung. A typo fix in UI copy goes straight through. A model swap, a new system prompt or a new retrieval index goes through all of them.
+
+### Deploy is not release
+
+**Deploy** puts new code on servers; **release** routes users to new behaviour. With both versions deployed, a flag picks which one a user gets, and rollback is a flag flip in seconds, not a redeploy that might itself fail. Answer Grader does this for retrieval: `RETRIEVAL_MODE=dense` in `backend/retrieval.py` restores the previous ranking exactly, so the new ranking can be turned off without a deploy.
+
+Assignment must be **sticky** (same user, same version on every turn), so hash a stable id into a bucket.
+
+```python
+import hashlib
+
+def bucket(user_id: str, salt: str) -> float:
+    return int(hashlib.sha256(f"{salt}:{user_id}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+
+def choose_release(user_id: str, flags: dict) -> str:
+    if flags.get("kill_candidate"):
+        return flags["stable"]
+    if user_id in flags.get("allowlist", ()):          # internal users and pilot testers first
+        return flags["candidate"]
+    return flags["candidate"] if bucket(user_id, flags["salt"]) < flags["percent"] / 100 else flags["stable"]
+
+def check_canary(stable: dict, cand: dict, limits: dict) -> str:
+    """stable/cand: rolling metrics per release from traces."""
+    if cand["error_rate"] > stable["error_rate"] + limits["error_abs"]:
+        return "rollback"
+    if cand["p95_s"] > stable["p95_s"] * limits["latency_ratio"]:
+        return "rollback"
+    if cand["cost_per_turn"] > stable["cost_per_turn"] * limits["cost_ratio"]:
+        return "hold"
+    return "advance"
+```
+
+Chat Insights's pilot middleware (`backend/src/lc/middleware/pilot.js`, reading `LC_PILOT_USER_IDS`) is the allowlist rung of this ladder: an empty list means open to all, otherwise only listed users get through. Its `RENDER_MIGRATION_RUNBOOK.md` stages an infrastructure move the same way: backend, then web client, then extension, with the old host kept 24 to 48 hours as the rollback and named metrics watched at each step.
+
+### What a 1% canary can actually see
+
+Canaries catch crashes, error spikes, latency and cost regressions quickly, because those are measured on every request. Quality is slower. Suppose your quality signal is the thumbs-down rate, 5% today, and you want to detect a rise to 7%. The standard two-proportion sample size per arm, at 95% confidence and 80% power, is:
+
+```text
+n ≈ (z_α/2 + z_β)² × (p1(1−p1) + p2(1−p2)) / (p2 − p1)²
+  = (1.96 + 0.84)² × (0.05×0.95 + 0.07×0.93) / 0.02²
+  = 7.84 × (0.0475 + 0.0651) / 0.0004
+  ≈ 2,200 conversations per arm
+
+at 20,000 conversations/day:  1% canary = 200/day  -> about 11 days
+                              10% canary = 2,000/day -> about 1 day
+```
+
+So a 1% canary is a safety check for breakage, not a quality test. Quality is decided earlier, by offline evals and shadow comparisons, and confirmed with a larger split or a sampled [online judge](/20-evals-judges-and-ci/#online-evals-and-production-sampling). Saying this clearly is a strong interview signal.
+
+### Rollback, honestly
+
+- **Prompts, aliases, flags:** instant, if the old version is still deployed.
+- **Code:** redeploy the previous image. Scheme Assistant's deploy script tags images with `git rev-parse --short HEAD`, so "previous" is unambiguous.
+- **Database migrations:** not undone by redeploying. Use expand and contract: add the new shape, write both, backfill, switch reads, drop the old shape after the bake. Scheme Assistant runs migrations as a separate step (`APP_SKIP_MIGRATIONS=1` at container start, then a migrate script), so they are never a side effect of a container booting.
+- **Indexes and embeddings:** new-model vectors are not comparable with old ones, so rolling back the embedder means switching back to the old index, which works only if you kept it.
+- **Conversations in flight:** store the release id on the conversation so a user mid-conversation on prompt v3 finishes on v3.
+
+## A/B tests and shadow traffic
+
+### Shadow: real inputs, invisible outputs
+
+**Shadow traffic** (also called dark launch or mirroring) sends a copy of real requests to the candidate, discards its responses, and compares them offline with what production returned. It answers "how does the new version behave on the real distribution?" with zero user risk.
+
+```python
+import asyncio, random
+
+async def handle(req, stable, candidate, store, shadow_rate=0.05):
+    resp = await stable(req)                              # the user only ever sees this
+    if random.random() < shadow_rate and req.get("shadow_ok", True):
+        asyncio.create_task(shadow(req, resp, candidate, store))   # off the request path
+    return resp
+
+async def shadow(req, prod_resp, candidate, store):
+    try:
+        cand = await asyncio.wait_for(candidate({**req, "read_only": True}), timeout=60)
+        store.append({"id": req["id"], "input": req["text"],
+                      "prod": prod_resp["text"], "cand": cand["text"],
+                      "prod_ms": prod_resp["ms"], "cand_ms": cand["ms"],
+                      "prod_usd": prod_resp["usd"], "cand_usd": cand["usd"]})
+    except Exception as e:                                # a failing shadow must never affect users
+        store.append({"id": req["id"], "shadow_error": repr(e)})
+```
+
+A batch job then compares pairs: code checks first (schema, citations, length, refusal), then a validated [pairwise judge](/20-evals-judges-and-ci/#pairwise-vs-pointwise) in both orders, then a human read of the biggest disagreements. Four rules:
+
+- **No side effects.** The candidate must not send emails, write memory or call write tools. Stub write tools in the harness itself, not by convention.
+- **Same inputs, including context.** Record retrieved ids for both sides, or you cannot tell a retrieval change from a prompt change.
+- **Budget it.** At 20,000 requests a day and a 5% shadow rate, that is 1,000 extra calls; at ₹0.5 a call, ₹500 a day. A few hundred pairs per slice usually shows the patterns; then stop.
+- **Multi-turn is hard.** A shadow of turn three sees production's turns one and two. For conversation-level changes, replay whole conversations offline.
+
+### A/B tests: users see the variant
+
+An **A/B test** shows the candidate to a random, sticky share of users and compares product metrics: task completion, retention, escalations, cost per successful task. Use it when the question is "do users do better?", which shadowing cannot answer. Pick a metric the variant can move (quality often shows in rephrased follow-ups and abandoned sessions more than in thumbs, which few users click), watch guardrail metrics alongside (abstain rate, safety flags, cost), and control for length, since longer answers often look better at first. The power arithmetic above applies: most small products cannot power a quality A/B test in reasonable time and should say so.
+
+Before any live traffic, replay stored real inputs through both versions. Answer Grader's `scripts/eval_retrieval.py` runs three named retrieval systems over the same labelled queries; Scheme Assistant's `scripts/compare_gates.py` runs each question with a gate setting off and on. Both are offline A/B, the right first rung; neither yet feeds sampled production inputs into the comparison.
+
+## Orchestration
+
+### The problem
+
+A real request is several steps (condense, retrieve, rerank, generate, verify, store), and an agent run is an unknown number of them. Each takes seconds and can fail independently. **Orchestration** decides which step runs next, holds the intermediate state, and handles failure in the middle. Use the lowest of three levels that works:
+
+1. **In-request code,** for anything that finishes well inside the request timeout. Chat Insights's `chatService.js` runs validate, profile, contest lock, session and context in a fixed order before the model call, each able to short-circuit with a typed error.
+2. **A task queue with chained tasks,** for pipelines that take minutes. The Health Triage backend (your team's code) fans in: after each speech-to-text or OCR job, `maybe_trigger_ai` checks whether all inputs are done and uses a conditional database update as a latch, so triage is enqueued exactly once.
+3. **Durable execution** (Temporal, AWS Step Functions and similar): every step's result goes to a durable log, and a replacement worker replays it, skipping completed steps. For long agent runs, approval waits and anything that must survive deploys.
+
+### Durable execution without the framework
+
+Every step has a name; its result is stored once; re-running the workflow returns stored results instead of re-executing them.
+
+```python
+import json, sqlite3
+
+db = sqlite3.connect("runs.db")
+db.execute("CREATE TABLE IF NOT EXISTS steps (run_id TEXT, name TEXT, result TEXT, PRIMARY KEY (run_id, name))")
+
+def step(run_id: str, name: str, fn, *args):
+    row = db.execute("SELECT result FROM steps WHERE run_id=? AND name=?", (run_id, name)).fetchone()
+    if row:
+        return json.loads(row[0])                 # already done before the crash: do not repeat
+    result = fn(*args)                            # may be a paid LLM call or a tool with side effects
+    db.execute("INSERT INTO steps VALUES (?,?,?)", (run_id, name, json.dumps(result)))
+    db.commit()
+    return result
+
+def grade_answer(run_id: str, image_path: str, llm, retrieve):
+    text = step(run_id, "ocr", llm.ocr, image_path)
+    refs = step(run_id, "retrieve", retrieve, text)
+    draft = step(run_id, "grade", llm.grade, text, refs)
+    final = step(run_id, "verify", llm.verify, draft, refs)
+    return final
+
+# a worker that crashed after "grade" re-runs grade_answer(run_id, ...) and pays only for "verify"
+```
+
+The gap is the classic one from [chapter 22](/22-agent-loop/#long-running-agents-checkpointing-resumability): a crash after `fn` runs but before the commit runs the step twice. For a model call that costs money; for a tool that sends email it is a duplicate email, so side-effecting tools need an idempotency key.
+
+### Deploys and half-finished work
+
+A rolling deploy sends SIGTERM to old instances. If a 4-minute agent run lives in that process's memory, it is gone, the spinner spins forever, and the tokens spent are wasted. Defences:
+
+- **Graceful shutdown:** on SIGTERM, stop accepting work, drain in-flight requests, then exit; set the termination grace period above your p99 request.
+- **Move long work onto workers** with checkpoints (next section), so a web deploy never touches it.
+- **Version runs:** store the release id with the run; finish it on compatible code or migrate its state explicitly.
+- **Sweep abandoned runs:** mark runs with no heartbeat for N minutes as failed and tell the user.
+
+## Async jobs and queues
+
+### When the request should not wait
+
+If work takes longer than about 30 seconds, where proxies, mobile networks and patience start to fail, make it a job:
+
+```text
+POST /jobs           -> 202 Accepted { "id": "j_81f2", "status": "queued" }
+worker               -> picks j_81f2, writes status per stage, stores result
+GET  /jobs/j_81f2    -> { "status": "grading", "progress": 0.6 }      (poll)
+GET  /jobs/j_81f2/events                                               (or stream, next section)
+```
+
+Answer Grader does the first half: `backend/api/app.py` returns the submission id at once, runs the pipeline as a FastAPI background task, and the page polls every 2 seconds. The code's own comment names the weakness: a serverless host (it runs on Vercel) may freeze the instance once the response is flushed, so this belongs on a durable queue. A background task has no retry, no visibility after a crash, and no concurrency limit.
+
+### What a real queue gives you
+
+- **Durability** across API and worker crashes.
+- **At-least-once delivery:** a worker leases a job; if it does not acknowledge within the **visibility timeout**, another worker gets it. Set the timeout above your longest job or extend it with heartbeats, or two workers process the same job.
+- **Retries with backoff and a dead-letter queue,** so a poison message does not loop forever.
+- **Concurrency control and priority lanes:** worker count caps parallel paid calls, and bulk backfills cannot starve interactive jobs.
+
+```python
+import time, uuid
+
+class PermanentError(Exception): """Bad input, schema violation, refusal: retrying cannot help."""
+
+def worker_loop(queue, jobs, handlers, lease_s=300):
+    me = uuid.uuid4().hex[:8]
+    while True:
+        job = queue.lease(owner=me, seconds=lease_s)        # invisible to others until lease expires
+        if not job:
+            time.sleep(1); continue
+        if jobs.status(job["id"]) == "done":                # duplicate delivery: already finished
+            queue.ack(job); continue
+        try:
+            jobs.set(job["id"], status="running", worker=me)
+            result = handlers[job["kind"]](job, heartbeat=lambda: queue.extend(job, lease_s))
+            jobs.set(job["id"], status="done", result=result)
+            queue.ack(job)
+        except PermanentError as e:                         # bad input, schema violation, refusal
+            jobs.set(job["id"], status="failed", error=str(e)); queue.ack(job)
+        except Exception as e:                              # transient: let the queue redeliver later
+            jobs.set(job["id"], status="retrying", error=repr(e)[:200])
+            queue.nack(job, delay=min(600, 10 * 2 ** job["attempts"]))
+```
+
+The `PermanentError` split matters. The Health Triage backend's Celery triage task retries any exception three times with backoff from 10 seconds (`autoretry_for=(Exception,)`), including invalid JSON from the model: up to four paid calls and about a minute of backoff for a job that cannot succeed.
+
+### Sizing workers
+
+Little's law again, with jobs arriving at `λ` per second and taking `W` seconds:
+
+```text
+busy workers = λ × W
+peak 2 grading jobs/s × 45 s per job = 90 busy workers
+at a target utilisation of 70%, run about 90 / 0.7 ≈ 130 worker slots
+
+but the provider caps you too: if each job makes 4 model calls of ~6,000 tokens,
+tokens/min = 2 × 60 × 4 × 6,000 = 2.88M TPM  -> check it fits your tier first
+```
+
+Worker slots beyond your provider quota just turn queue wait into 429s. Size workers to the smaller limit, with a client-side token bucket in the gateway.
+
+## Streaming over SSE/WebSockets
+
+Streaming cuts perceived latency (time to first token, TTFT) without changing total latency; see [streaming UX](/34-product-ux-and-feedback/#streaming-and-progress-ux) and [chapter 31](/31-cost-and-latency-engineering/#streaming-and-perceived-latency). The concern here is getting bytes through infrastructure reliably.
+
+### SSE vs WebSockets
+
+**Server-Sent Events** is a long-lived HTTP response with content type `text/event-stream`: blocks of `field: value` lines separated by a blank line, where `data:` carries the payload, `event:` names a type, `id:` sets a position, and a line starting with `:` is a comment. It is one-way, plain HTTP, and passes most infrastructure. The browser's `EventSource` only does GET without custom headers, so most LLM apps POST with `fetch` and parse the stream; Memory Agent's `public/app.js` reads the body with a `TextDecoderStream` and splits on blank lines. **WebSockets** are bidirectional, right for voice and barge-in, and cost more to operate (sticky connections, own auth and reconnect logic). For text chat, SSE is the default.
+
+### The four ways streams break in production
+
+1. **Buffering proxies** deliver the whole answer at the end. Send `Cache-Control: no-cache` and `X-Accel-Buffering: no`, skip compression on the stream, and test through the real edge. Scheme Assistant's `chat_stream` in `src/app_api/chat.py` sets both headers and pulls the first event before returning, so validation errors become an HTTP status rather than a broken stream.
+2. **Idle timeouts.** Load balancers close silent connections (often 30 to 120 seconds; check yours), cutting an agent that thinks before its first token. Send a comment heartbeat every 10 to 15 seconds.
+3. **Client disconnects.** If nothing notices a closed tab, the model keeps generating and you keep paying. Abort upstream when the response closes before it finished (in Node, listen on `res`; `req` emits `close` as soon as its body is read).
+4. **Deploys** kill open streams on old instances. Drain, or make streams resumable.
+
+```ts
+import http from "node:http";
+
+http.createServer(async (req, res) => {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "x-accel-buffering": "no",
+  });
+  const upstream = new AbortController();
+  // Watch res, not req: in current Node, req emits "close" as soon as its body has been read.
+  res.on("close", () => { if (!res.writableEnded) upstream.abort(); });   // tab closed: stop paying
+  const beat = setInterval(() => res.write(": ping\n\n"), 15_000);   // keep idle proxies from closing us
+  let seq = 0;
+  const send = (type: string, data: unknown) =>
+    res.write(`id: ${++seq}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  try {
+    for await (const delta of generate(await readBody(req), upstream.signal)) send("token", { t: delta });
+    send("done", {});
+  } catch (e) {
+    if (!upstream.signal.aborted) send("error", { code: "UPSTREAM" });
+  } finally {
+    clearInterval(beat);
+    res.end();
+  }
+}).listen(3000);
+```
+
+Memory Agent's server writes the event-stream headers by hand and streams JSON events, but `src/server.ts` at the pinned commit has no `close` handler and no heartbeat: a closed tab lets the writer run until its 45-second deadline, and a quiet search phase depends on no proxy timing out.
+
+### Decouple generation from the connection
+
+The robust pattern unties work from the connection. A worker appends events to a durable log (a Redis stream, a table); the API process holding the connection tails it. A dropped client reconnects with `Last-Event-ID` and gets a replay; a deployed-away API instance is replaced by one that picks up the tail. The Health Triage backend relays worker events to the SSE endpoint over Redis pub/sub and unsubscribes in a `finally` block on disconnect; pub/sub is not durable, so a reconnecting client misses events, which a Redis stream with sequence ids fixes.
+
+Streaming and output guards fight: if an answer must be verified before display, you stream and retract, stream after the check, or stream progress events instead of tokens. Scheme Assistant chose the last, which is why its server sends whole verified answers. Its Flutter client still parses `token` events the server never sends: dead protocol surface to remove or implement.
+
+## Rate limiting and backpressure
+
+### Two different problems
+
+[Chapter 11](/11-serving-and-model-economics/#rate-limits-quotas-batch-apis) covers the provider's limits on you. This section is your limits on your users (**rate limiting**: requests, tokens or concurrent streams per caller) and what the system does when full (**backpressure**: bounded queues, 429 or 503 with `Retry-After`, shedding low-priority work first).
+
+### Denial of wallet
+
+An LLM endpoint with no limit lets anyone with a script spend your money. Work it out for a real deployment:
+
+```text
+Scheme Assistant: about ₹0.57 of Gemini spend per turn (metered at list price in its persona-critic run)
+throughput ceiling from earlier ≈ 9.4 turns/s (3 instances × 20 concurrency / 6.4 s)
+one script saturating it:  9.4 × 3,600 × 0.57 ≈ ₹19,000 per hour   (rough: one measured run)
+```
+
+Only the instance cap (and whatever quota the Gemini project has) bounds that today. Scheme Assistant's `POST /v1/chat/stream` requires a bearer token, but at the pinned commit a token is free: `src/app_api/auth.py` sends no SMS and opens a session for any six-digit code other than a few demo codes, and neither the OTP routes nor chat have a per-user or per-IP limiter. Memory Agent's `POST /api/chat` has no auth or limit; the only bound is that each message is truncated to 4,000 characters. Chat Insights does it right for one instance: `backend/src/lc/middleware/limiters.js` keys a limiter by user id (else IP) at 20 chat requests a minute, plus a daily hint cap. Its counters live in process memory, so three replicas would triple the limit; scale-out needs a shared store such as Redis.
+
+### Limit on cost, not only on requests
+
+One request with a 100K-token document costs as much as a hundred short ones. Charge the bucket in estimated tokens (or money), refund the difference when real usage arrives, and cap concurrent streams per user.
+
+```python
+import asyncio, time
+
+class CostBucket:
+    """Per-user budget in tokens per minute, refilled continuously."""
+    def __init__(self, per_min: int):
+        self.rate, self.cap, self.level, self.t = per_min / 60, per_min, per_min, time.monotonic()
+    def try_take(self, n: int) -> float:                  # 0 if allowed, else seconds to wait
+        now = time.monotonic()
+        self.level = min(self.cap, self.level + (now - self.t) * self.rate); self.t = now
+        if self.level >= n:
+            self.level -= n; return 0.0
+        return (n - self.level) / self.rate
+
+buckets: dict[str, CostBucket] = {}
+inflight = asyncio.Semaphore(60)                          # global cap = what the provider tier allows
+
+async def admit(user_id: str, est_tokens: int):
+    wait = buckets.setdefault(user_id, CostBucket(20_000)).try_take(est_tokens)
+    if wait:
+        return 429, {"retry_after": round(wait, 1), "error": "user_rate_limited"}
+    if inflight.locked():                                 # system full: shed, do not queue forever
+        return 503, {"retry_after": 5, "error": "busy"}
+    return 200, None
+```
+
+### Queue or shed?
+
+Queueing smooths short bursts, but an unbounded queue under sustained overload turns every request into a timeout after you have paid for some of them. **Bound every queue.** The Health Triage backend reads the Redis length of both work queues before enqueuing and returns 429 above an admin-configurable `max_queue_depth`, and each worker reserves a slot on a shared Redis limiter before calling Gemini.
+
+The arithmetic: 60 slots at 6.4 seconds drain about 9.4 requests a second, so a burst of 300 waits up to `300 / 9.4 ≈ 32` seconds, past a 30-second client timeout. Anything beyond about 280 queued is doomed; reject it at the door. **Queueing under burst** shows up as p95 latency, not errors, until clients time out. When shedding, drop batch work first, then free tier, then paid users, and always send `Retry-After`.
+
+## Fallbacks and failover
+
+### Timeouts are a budget, not a constant
+
+Timeouts must nest, each inner deadline shorter than its caller's, or the outer layer gives up while the inner one is still paying. Pass a deadline down instead of hard-coding numbers.
+
+```text
+mobile app gives up            45 s
+  API request deadline         40 s
+    RAG pipeline               30 s
+      model call               min(remaining − 2 s, 25 s)
+      fallback call            only if remaining > its p95 latency
+```
+
+Scheme Assistant layers this sensibly: the app's 45-second cliff (noted in the deploy script), the RAG call wrapped in `asyncio.timeout` at `rag_timeout_s = 30` (`src/app_api/rag.py`), and Cloud Run's 120 seconds outside. Its model client's own 120-second HTTP timeout never fires because the 30-second deadline wins; harmless, but it hides the real budget from a reader.
+
+### Retries, then failover, then degradation
+
+Chapter 11 covers [retry classification and backoff](/11-serving-and-model-economics/#rate-limits-quotas-batch-apis) and the [fallback chain](/11-serving-and-model-economics/#gateways-and-multi-provider-abstraction): retry and fail over only on availability errors (timeouts, 429, 5xx), never on auth, bad-request, out-of-credit, refusal or parse failures, which fail the same way everywhere.
+
+Answer Grader's `backend/llm.py` is a worked example. `_is_retryable` refuses out-of-credit errors, `_backoff_seconds` prefers the delay the provider names (capped at 90 s), and after `LLM_FALLBACK_AFTER` tries (default 2) the same call moves to the fallback provider, with usage tagged `fallback_from`; that call is pinned, so it can retry on the fallback but never falls back again. The arithmetic: five attempts with backoff of 5, 10, 20 and 40 seconds is 75 seconds of sleeping in a demand spike; failing over after the second attempt costs about 5.
+
+### The circuit breaker
+
+During an outage, retries make things worse: every request waits through its retries before falling back, and you keep hammering a dead provider. A **circuit breaker** remembers recent failures and skips the provider for a cool-down.
+
+```python
+import time
+
+class Retryable(Exception): """Timeout, 429, 5xx: worth trying another provider."""
+
+class Breaker:
+    """closed: calls pass. open: calls skip this provider. half-open: let one probe through."""
+    def __init__(self, threshold=5, window_s=30, cooldown_s=20):
+        self.threshold, self.window_s, self.cooldown_s = threshold, window_s, cooldown_s
+        self.failures: list[float] = []
+        self.open_until = 0.0
+    def allow(self) -> bool:
+        now = time.monotonic()
+        if now < self.open_until:
+            return False
+        if len(self.failures) >= self.threshold:          # half-open: this caller is the probe,
+            self.open_until = now + self.cooldown_s       # everyone else waits for its result
+        return True
+    def record(self, ok: bool):
+        now = time.monotonic()
+        if ok:
+            self.failures.clear(); self.open_until = 0.0; return
+        self.failures = [t for t in self.failures if now - t < self.window_s] + [now]
+        if len(self.failures) >= self.threshold:
+            self.open_until = now + self.cooldown_s       # trip: stop sending traffic for a while
+
+def call_with_failover(req, chain, breakers, deadline):
+    for name, call in chain:                              # e.g. [("a", call_a), ("b", call_b)]
+        if not breakers[name].allow() or time.monotonic() > deadline:
+            continue
+        try:
+            out = call(req, timeout=deadline - time.monotonic())
+            breakers[name].record(True)
+            return {**out, "served_by": name}
+        except Retryable:
+            breakers[name].record(False)
+    return degraded_answer(req)                           # cached answer, sources only, or honest error
+```
+
+With several replicas, share breaker state (Redis) or each replica learns of the outage separately. The Health Triage backend has a Redis-backed `CircuitBreaker` in `app/utils/circuit_breaker.py` that nothing imports, so an outage is absorbed only by retries and rate limits. Wire it in or delete it; unused safety code gives false confidence.
+
+### Degrade in steps
+
+1. A smaller or self-hosted model that has passed the same eval (an untested fallback is a second incident).
+2. An exact-match cached answer.
+3. Retrieval only: "here are the most relevant sources".
+4. A template or a clear, retryable error. Scheme Assistant separates infrastructure failure (`RagError`, `RagTimeout`) from "no answer", so the app says "try again" rather than abstaining.
+
+Kill switches belong here: Chat Insights's `LC_KILL_LLM` returns a template before any provider call; the Health Triage backend keeps accepting assessments with the AI flag off and skips only the AI stage. And **count fallbacks**: a jump from 0.1% to 30% is an outage users have not reported yet.
+
+## Managed agent platforms and sandboxes
+
+### What an agent runtime needs
+
+An agent that edits a repository, runs tests and opens a pull request does not fit in a request. It needs a **durable session** (the run's event log, outside any process), a **sandbox** where model-written code cannot reach your network, secrets or other users' data, **credential handling** that lets it act without exposing tokens to generated code, **lifecycle** controls (pause for approval, resume, time out, per-run budgets), and **scale to zero**, because idle sandboxes cost money. You can build it from this chapter's pieces or rent it.
+
+### The managed option
+
+Platforms now host the loop and sandbox for you: Anthropic's Managed Agents, cloud offerings such as AWS Bedrock AgentCore, and sandbox vendors selling isolated environments by the second. Anthropic's engineering post "Scaling Managed Agents: Decoupling the brain from the hands" (2026) is a useful reference design. It splits an agent into three parts with narrow interfaces:
+
+- the **session**, a durable append-only event log stored outside both the harness and the model's context;
+- the **harness**, a stateless loop that calls the model and routes tool calls, so a crashed harness is replaced and resumes from the session log;
+- the **sandbox**, where code runs, treated as disposable: if a container dies, that becomes a tool error and a fresh one is provisioned.
+
+Two details are worth repeating in interviews. Credentials never enter the sandbox: repository tokens configure the remote at setup, and other tokens sit in a vault behind a proxy. And containers are provisioned only when a tool call needs one, which the post reports cut p50 time to first token by roughly 60% and p95 by over 90%: keep slow provisioning off the path of requests that may never need it.
+
+### Isolation levels
+
+```text
+weakest                                                              strongest
+process + resource limits -> container (shared kernel) -> gVisor-style user-space kernel -> microVM (Firecracker-style)
+cheap, fast start                                                     own kernel per sandbox, still starts quickly
+```
+
+A container shares the host kernel, so for untrusted model-written code a user-space kernel or microVM is the usual baseline. At any level: no secrets in the environment, an egress allowlist, CPU, memory and wall-clock limits, a fresh filesystem per run, and an audit log. Threat model in [chapter 33](/33-security-prompt-injection/#sandboxing-and-containment).
+
+```python
+import resource, subprocess, tempfile
+
+def run_untrusted(code: str, timeout_s: int = 10) -> dict:
+    """Linux. Resource limits only, NOT a security boundary: run it inside a microVM or gVisor sandbox."""
+    def limits():
+        resource.setrlimit(resource.RLIMIT_CPU, (timeout_s, timeout_s))
+        resource.setrlimit(resource.RLIMIT_AS, (512 * 2**20, 512 * 2**20))   # 512 MB address space
+        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))                  # no fork bombs
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            p = subprocess.run(["python3", "-I", "-c", code], cwd=tmp, env={"PATH": "/usr/bin"},
+                               capture_output=True, text=True, timeout=timeout_s, preexec_fn=limits)
+            return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-2000:]}
+        except subprocess.TimeoutExpired:
+            return {"exit": None, "error": f"timed out after {timeout_s}s"}
+```
+
+The sketch keeps keys out (empty environment), uses a throwaway directory and truncates output before it re-enters the context; it cannot stop network access or a kernel exploit.
+
+**Build or buy.** Buy when agent runs are a feature rather than your product and the provider's data handling meets your residency needs. Build when you need a specific region, another vendor's model in the loop, or cost control at volume. Either way, keep your own record of what each run did: it is your audit trail and your eval data.
+
+## Model upgrade/regression management
+
+### Every model change is a release
+
+Chapter 11 has the [migration checklist](/11-serving-and-model-economics/#deprecation-and-migration) for a retired model. This section is the ongoing process of keeping quality from sliding across releases, including ones you did not make. Outputs move when you change something (model id, prompt, parameters, index), when the provider changes something (a floating alias, serving changes; a pin limits this but is not a promise of bit-identical behaviour), and when your traffic changes (new users, topics, documents).
+
+### Regression is more than the pass rate
+
+A candidate can match the old pass rate and still be worse. Diff several axes, per case, on the same inputs:
+
+```python
+def regression_report(old: list[dict], new: list[dict], limits: dict) -> list[str]:
+    """old/new: one row per eval case, same order: passed, tokens_out, refused, usd, ms, critical."""
+    n = len(old); problems = []
+    broke = [o["id"] for o, c in zip(old, new) if o["passed"] and not c["passed"]]
+    crit = [o["id"] for o, c in zip(old, new) if o["critical"] and not c["passed"]]
+    if crit:
+        problems.append(f"critical cases failing: {crit}")
+    if len(broke) > limits["max_broken"]:
+        problems.append(f"{len(broke)} cases regressed: {broke[:10]}")
+    def mean(rows, k): return sum(r[k] for r in rows) / n
+    def p95(rows, k): return sorted(r[k] for r in rows)[int(0.95 * (n - 1))]
+    if mean(new, "tokens_out") > limits["len_ratio"] * mean(old, "tokens_out"):
+        problems.append("answers got much longer: truncation and cost risk")
+    if mean(new, "refused") > mean(old, "refused") + limits["refusal_abs"]:
+        problems.append("refusal rate rose")
+    if mean(new, "usd") > limits["cost_ratio"] * mean(old, "usd"):
+        problems.append("cost per case rose")
+    if p95(new, "ms") > limits["p95_ratio"] * p95(old, "ms"):
+        problems.append("p95 latency rose")
+    return problems                                      # empty list = eligible for shadow and canary
+```
+
+Gate on the paired flips with a significance test, as in [chapter 20's gate](/20-evals-judges-and-ci/#evals-in-ci), and read every regressed case before shipping.
+
+### Recalibrate what was tuned to the old model
+
+Anything fitted to one model's outputs must be refitted: judge thresholds, abstain cut-offs, parsers, max-token limits, score mappings. Answer Grader's grades are model-specific (the code notes Gemini marked a band higher than gpt-4o on the same copies), so `backend/evaluation.py` stores `graded_by` with every result and calibration to real marks is fitted per model. Without that field, a model switch would silently move every student's score.
+
+### Watch for drift you did not cause
+
+Run the regression suite nightly against the unchanged production release. A drop with no deploy points at the provider, the index or a dependency. Scheme Assistant's `scripts/critic_api.py` gets reproducibility right: it runs the API from a worktree of the deployed commit (the Cloud Run image tag) with the deploy script's environment copied in, so comparisons are against what production runs. Keep a **deprecation calendar** for every pinned id; Scheme Assistant's `src/app/config.py` records an older default model that started returning 404 for new keys.
+
+### Release markers
+
+Draw a line on every dashboard at each deploy, prompt publish, alias change and flag flip, labelled with the release id. Most "quality dropped on Tuesday" investigations end at one of those lines. Dashboards are in [chapter 30](/30-observability/#quality-latency-cost-error-metrics).
+
+## Data flywheel
+
+### The loop
+
+Your best eval set and training data is your own production traffic. The **data flywheel** turns it into improvements:
+
+```text
+production traces (with release id)
+   -> signals: thumbs, retries, escalations, guard hits, online judge flags
+   -> sample + triage: humans label failures, name the failure mode
+   -> promote: failing cases join the eval set; good pairs become few-shot or fine-tune data
+   -> fix: prompt, retrieval, data or model change
+   -> gate: offline eval, shadow, canary
+   -> deploy -> measure the same failure mode in production again
+```
+
+[Chapter 30](/30-observability/#the-trace-eval-fix-loop) covers the loop and [chapter 20](/20-evals-judges-and-ci/#online-evals-and-production-sampling) the sampling. The deployment concern is plumbing: traces carry release and retrieved ids, flagged traces land in a review queue, and promoting a case is one command.
+
+```python
+import hashlib, re, time
+
+PII = [r"\b\d{4}\s?\d{4}\s?\d{4}\b", r"(?:\+91[\s-]?)?\b[6-9]\d{9}\b", r"[\w.+-]+@[\w-]+\.[\w.]+"]
+
+def redact(text: str) -> str:
+    for pat in PII:
+        text = re.sub(pat, "[REDACTED]", text)
+    return text
+
+def promote(trace: dict, label: dict, evalset: dict, retention_days: int = 365) -> str | None:
+    """Turn a reviewed production trace into an eval case. label = {failure_mode, expected, critical}."""
+    if not trace.get("consent_ok", False):
+        return None                                      # users who opted out never become test data
+    q = redact(trace["input"])
+    key = hashlib.sha256(re.sub(r"\s+", " ", q.lower()).encode()).hexdigest()[:12]
+    if key in evalset:
+        evalset[key]["seen"] += 1; return key            # dedupe: count recurrences instead
+    evalset[key] = {"input": q, "expected": label["expected"], "failure_mode": label["failure_mode"],
+                    "critical": label.get("critical", False), "from_release": trace["release_id"],
+                    "added": time.time(), "expires": time.time() + retention_days * 86400, "seen": 1}
+    return key
+```
+
+### Retention is part of the design
+
+Production data is personal data. Under India's Digital Personal Data Protection Act, 2023 and similar laws you need a purpose, a retention limit and a way to honour deletion. Decide per class: raw prompts and completions kept briefly (days to weeks), access-controlled and redacted; metadata (release id, tokens, latency, cost, scores, retrieved ids) kept longer; promoted eval cases redacted, with a source pointer, an expiry and a deletion path. Provider-side retention is separate and set by vendor terms ([chapter 11](/11-serving-and-model-economics/#data-residency-confidential-inference)); logging policy is in [chapter 30](/30-observability/#log-privacy-and-retention).
+
+### How flywheels go wrong
+
+- **Selection bias:** complaints over-represent edge cases; mix in uniform random samples.
+- **Training on your own outputs** bakes in current mistakes; use human-corrected targets.
+- **Stale cases:** store the source version with each case and re-review when sources change.
+- **No owner:** without weekly triage the review queue just grows.
+
+Scheme Assistant has the raw material: `src/app/core/answer_query.py` writes every question and answer to an append-only `query_log` with retrieved and cited chunk ids. What it lacks is the promotion path from a flagged answer back into the eval set or corpus.
+
+<Production>
+
+**Failure modes.**
+
+- Half-finished agent jobs on deploy: work in a web process's memory dies on SIGTERM. Workers with checkpoints, drain on shutdown, release id per run, a sweeper for runs with no heartbeat.
+- Streaming connections dropped or buffered by proxies: no-buffering headers, heartbeats under the idle timeout, upstream abort on disconnect, resumable streams from a durable log.
+- Silent behaviour change from a registry edit, a moved alias or a flag flip that skipped the eval gate.
+- Fallbacks that never fire (an unused circuit breaker) or fire silently (a generic catch hiding a rejected parameter). Test failover; alert on fallback rate.
+
+**Cost.**
+
+- Idle GPU capacity: self-hosted models sized for peak sit idle at night, and warm agent sandboxes cost money between runs. Scale to zero where cold starts are acceptable; move deferrable work to batch.
+- Denial of wallet: `throughput × cost per call` under abuse, about ₹19,000 an hour in the Scheme Assistant example. Per-user cost buckets and daily caps before the call.
+- Hidden multipliers: shadow traffic, retried permanent errors, and generation that continues after the client left.
+
+**Latency.**
+
+- Queueing under burst: with `L = λ × W`, slots fill fast and queue wait lands on p95 before errors appear. Bound queues and shed with `Retry-After`.
+- Nested deadlines, with a fallback tried only if the remaining budget covers its p95.
+- Cold starts after scale-to-zero (Scheme Assistant's deploy notes about 5 s unless one instance stays warm).
+
+**Observability.**
+
+- Release markers on dashboards for deploys, prompt publishes, alias changes and flag flips; release id on every trace.
+- Per release: error rate, p50 and p95 latency, cost per successful task, fallback, abstain and refusal rates, rate-limit rejections, queue depth and oldest-job age.
+- A nightly regression run against the unchanged production release to catch drift you did not cause.
+
+**Security.**
+
+- Secrets in a secrets manager, one per environment and service, with spend caps and rotation; never in the repo, image, browser, prompt or manifest.
+- Sandbox isolation for agent runtimes: microVM-class isolation for model-written code, no credentials inside, egress allowlists, resource limits, audit logs.
+- Runtime flags and prompt registries are production write access: restrict and log them.
+
+</Production>
+
+<Interview>
+
+<Q q="Design ChatGPT (or a chat product) end to end." reported>
+
+- **Scope and SLOs:** chat with history and streaming; say 1M daily users, 10 turns each, TTFT p95 under 1.5 s, 99.9% availability, a cost-per-turn budget. Ask about tools, memory, enterprise data.
+- **Architecture:** edge (auth, per-user cost buckets) → stateless chat API → orchestrator (context assembly, moderation, gateway call with aliases and fallbacks) → SSE. Conversations in Postgres; a durable event log per turn so streams resume; queues for titles, summaries and memory after the reply.
+- **Capacity:** 10M turns a day ≈ 116 per second, about 350 at a 3× peak; at 8 s per turn, `L = 350 × 8 ≈ 2,800` concurrent streams. Size connections and provider TPM for that.
+- **Models:** route easy turns to a small model; prompt caching for the system prompt and history; summarise past a token budget.
+- **Evals, guardrails, rollout:** offline suite and pairwise judges, shadow then sticky canary, online sampled judges; moderation in and out; a fallback provider behind a circuit breaker.
+- **Observability and cost:** traces with release id, TTFT, tokens, cost per turn, fallback rate, per-tenant spend.
+- **The trap:** drawing a box that says "LLM" and spending the whole time on the model, with nothing about streaming through proxies, concurrency arithmetic, abuse limits or how a change is rolled out.
+
+</Q>
+
+<Q q="How do you roll out a new model version safely?">
+
+- Pin dated model ids behind your own alias; the switch is a reviewed config change with a new release id.
+- Offline: full suite, paired per-case diff with a sign test, critical cases must pass; also diff length, refusal rate, cost and p95. Re-fit thresholds, parsers and calibration.
+- Shadow on sampled production traffic with side effects disabled; compare with code checks and a validated pairwise judge.
+- Sticky canary 1% → 5% → 25% → 100%, auto-rollback on errors, latency or cost.
+- The number: detecting a thumbs-down rise from 5% to 7% needs about 2,200 conversations per arm, so a 1% canary only catches breakage.
+- Keep the old alias one flag away during the bake; release markers on dashboards.
+- **The trap:** "run the eval set and switch if the score is the same", which misses per-case regressions, longer answers that get truncated, changed refusal behaviour and recalibration.
+
+</Q>
+
+<Q q="How do you serve long-running agent tasks behind an HTTP API?">
+
+- `POST /runs` returns 202 and a run id; the run goes on a durable queue.
+- Workers lease runs with a visibility timeout and heartbeats, checkpoint every step, and use idempotency keys for side-effecting tools.
+- Progress over SSE tailing the run's event log with sequence ids, so clients resume with `Last-Event-ID`; polling as fallback.
+- Per-run budgets (steps, tokens, money, wall clock), approval pauses that save state and stop, resume and cancel endpoints, a sweeper for dead runs.
+- Deploys: web deploys never touch runs; workers drain or resume from checkpoints; release id per run.
+- Tools run in microVM-class sandboxes with no credentials inside.
+- **The trap:** "use a longer timeout" or a background thread in the web process, which dies on the next deploy and loses the tokens already spent.
+
+</Q>
+
+<Q q="Design an end-to-end architecture for an LLM app (gateway, cache, guardrails, router, observability).">
+
+- **Scope and SLOs first:** traffic, latency target, quality bar, data sensitivity, budget per request.
+- **Request path:** edge (auth, rate limits, size caps) → input guardrails (redaction, moderation, scope) → cache (only where staleness is safe) → router (cheap model first, escalate on low confidence) → gateway (aliases, retries, breakers, fallback chain, cost ledger) → output guardrails (schema, grounding) → stream.
+- **Off the request path:** queues, online sampled judges, the flywheel into the eval set.
+- **Control plane:** prompts and config in git with release ids, flags and kill switches, eval gates in CI, secrets manager.
+- **Observability:** one trace per request, spans per step, release id, tokens, cost, cache hit, route, fallback.
+- **Numbers:** concurrency `λ × W`, TPM headroom, cost = Σ tokens × price, guardrail latency (run checks in parallel).
+- **The trap:** a list of boxes with no explanation of order (why redaction precedes the cache, why the cache key includes the release id) and no failure behaviour for each box.
+
+</Q>
+
+<Q q="How do you protect a paid LLM endpoint from abuse and overload?">
+
+- Authentication first; anonymous access only with tight per-IP and per-device limits.
+- Per-user limits in cost units with a token bucket in a shared store, a per-user concurrency cap and a daily spend cap checked before the call.
+- Global backpressure: a semaphore sized to provider quota, bounded queues, 429 or 503 with `Retry-After`, lowest priority shed first.
+- Input caps (message length, file size, history tokens); spend alerts per user and key; a kill switch per feature.
+- Quote the risk: `throughput × cost per call`, about ₹19,000 an hour at 9.4 turns a second and ₹0.57 a turn.
+- **The trap:** a requests-per-minute limit kept in process memory, which counts a 50-token and a 50,000-token request the same and multiplies by the number of replicas.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** deploy one app with streaming SSE that survives proxies and disconnects, a job queue for long agent runs, a canary rollout of a new model version gated on eval scores, and shadow traffic. Do it in **Memory Agent** (`~/memory-agent`), because it already streams SSE from `src/server.ts`, has an eval runner in `eval/run.ts` that can force one model with `ANSWER_MODEL`, and lacks rate limits and disconnect handling.
+
+**Model:** run offline. Use Ollama with two local models as "stable" and "candidate" (for example two sizes of the same open model), or the scripted fake client pattern from `src/agent.test.ts` for the plumbing steps. No paid API.
+
+**Steps**
+
+1. **Release id.** `src/release.ts` hashes `src/prompts.ts`, the model map in `src/config.ts` and the git sha. Log it at startup, return it from `/api/status`, attach it to every `done` event and stored turn.
+2. **Hardened SSE.** In `src/server.ts` add `x-accel-buffering: no`, a 15 s `: ping` heartbeat, event ids, and a `res.on("close")` handler that aborts the writer when the response closes before it ended. Disconnect after the first token and confirm in the Ollama log that generation stops.
+3. **Rate limit.** A per-client token bucket and a global in-flight semaphore on `/api/chat`, returning 429 or 503 with `Retry-After`. Test with 50 parallel requests.
+4. **Job queue.** `POST /api/runs` inserts into a SQLite `jobs` table and returns 202. A worker leases jobs with a visibility timeout and heartbeat, records durable steps, and appends to `run_events`; `GET /api/runs/:id/events` streams from it with `Last-Event-ID`. Kill the worker mid-run; another must resume without repeating steps.
+5. **Eval gate.** Run `eval/run.ts` against Ollama for stable and candidate; a gate script blocks on critical failures, lopsided flips, a length ratio above 1.5 or p95 above 1.5× stable.
+6. **Shadow.** Mirror 20% of turns to the candidate with searches stubbed and no memory writes; judge stored pairs with a local model in both orders.
+7. **Canary.** Route a sticky 10% hash bucket of thread ids to the candidate; a script prints advance, hold or rollback from per-release metrics; a flag flip rolls back.
+
+**Definition of done:** the release id appears on every stored turn; closing the tab stops generation; 50 parallel requests get 429s rather than a pile-up; a killed worker's run completes without repeating steps and a reconnecting client receives the missed events; the gate blocks a deliberately worse candidate (for example a prompt that drops citations) and passes an equivalent one; the shadow report shows per-pair verdicts; and the canary script rolls back when you inject a 20% error rate into the candidate.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader has the best provider resilience of your repos; say it with the numbers.** `backend/llm.py` picks the provider from one env var, never retries out-of-credit errors, honours the provider's named retry delay (capped at 90 s), and after `LLM_FALLBACK_AFTER` (default 2) attempts moves the call to the fallback provider (pinned there, so it never falls back twice), tagging usage with `fallback_from`. Explain the trade: five attempts of exponential backoff would cost about 75 s of waiting in a demand spike; failing over after two costs about 5 s. `graded_by` in `backend/evaluation.py` plus per-model calibration is your model-upgrade story. Gaps to name: no CI runs tests or evals (the only workflow posts to Telegram), and the pipeline runs as a FastAPI background task on Vercel, which the code's own comment says belongs on a durable queue.
+- **Scheme Assistant is your deployment story, but most of the backend is Chiman's; say "our".** The deploy script (Chiman's) builds an image tagged with the git sha, mounts provider keys from Secret Manager, runs migrations as a separate step, and caps Cloud Run at 3 instances × 20 concurrency, which with a 6.4 s mean answer is about 9.4 answers a second (Little's law). The SSE endpoint sends anti-buffering headers. Gaps: no staging or canary (deploys go from a laptop to the one public service), no rate limit on the paid `POST /v1/chat/stream` (about ₹19,000 an hour at the ceiling using the ₹0.57 per turn your critic run measured), and no retry or secondary provider on the answer call. Your own contribution is the regression side: `scripts/critic_api.py` replays persona questions against the deployed commit with the live environment under a hard spend cap.
+- **Memory Agent is where to show streaming and rollout engineering.** It streams SSE by hand (`src/server.ts`, `public/app.js`), routes models by intent from env (`src/config.ts`), and keeps a speculative writer behind a flag that is off because its quality effect is unmeasured, which is a clean example of a flag waiting for an eval gate. Gaps: no rate limit or auth on `/api/chat`, no client-disconnect abort, no heartbeat. Closing those is the Apply it above.
+- **Chat Insights shows config, cohort rollout and a staged migration.** `backend/src/lc/config.js` documents every switch (provider, models, timeout, daily cap, `LC_KILL_LLM`, pilot allowlist, minimum extension version) and freezes it; `/health` returns version plus commit sha as a release marker; chat is limited to 20 a minute per user. `RENDER_MIGRATION_RUNBOOK.md` stages a host move (backend, then web, then extension), keeps the old host for 24 to 48 hours as rollback, and runs a single instance on purpose to avoid duplicate in-process cron runs. Gap: in-memory limiter counters do not aggregate across replicas.
+- **Health Triage (your team's backend; your commits were mostly the Flutter client and its SSE parsing).** Use it for queues and backpressure: a bounded-queue 429 at `max_queue_depth`, a shared Redis limiter before each Gemini call, a fan-in latch that enqueues triage exactly once, SSE over Redis pub/sub with cleanup on disconnect, and runtime kill switches in the database. Name the gaps too: a circuit breaker class nothing uses, and Celery retries on every exception, including permanent ones.
+
+</YourProject>

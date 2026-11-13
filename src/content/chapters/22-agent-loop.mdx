@@ -1,0 +1,749 @@
+---
+id: "22"
+title: "The Agent Loop and Architectures"
+summary: "Write an agent loop from scratch with step, token and cost budgets, error feedback, checkpoints and human approval, and decide when a fixed workflow beats an agent."
+readingTime: "36 min"
+---
+
+Every "agent" you will be asked about in an interview, from a support bot to a coding agent, comes down to one `while` loop. Your code calls a model. The model either answers or asks for a tool. Your code runs the tool, appends the result, and calls the model again. Everything else in this chapter is about the questions the loop raises: when should it stop, what does it cost, what happens when a tool fails, how do you pause it for a human and resume tomorrow, and when should you not build one at all.
+
+The loop is short, but it changes the economics of your system. A RAG endpoint makes one or two model calls with a known prompt size. An agent makes an unknown number of calls, and each call carries everything the previous calls produced. So cost grows faster than linearly with steps, latency is step count times call latency, and a 95%-reliable step becomes a 60%-reliable task after ten steps. Those three facts explain most of the design advice you will read.
+
+This chapter builds the loop in plain Python with a mocked model, adds budgets, error feedback, checkpointing and approval, and covers the workflow patterns from Anthropic's "Building effective agents" (2024), which you should usually try first. Neighbouring chapters go deeper on [tool design](/21-tool-use/#agent-computer-interface-design), [memory](/23-memory/#conversation-buffer), [planning](/24-planning/#plan-then-execute), [multi-agent systems](/25-multi-agent-systems/#orchestrator-sub-agent) and [context engineering](/27-context-engineering/#compaction). Here we stay with the loop itself.
+
+## Workflows vs agents
+
+Start with the distinction Anthropic draws, because interviewers use the same words. A **workflow** is a system where LLM calls and tools are wired together by code paths you wrote in advance. The model fills in each box, but your code decides which box comes next. An **agent** is a system where the model decides the next step at runtime: which tool to call, with what arguments, and when it is finished. Both are "agentic systems". The difference is who owns the control flow.
+
+```text
+Workflow (you own the edges)            Agent (the model picks the edge)
+
+input -> [LLM: classify]                 input
+            |                              |
+     +------+------+                       v
+     v             v                  +---------+  tool call  +-------+
+ [LLM: refund]  [LLM: faq]            |  model  | ----------> | tools |
+     |             |                  |         | <---------- |       |
+     v             v                  +---------+   result    +-------+
+ [code: guard] [code: guard]               |
+     |             |                       | no tool call
+     v             v                       v
+   reply         reply                   reply
+```
+
+The distinction decides four things you are held to in production.
+
+- **Predictability.** A workflow has a fixed number of calls, so you can state its p95 latency and cost per request. An agent's step count is a distribution with a long tail.
+- **Testability.** A workflow's paths can be enumerated and tested. An agent's trajectories cannot, so you test it with outcome evals over a task set ([trajectory vs outcome evals](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory)).
+- **Blast radius.** A workflow can only do what its code paths do. An agent can do anything its tools allow, in any order, which matters the moment a tool writes or spends.
+- **Flexibility.** An agent handles inputs you did not anticipate. That is the only reason to pay for the other three.
+
+### When not to build an agent
+
+The honest default is: do not. Try these in order and stop at the first that meets your quality bar on an eval set.
+
+1. **One call** with a good prompt and retrieved context (the augmented LLM, next section).
+2. **A workflow**: a fixed chain, a router, or a parallel fan-out.
+3. **An agent**, only if the number and order of steps truly cannot be known until you see intermediate results.
+
+Concrete signals that you need an agent: the task needs a search whose next query depends on what the last one returned; the number of sub-steps varies by an order of magnitude between inputs (fix one file vs fix twelve); or recovering from a failed step needs judgment rather than a retry. Signals that you do not: you can draw the flowchart on a whiteboard, the steps are always the same, or the business needs an audit trail that says "step 3 always runs after step 2".
+
+A middle ground: Bojie Li's *AI Agents in Depth* (chapter 1) suggests letting a model write a workflow once and then executing it with deterministic code, for flexibility at planning time and predictability at run time ([plan-then-execute](/24-planning/#plan-then-execute)).
+
+<Callout type="interview">
+
+"Workflow or agent?" is a judgment question. A strong answer names the cost of autonomy (unbounded latency and cost, compounding error, wider blast radius), says you would start with the simplest design that passes the eval, and gives the specific signal that justifies an agent for this task.
+
+</Callout>
+
+## The augmented LLM
+
+Before any loop, there is the building block Anthropic calls the **augmented LLM**: one model call that has access to retrieval, tools and memory. The model can write its own search query, pick a tool, or decide what to remember, but within a single request-response.
+
+A bare model knows only its training data and the prompt. Augmentation gives it fresh facts (retrieval), the ability to act or compute (tools) and continuity across sessions (memory). Most production "AI features" are exactly this: one call with a few capabilities, inside normal backend code.
+
+```python
+def augmented_answer(question: str, user_id: str, llm, search, memory) -> str:
+    facts = search(question, k=5)                       # retrieval, chosen by your code
+    remembered = memory.recall(user_id, question)       # memory, chosen by your code
+    reply = llm(
+        system="Answer from the facts. Cite them as [n]. Say 'I don't know' if they don't cover it.",
+        user=f"Facts:\n{facts}\n\nAbout this user:\n{remembered}\n\nQuestion: {question}",
+        tools=[CALCULATOR],                             # the model may call this once
+    )
+    return reply.text
+```
+
+Two design choices hide in this code. First, **who decides to retrieve**: here your code always retrieves, which is cheap and predictable; in an agent the model decides when and what to search, which is flexible but costs a step. Second, **the interface to each capability** (tool schema, shape of retrieved text, memory format), which deserves the care of a public API ([chapter 21](/21-tool-use/#names-descriptions-examples)).
+
+The trade-off: fixed cost and latency, but no way to follow evidence across several hops. Once you want "call the model, look at what it found, then call it again with a different question", you need a workflow or a loop. In production the augmented LLM fails quietly: retrieval returns nothing useful and the model answers anyway, so add an abstain instruction and a check in code ([RAG pipelines](/17-rag-pipelines/)).
+
+## Chaining, routing, parallelization
+
+These are the three simplest workflow patterns. Each is a few lines of ordinary code around model calls, and each buys something specific.
+
+### Prompt chaining
+
+Split a task into fixed steps, where each call's output feeds the next, with optional code checks ("gates") between steps. Example: extract the facts from a ticket, then draft a reply from those facts only, then translate.
+
+Why it helps: each call does one thing, so each prompt is short and easy to evaluate, and a gate can stop a bad intermediate result before it propagates. The cost is latency: steps run in sequence, so a three-step chain at 1.5 s per call takes about 4.5 s before the first token of the last step.
+
+### Routing
+
+Classify the input once, then send it to a specialised prompt, model or pipeline. Example: a cheap model labels a support message as `refund`, `bug` or `faq`, and each label has its own prompt and tool set. Routing also sends easy inputs to a small model and hard ones to a large model ([routing and cascades](/31-cost-and-latency-engineering/#routing-and-cascades)).
+
+Why it helps: one prompt that handles every category gets worse at each as you add more. Separate prompts can be tuned and tested separately. The risk is the router itself: a misroute sends the user down the wrong path with full confidence. Measure router accuracy on a labelled set and give it an `other` label with a safe default path.
+
+### Parallelization
+
+Run independent calls at the same time and combine them. Anthropic names two variants. **Sectioning** splits the work into independent parts, for example one call writes the answer while another screens the input for policy violations. **Voting** runs the same task several times and aggregates, for example three reviewers flag a code change as risky and you act if two agree.
+
+```python
+import asyncio
+
+async def chain(ticket, llm):
+    facts = await llm(f"List the facts in this ticket as bullets:\n{ticket}")
+    if "order" not in facts.lower():                     # gate: code, not a model
+        return "ESCALATE: no order details"
+    return await llm(f"Draft a reply using only these facts:\n{facts}")
+
+async def route(ticket, llm, handlers):
+    label = (await llm(f"Label as refund, bug, faq or other:\n{ticket}")).strip().lower()
+    return await handlers.get(label, handlers["other"])(ticket)
+
+async def vote(diff, llm, n=3):
+    verdicts = await asyncio.gather(*[llm(f"Is this change risky? yes/no\n{diff}") for _ in range(n)])
+    yes = sum(v.strip().lower().startswith("yes") for v in verdicts)
+    return yes * 2 > n                                   # majority
+```
+
+Parallel calls cut wall-clock latency to roughly the slowest call, but cost is the sum of all calls. Voting with n = 3 triples the spend for that step. It pays off when one wrong answer is expensive (a security review), not for routine text.
+
+In production: chains pass a bad intermediate result forward if there is no gate; routers drift as your traffic mix changes, so log the label distribution; and fan-out hits provider rate limits early, so bound concurrency with a semaphore.
+
+## Orchestrator-workers; evaluator-optimizer
+
+These two patterns are where workflows start to look like agents, because a model makes a structural decision at runtime.
+
+### Orchestrator-workers
+
+An orchestrator model reads the task and decides what subtasks exist. Workers (often the same model with a narrower prompt) handle each subtask, and the orchestrator or code combines the results. The difference from parallelization is that the subtasks are not known in advance. "Summarise these five documents" is parallelization. "Find what changed in our pricing across all competitors" is orchestrator-workers: the orchestrator decides which competitors and which pages.
+
+```python
+async def orchestrate(task, llm, worker, max_subtasks=6):
+    plan = await llm(f"Split into independent subtasks, one per line, at most {max_subtasks}:\n{task}")
+    subtasks = [s.strip("- ").strip() for s in plan.splitlines() if s.strip()][:max_subtasks]
+    results = await asyncio.gather(*[worker(s) for s in subtasks], return_exceptions=True)
+    ok = [(s, r) for s, r in zip(subtasks, results) if not isinstance(r, Exception)]
+    failed = [s for s, r in zip(subtasks, results) if isinstance(r, Exception)]
+    report = "\n\n".join(f"## {s}\n{r}" for s, r in ok)
+    return await llm(f"Combine into one answer. Say which parts failed: {failed}\n\n{report}")
+```
+
+Note the cap on subtasks (orchestrators love to over-decompose), and that failed subtasks are reported, not dropped. Silent partial completion is the classic bug here: four of six workers succeed and the final answer reads as complete. When workers are themselves agents with their own loops and context windows, you are in [multi-agent territory](/25-multi-agent-systems/#orchestrator-sub-agent), with its own token multiplier.
+
+### Evaluator-optimizer
+
+One call generates, another evaluates against explicit criteria and returns feedback, and the generator revises. Repeat until the evaluator passes or you run out of rounds. It works when two things are true: you can state the criteria clearly, and feedback measurably improves the output. Translation with a style guide, code that must pass tests, and answers that must cite only given sources all qualify.
+
+```python
+def refine(task, generate, evaluate, max_rounds=3):
+    feedback = None
+    for round_ in range(1, max_rounds + 1):
+        draft = generate(task, feedback=feedback)
+        verdict = evaluate(task, draft)          # {"pass": bool, "issues": [...]}
+        if verdict["pass"]:
+            return draft, {"rounds": round_, "status": "pass"}
+        feedback = "; ".join(verdict["issues"])
+    return draft, {"rounds": max_rounds, "status": "unresolved", "last_issues": feedback}
+```
+
+The evaluator does not have to be a model. A deterministic checker (a schema validator, a test suite, a regex for banned content) is cheaper, faster and does not share the generator's blind spots. Chat Insights's tutor is an evaluator-optimizer with a code evaluator and `max_rounds = 1`, which the Your project block at the end returns to.
+
+Cost arithmetic: with g tokens per generation and e per evaluation, the worst case is `max_rounds × (g + e)`. With max_rounds = 3, budget for 3 drafts plus 3 evaluations on the hard inputs; every draft returned has been evaluated. Log the round count: if most requests need 3 rounds, fix the generator prompt instead.
+
+## ReAct loop
+
+ReAct ("ReAct: Synergizing Reasoning and Acting in Language Models", Yao et al., 2022) is the paper most people mean by "the agent loop". The idea: interleave **reasoning** (a thought about what to do next) with **acting** (a call to an external tool) and **observing** (reading the tool's result), and repeat. Reasoning alone, as in chain-of-thought, hallucinates facts because it never checks them. Acting alone does not plan or recover. Interleaving lets each thought be grounded in the last observation. The paper tested it on question answering over Wikipedia (HotpotQA), fact checking (FEVER) and two interactive environments (ALFWorld and WebShop).
+
+### The original text format
+
+In 2022 there was no native tool calling, so ReAct used text. The model wrote `Thought:` and `Action:` lines, the harness parsed the action, ran it, and appended an `Observation:` line. In a coding round without a tool-calling API, this is what you will write.
+
+```python
+import re
+ACTION = re.compile(r"Action:\s*(\w+)\[(.*)\]")
+
+def react_text(question, llm, tools, max_steps=6):
+    transcript = f"Question: {question}\n"
+    for _ in range(max_steps):
+        out = llm(PROMPT + transcript, stop=["Observation:"])   # never let it invent observations
+        transcript += out
+        m = ACTION.search(out)
+        if not m:
+            transcript += "\nObservation: no valid Action line; use Tool[input] or Finish[answer].\n"
+            continue
+        name, arg = m.group(1), m.group(2)
+        if name == "Finish":
+            return arg
+        obs = tools[name](arg) if name in tools else f"unknown tool {name}"
+        transcript += f"\nObservation: {obs}\n"
+    return None                                                 # out of steps: say so, don't guess
+```
+
+The `stop=["Observation:"]` argument is the detail interviewers look for. Without it, the model happily writes its own fake observation and continues reasoning from fiction.
+
+### The modern version with tool calls
+
+Today the provider's API returns tool calls as structured data, so you do not parse text. The model's "thought" is either visible text before the call or hidden reasoning tokens ([interleaved thinking](/08-reasoning-models/#interleaved-thinking-with-tools)). The loop is the same shape. Here is a complete, framework-free version with a mocked model, a step limit, a token and cost budget, and errors fed back to the model. It runs as is.
+
+```python
+import json
+from dataclasses import dataclass
+
+PRICE_IN, PRICE_OUT = 3.00 / 1e6, 15.00 / 1e6     # USD per token: placeholders, check the price page
+
+ORDERS = {"A17": {"status": "shipped", "eta": "2026-11-15"}}
+def get_order(order_id: str) -> dict:
+    if order_id not in ORDERS:
+        raise ValueError(f"no order {order_id!r}; ids are uppercase, like A17")
+    return ORDERS[order_id]
+TOOLS = {"get_order": get_order}
+
+def mock_model(script):                            # replays scripted replies; tokens ~ chars / 4
+    replies = iter(script)
+    def call(messages, tool_names):
+        reply = dict(next(replies))
+        reply["usage"] = {"input": sum(len(json.dumps(m)) for m in messages) // 4, "output": 40}
+        return reply
+    return call
+
+@dataclass
+class Budget:
+    max_steps: int = 8
+    max_tokens: int = 20_000
+    max_usd: float = 0.05
+    max_consecutive_errors: int = 3
+
+def execute(call, tools):
+    """Run one tool call. Never raise: an error becomes text the model can read."""
+    fn = tools.get(call["name"])
+    if fn is None:
+        return json.dumps({"error": f"unknown tool {call['name']!r}", "available": sorted(tools)}), False
+    try:
+        return json.dumps({"result": fn(**call["args"])}), True
+    except TypeError as e:                         # wrong or missing arguments
+        return json.dumps({"error": f"bad arguments: {e}"}), False
+    except Exception as e:                         # the tool itself failed
+        return json.dumps({"error": f"{type(e).__name__}: {e}"[:300]}), False
+
+def run_agent(task, model, tools, budget=Budget(), log=print):
+    messages = [{"role": "system", "content": "Answer support questions. Use tools; never guess order data."},
+                {"role": "user", "content": task}]
+    spent, errors = {"tokens": 0, "usd": 0.0}, 0
+    stop = lambda reason, step: {"status": reason, "steps": step, "spent": spent, "messages": messages}
+
+    for step in range(1, budget.max_steps + 1):
+        reply = model(messages, list(tools))                                  # think
+        u = reply["usage"]
+        spent["tokens"] += u["input"] + u["output"]
+        spent["usd"] += u["input"] * PRICE_IN + u["output"] * PRICE_OUT
+        calls = reply.get("tool_calls", [])
+        messages.append({"role": "assistant", "content": reply.get("content", ""), "tool_calls": calls})
+        log(f"step {step}: {len(calls)} call(s), {u['input']} in, ${spent['usd']:.5f} so far")
+
+        if not calls:                                                         # the model chose to answer
+            return {**stop("done", step), "answer": reply["content"]}
+        if spent["tokens"] > budget.max_tokens or spent["usd"] > budget.max_usd:
+            return stop("budget_exceeded", step)                              # stop before acting
+        for call in calls:                                                    # act
+            result, ok = execute(call, tools)
+            errors = 0 if ok else errors + 1
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})   # observe
+        if errors >= budget.max_consecutive_errors:
+            return stop("too_many_errors", step)
+    return stop("max_steps", budget.max_steps)
+
+script = [
+    {"tool_calls": [{"id": "c1", "name": "get_order", "args": {"order_id": "a17"}}]},   # wrong case
+    {"tool_calls": [{"id": "c2", "name": "get_order", "args": {"order_id": "A17"}}]},   # fixed from the error
+    {"content": "Order A17 has shipped and should arrive on 15 November."},
+]
+print(run_agent("Where is my order a17?", mock_model(script), TOOLS)["status"])         # done, 3 steps
+```
+
+Run it and the trace shows the input tokens growing each step (36, then 96, then 155 with this tiny prompt), the first call failing, the error going back as a tool result, and the model fixing the argument. Swap the script for ten identical bad calls and the run ends with `too_many_errors` after 3 steps. Raise the error cap and it ends with `max_steps`. Every exit returns a status and the full message list, so the caller can tell "done" from "gave up" and never mistakes a stopped run for a finished one.
+
+Things to notice, because each is a section below:
+
+- The loop's **only success exit** is the model answering without a tool call. Every other exit is a failure with a reason.
+- The **budget check runs before acting**, so you never start a side effect you cannot afford to finish reasoning about.
+- **Errors are data**: the tool's exception becomes a JSON string in the conversation, and the model reads it.
+- The **state is just `messages`** plus two counters, so checkpointing is a `json.dump`. (The budget exit leaves the last tool calls unanswered; a resumed run must answer or drop them before the next model call.)
+
+<Callout type="interview">
+
+In a "write a ReAct loop" round, say the exits out loud before you code: final answer, max steps, budget, repeated errors. Then write the loop, keep tool errors inside the conversation, and return a status with every exit. Ask whether you may use a native tool-calling format or must parse text.
+
+</Callout>
+
+## Stop conditions and budgets
+
+The model decides when the task is done. Your code decides when the model has had enough. You need both, because a model can be wrong about being done (it stops early) and wrong about not being done (it never stops).
+
+### The exits
+
+| Exit | Who triggers it | What the caller sees |
+|---|---|---|
+| Final answer (no tool call) | model | `done` + answer |
+| `finish` tool called | model | `done` + structured result |
+| Max steps | harness | `max_steps` + partial state |
+| Token or cost budget | harness | `budget_exceeded` + partial state |
+| Wall-clock deadline | harness | `timeout` + partial state |
+| Consecutive errors | harness | `too_many_errors` + last error |
+| Repeated identical call | harness | `stuck` + the repeated call |
+| Human interrupt or approval needed | harness | `awaiting_approval` + pending call |
+
+A **`finish` tool** is often better than "no tool call means done", because it lets you demand a structured final result (`status`, `answer`, `unresolved_items`) and reject a finish that leaves items unresolved. That is a cheap defence against silent partial completion.
+
+**Stuck detection** catches a failure mode that step limits catch too late: the model calls the same tool with the same arguments over and over.
+
+```python
+from collections import Counter
+
+def is_stuck(messages, window=6, repeats=3):
+    calls = [json.dumps([c["name"], c["args"]], sort_keys=True)
+             for m in messages[-window * 2:] if m["role"] == "assistant" for c in m.get("tool_calls", [])]
+    return any(n >= repeats for n in Counter(calls).values())
+```
+
+### Why the budget must be on tokens and money, not only steps
+
+Each step re-sends the whole history. Suppose the fixed prefix (system prompt plus tool schemas) is P = 3,000 tokens and each step adds d = 500 tokens (the model's call plus the tool result). Step k sends `P + (k − 1) × d` input tokens. Over n steps:
+
+```text
+total_input(n) = n × P + d × n(n − 1) / 2
+
+n = 10:  10 × 3,000 + 500 × 45    =  30,000 +  22,500 =  52,500 tokens
+n = 50:  50 × 3,000 + 500 × 1,225 = 150,000 + 612,500 = 762,500 tokens
+```
+
+Five times the steps gives about fifteen times the input tokens, because the second term is quadratic (Bojie Li's chapter 1 poses the same fact, for cumulative cache reads, as an exercise). At placeholder prices of $3 per million input tokens and $15 per million output (check the current price page), with 200 output tokens per step:
+
+```text
+10 steps: 52,500 × $3/M + 2,000 × $15/M  = $0.158 + $0.030 = ~$0.19 per task  -> ~$190 per 1K tasks
+50 steps: 762,500 × $3/M + 10,000 × $15/M = $2.29 + $0.15  = ~$2.44 per task
+```
+
+Now the runaway case. If 1% of 100,000 daily runs get stuck and burn to a 50-step cap, that is 1,000 × $2.44 ≈ $2,440 a day from runs that produced nothing. A step cap alone would not tell you this. A dollar cap per run, plus a daily cap per user and per tenant, would. Prompt caching cuts the prefix part (cached input is billed at a fraction of the normal price; check the provider), which is one more reason to keep the prefix stable ([cache-aware layout](/27-context-engineering/#cache-aware-layout)).
+
+### Latency budget
+
+Latency is roughly `steps × (model latency + tool latency)`. With 2 s per model call and 0.5 s per tool, ten steps take about 25 s. That is fine for a background job and too slow for a chat box, which is why chat products stream progress ("Searching orders...") and set a wall-clock deadline that returns the best partial answer. Parallel tool calls in one step ([chapter 21](/21-tool-use/#parallel-calls)) are the main lever for cutting step count.
+
+### Compounding error
+
+If each step is right with probability p and steps are independent, a task of n steps succeeds with probability p to the power n. With p = 0.95: ten steps gives 0.95^10 ≈ 0.60, twenty steps gives 0.95^20 ≈ 0.36. With p = 0.99, twenty steps gives about 0.82. Real steps are not independent, and a good agent recovers from some errors, but the shape is right: long loops need either very reliable steps or checkpoints where errors are caught. This is the quantitative case for workflows.
+
+<Callout type="tip">
+
+Set the step cap from data, not instinct. Run the agent on your eval set, plot steps per successful task, and set the cap near the p99 of successful runs. Anything beyond that is almost always a stuck run.
+
+</Callout>
+
+## State and message history
+
+In the loop above, the agent's state is the `messages` list: system prompt, task, then alternating assistant turns and tool results. The model is stateless and sees exactly this list on every call. If something is not in the list, the agent does not know it.
+
+### The invariants
+
+Provider APIs enforce a few rules, and breaking them gives you a 400 error in the middle of a run.
+
+- Every tool call the assistant makes must be followed by a matching tool result (same id) **before the next model call**. If you run three parallel calls, you append three results.
+- If you trim history to save tokens, you must drop a call and its result together. Dropping only one breaks the pairing.
+
+### Append-only, and why
+
+Treat the history as an append-only log: prompt caching only helps when the prefix is byte-identical, an append-only log is easy to checkpoint and replay, and it is an honest audit trail. When the history gets too long, you **compact** it deliberately (summarise older steps into one message) rather than editing it here and there; [chapter 27](/27-context-engineering/#compaction) covers how.
+
+### Own the format
+
+12-Factor Agents argues you should own your context window: the provider's message list is one way to present state, not the only one. You can keep your own event log and render it compactly:
+
+```python
+def render(events):
+    lines = []
+    for e in events:
+        if e["type"] == "tool_result" and len(e["data"]) > 2000:
+            e = {**e, "data": e["data"][:2000] + " ...[truncated, ask for more with page=2]"}
+        lines.append(f"<{e['type']}>\n{e['data']}\n</{e['type']}>")
+    return "\n".join(lines)
+```
+
+That gives you control over truncation and ordering, which matters: one oversized tool result can push the task out of the model's effective attention ([context rot](/27-context-engineering/#context-rot)).
+
+### Execution state vs business state
+
+**Execution state** is where the run is (step, retry counts, waiting for a human); **business state** is what has happened (messages, calls, results). 12-Factor's factor 5 says derive the first from the second and keep one record: a run "waiting for approval" is one whose last event is an unanswered approval request. One record cannot disagree with itself.
+
+The first state failure you will meet in production is unbounded growth: a long tool result per step, and the run dies with a context-length error at step 30 after spending real money. Count tokens before each call and compact or stop first.
+
+## Error recovery
+
+Errors in an agent come from four places, and each needs a different response. Mixing them up is the most common design mistake.
+
+| Error | Example | Who handles it | How |
+|---|---|---|---|
+| Transport | 429, 503, timeout calling the model | harness | retry with exponential backoff and jitter; the model never sees it |
+| Malformed call | unknown tool, bad JSON, wrong argument type | model | return the validation error as the tool result |
+| Tool failure | record not found, API returned 500 | model, then harness | return a short error; harness counts repeats |
+| Semantic failure | tool "succeeded" but the result is wrong | harness | verification step, test, or human check |
+
+### Transport errors stay out of the context
+
+Retrying a 503 is plumbing. Wrap the model call so the loop never sees transient failures, and cap total retry time so a provider outage does not hang every run.
+
+```python
+import random, time
+
+def call_with_retry(model, messages, tools, attempts=4, base=0.5):
+    for i in range(attempts):
+        try:
+            return model(messages, tools)
+        except TransientError:                       # 429, 5xx, timeouts: your client's error types
+            if i == attempts - 1:
+                raise
+            time.sleep(base * 2 ** i + random.uniform(0, base))   # 0.5, 1, 2 s plus jitter
+```
+
+### Tool errors go into the context, compactly
+
+This is 12-Factor's factor 9: a capable model reads an error and fixes its next call, as the `a17` example showed. Three rules make it work. Write errors for the model, not for a log: say what was wrong and what a valid value looks like. Keep them short, because a 5,000-token stack trace costs money on every later step and buries the task. And cap consecutive errors (the essay suggests around three), resetting the count on success, then take a different path: escalate, fall back, or stop with a clear status.
+
+### Retries and side effects
+
+A retry is safe only if the tool is idempotent. If `charge_card` timed out, you do not know whether it ran. Retrying without an idempotency key can charge twice. This is the main reason write tools need idempotency keys and why [chapter 21](/21-tool-use/#idempotency-retries-side-effects) spends a section on it. In the loop, the rule is: never auto-retry a non-idempotent tool; return the ambiguity to the model or a human.
+
+### Semantic failures need verification
+
+The worst errors raise no exception: the search returned the wrong company's pricing, or the code compiled but no test ran. Only a check catches these, which is the next section.
+
+## Reflection
+
+Reflection means the agent looks at its own output or trajectory and revises. Self-Refine (Madaan et al., 2023) had the same model critique and rewrite its output in a loop. Reflexion (Shinn et al., 2023) had an agent write a short verbal lesson after a failed attempt and carry it into the next attempt ([Reflexion in planning](/24-planning/#reflexion)).
+
+The useful finding from the follow-up work is about **where the signal comes from**. "Large Language Models Cannot Self-Correct Reasoning Yet" (Huang et al., 2023) found that when a model reviews its own reasoning with no external feedback, it often fails to improve and sometimes changes right answers to wrong ones. The reflection that reliably helps is grounded in something outside the model: a failing test, a validator error, a tool result that contradicts the claim, or a separate checker with different information.
+
+So design reflection as **verify, then revise**, not "think again":
+
+```python
+def answer_with_check(task, agent, verify, max_revisions=1):
+    out = agent(task)
+    for _ in range(max_revisions):
+        problems = verify(out)                       # tests, schema, number-vs-source, policy rules
+        if not problems:
+            return out, "verified"
+        out = agent(task + "\n\nYour previous answer failed these checks:\n" + "\n".join(problems))
+    return out, ("verified" if not verify(out) else "unverified")
+```
+
+Each revision costs a full agent run or at least a long call, so cap it (one is often enough) and record whether the final answer was verified. Reflection also has a subtle production failure: the model learns to satisfy the checker rather than the task, for example by weakening a test until it passes. Keep checkers outside the agent's write access.
+
+## Harness design
+
+Bojie Li's book frames an agent as model + context + tools, with the **harness** as the code around the model that makes it reliable: it builds context, exposes tools, enforces permissions, runs the loop, verifies and recovers. Two teams with the same model ship very different agents because their harnesses differ.
+
+```text
++------------------------------------------- harness --------------------------------------------+
+| context builder -> model call -> parse -> policy check -> tool executor -> result shaper -+     |
+|      ^                (retry)               (permissions,    (sandbox,       (truncate,    |     |
+|      |                                       approval)       timeouts)       redact)       |     |
+|      +-------------------------- append to event log <----------------------------------- +     |
+|  budgets & stop rules . checkpoint store . tracer (one span per step) . verifier on finish       |
++------------------------------------------------------------------------------------------------+
+```
+
+- **Context builder**: stable prefix first (system, tools), then the log, then the newest result.
+- **Tool policy**: autonomy matched to blast radius. Read tools run freely, reversible writes are logged, irreversible or costly writes wait for a human.
+- **Executor**: timeouts, sandboxing, and result shaping (truncate, redact secrets, mark output as untrusted because it can carry [prompt injection](/33-security-prompt-injection/#indirect-injection)).
+- **Budgets, stop rules, checkpoint store**: the previous and next sections.
+- **Tracer**: one span per model and tool call, nested under the run, with tokens, cost and latency ([agent trajectory tracing](/30-observability/#agent-trajectory-tracing)).
+- **Verifier**: a check before "done" is accepted.
+
+### Agents as state machines and graphs
+
+A loop with all these rules is a **state machine**: states like `thinking`, `acting`, `awaiting_approval`, `verifying`, `done`, `failed`, and transitions between them. Making that explicit pays off once you mix fixed steps with model-chosen ones. In a graph, some edges are fixed by code and some are chosen by the model at a decision node.
+
+```python
+GRAPH = {
+    "classify": lambda s: "draft" if s["label"] != "legal" else "escalate",   # fixed rule
+    "draft":    lambda s: "check",
+    "check":    lambda s: "send" if s["check_ok"] else ("draft" if s["drafts"] < 2 else "escalate"),
+    "send": None, "escalate": None,                                          # terminal
+}
+
+def run_graph(state, nodes, start="classify"):
+    node = start
+    while GRAPH[node] is not None:
+        state = nodes[node](state)            # each node may be code, one LLM call, or a whole agent loop
+        state["trail"].append(node)
+        node = GRAPH[node](state)
+    return nodes[node](state)
+```
+
+This is the mental model behind LangGraph and similar tools: nodes do work, edges route, state is a typed dict passed through, and a checkpointer saves state after each node. You can write it in 15 lines, and the 15 lines make the auditor's question ("can this ever send without a check?") answerable by reading the edge table.
+
+## Long-running agents, checkpointing, resumability
+
+A chat turn lives inside one HTTP request. Many useful agents do not: they wait hours for a human approval, run a two-hour data job, or work across many context windows on a large codebase. For these the process will restart under them (deploys, crashes, autoscaling), so the run must survive outside the process.
+
+### Checkpoint after every step
+
+Because the state is a JSON-serialisable log plus a few counters, a checkpoint is a file write or a database row. Write it atomically so a crash never leaves half a checkpoint. The loop becomes "load, step, save" until the status is no longer `running`, and a run that needs a human simply stops with a pending call saved.
+
+```python
+import json, os, tempfile
+
+NEEDS_APPROVAL = {"refund_order"}
+
+def save(path, state):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)                                   # atomic rename
+
+def step(state, model, tools):
+    if state["pending"]:                                    # resuming after a human decision
+        call, decision = state["pending"], state.pop("decision")
+        result = execute(call, tools)[0] if decision == "approve" else '{"error": "a human rejected this call"}'
+        state["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        state["pending"] = None
+        return state
+    reply = model(state["messages"], list(tools))
+    calls = reply.get("tool_calls", [])
+    state["messages"].append({"role": "assistant", "content": reply.get("content", ""), "tool_calls": calls})
+    state["step"] += 1
+    state["status"] = "running" if calls else "done"
+    for call in calls:
+        if call["name"] in NEEDS_APPROVAL:                  # pause: save and return, no thread waits
+            state["pending"], state["status"] = call, "awaiting_approval"
+            break                                           # sketch: assumes the risky call comes last
+        state["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": execute(call, tools)[0]})
+    return state
+
+def run(path, model, tools, max_steps=8):
+    state = json.load(open(path))
+    while state["status"] == "running" and state["step"] < max_steps:
+        state = step(state, model, tools)
+        save(path, state)
+    return state
+```
+
+When the human clicks approve (in Slack, email or a web UI), a webhook loads the file, sets `decision` and `status = "running"`, and calls `run` again. No process sat waiting. This is 12-Factor's factors 6 and 7 in practice: launch, pause and resume through simple APIs, and treat "contact a human" as just another tool call whose result arrives later.
+
+### The crash-between-act-and-save problem
+
+If the process dies after a tool ran but before the checkpoint was saved, resume will run the tool again. For read tools that is harmless. For writes, either pass an idempotency key derived from the run id and call id (so the second call is a no-op), or record "about to call X" before acting and check the external system on resume. This is the same at-least-once problem as any job queue, and durable-execution engines (Temporal and similar) exist to handle it for you.
+
+### Across context windows
+
+Very long tasks outgrow one context window, and compaction alone loses detail. Anthropic's post on harnesses for long-running agents (2025) describes a coding pattern: a first session writes a JSON feature list with every item marked not done, a progress file and an initial git commit; every later session reads the progress file and git log, picks one unfinished feature, tests it end to end, commits and updates the notes. The failure modes it reports are worth quoting: doing too much in one session and running out of context mid-feature, and a later session seeing progress and declaring the job done. The fix for both is external, checkable state rather than the model's sense of where it is. [Chapter 28](/28-coding-and-computer-use-agents/#long-running-sessions) goes further.
+
+<Callout type="warn">
+
+Do not hold a long-running agent inside a web request or a single worker's memory. A deploy will kill it, and with no checkpoint the user gets nothing and you still pay for every step so far.
+
+</Callout>
+
+## Frameworks vs hand-rolled
+
+You have now seen the whole loop in under 100 lines. So what does a framework (LangGraph, the OpenAI Agents SDK, the Claude Agent SDK, smolagents, PydanticAI, CrewAI, LlamaIndex agents) do for you? Mostly the parts around the loop:
+
+- turns Python functions into tool schemas from type hints and docstrings;
+- runs the loop, including parallel tool calls and provider differences in message format;
+- graph and state abstractions with a checkpointer (in-memory, SQLite, Postgres) and human interrupts;
+- built-in tracing hooks, handoffs between agents, and streaming;
+- for agent SDKs from model vendors, a tuned harness with file, shell and search tools already written.
+
+"Building effective agents" advises starting with the model API directly, since many patterns are a few lines, and understanding the code under any framework you adopt, because abstractions hide the actual prompts and responses. 12-Factor Agents goes further: teams get a framework demo to 70 to 80% quality quickly, then find the last stretch needs control over prompts, context and flow that the framework hides.
+
+How to decide, in an interview or at work:
+
+| Pick a framework when | Hand-roll when |
+|---|---|
+| you need durable checkpoints and interrupts and do not want to build them | the loop is simple and the product depends on exact prompt and context control |
+| the team already knows it and it is in your stack | you need to explain every token sent, for cost or compliance |
+| you are prototyping and will measure before committing | the framework's abstraction fights your control flow (custom approvals, odd state) |
+| you want a vendor's tuned harness (coding, computer use) | you are debugging and cannot see what was sent |
+
+A sound middle path: hand-roll the loop and borrow pieces (a schema generator, a tracing library, a durable-execution engine). Either way, keep the ability to print the exact request sent at every step; without it you cannot debug.
+
+## Failure modes
+
+The production notes for this chapter list four failures. Here is each with its cause and the control that catches it.
+
+**Infinite loops.** The model repeats a call that keeps failing, or alternates between two tools. Cause: an error message that does not say how to fix the call, or a goal that cannot be met with the tools given. Control: stuck detection, consecutive-error cap, step and dollar caps, and an alert on runs that hit them.
+
+**Goal drift.** After many steps the agent solves a different problem ("fix the failing test" becomes "refactor the module"), because the task is far back in a long context and recent tool output dominates. Control: restate the goal and remaining items near the end of the context each step (a todo list does this), keep tool results short, and check the final result against the original task.
+
+**Compounding errors.** An early wrong fact (the wrong customer id) flows through every later step. Cause: no verification between steps. Control: validate key facts when first obtained, add gates at known checkpoints, and prefer workflows for long, well-understood sequences.
+
+**Silent partial completion.** The agent finishes five of eight items and writes a confident summary. Cause: "done" is the model's opinion. Control: a `finish` tool with a required `unresolved_items` field, a verifier that checks the original list, and a status in the API response that distinguishes `done`, `partial` and `failed`.
+
+Four more you will meet:
+
+- **Premature victory**: the agent declares success after a weak check (unit tests only, no end-to-end run). Make the definition of done a check the harness runs.
+- **Hallucinated tools or arguments**: calling a tool that does not exist or inventing an id. Return the list of valid tools in the error; validate ids against real data.
+- **Context overflow**: one huge tool result per step until the window fills. Truncate and paginate results; count tokens before calling.
+- **Injection through tool results**: a web page or email the agent reads contains instructions. Treat tool output as data, limit which tools can follow which, and require approval for writes after untrusted reads ([the lethal trifecta](/33-security-prompt-injection/#the-lethal-trifecta)).
+
+To find these you need a **trace tree per run**: run, then steps, then model and tool calls as child spans, each with inputs, outputs, tokens, cost and latency. Then review real traces and label failures before you write evals for them ([trace review](/19-evals-methodology/#trace-review)).
+
+## Twelve-factor principles
+
+*12-Factor Agents* by Dex Horthy of HumanLayer (2025) is a set of short essays modelled on the twelve-factor app. Its thesis is that good production agents are mostly ordinary software with model calls placed at the right points, and that teams should own the parts frameworks tend to hide. Here are the factors in my own words, grouped by what they control, with where each shows up in this chapter.
+
+**What the model produces**
+
+1. *Natural language to tool calls.* The model's core job is turning a request into a structured call code can execute.
+4. *Tools are just structured outputs.* A tool call is JSON the model wrote; your code decides whether and how to act on it.
+
+**What the model sees**
+
+2. *Own your prompts.* Keep prompts in your code, versioned and tested, not generated by a framework you cannot read.
+3. *Own your context window.* Choose what goes in and in what format ([State and message history](#state-and-message-history)).
+9. *Compact errors into the context window.* Short errors back to the model, consecutive errors capped ([Error recovery](#error-recovery)).
+13 (appendix). *Pre-fetch context you will probably need.* If the model will almost certainly call a tool first, call it in code and put the result in the prompt, saving a step.
+
+**Who controls the flow**
+
+8. *Own your control flow.* Your code decides what happens after each tool call: loop back, pause for a human, compact or stop; for example, break between "the model chose a risky tool" and "the tool ran" so a human can approve.
+7. *Contact humans with tool calls.* Asking a human is a tool like any other, in the same loop and log.
+10. *Small, focused agents.* Scope agents to short sub-tasks (the essay suggests roughly 3 to 10 steps, about 20 at most) so context stays small; larger processes become workflows of small agents.
+
+**How runs live in your system**
+
+5. *Unify execution state and business state.* One event log, from which you derive "where are we".
+6. *Launch, pause and resume with simple APIs.* Runs are records that can be started, stopped and continued by any process (see [checkpointing](#long-running-agents-checkpointing-resumability)).
+11. *Trigger from anywhere.* Start runs from chat, email, a cron job or a webhook, and reply through the same channel.
+12. *Make your agent a stateless reducer.* The agent is a function `(state, event) -> new state`. The whole run is a fold over events.
+
+Factor 12 ties the chapter together. `step(state, model, tools)` in the checkpointing code takes a state and returns the next one: loop it and you have an agent, save between calls and you have durability, replay the events and you have debugging. The essays say little about evals, memory or multi-agent systems, but as a checklist for "is this agent production-shaped?" they are hard to beat. (The text is CC BY-SA 4.0: attribute it if you ever publish derived material.)
+
+<Production>
+
+**Failure modes.** Infinite loops (stuck detection, an error cap of about 3, step and dollar caps). Goal drift (restate the goal and remaining items each step). Compounding errors (gates and verification; 0.95^10 ≈ 0.60). Silent partial completion (a `finish` tool with `unresolved_items`, a verifier, and `done` / `partial` / `failed` statuses).
+
+**Cost.** Input tokens grow as `n × P + d × n(n − 1) / 2`: 50 steps send about 762K input tokens versus 52.5K for 10. Cap dollars per run and per user and tenant per day; alert on cap hits. Cache the stable prefix, truncate tool results, pre-fetch obvious first calls. A stuck 1% of runs can cost a large share of the bill.
+
+**Latency.** Roughly `steps × (model latency + tool latency)`; 10 steps at 2.5 s is about 25 s. Cut steps with parallel calls and pre-fetching, use a smaller model for routine steps, stream progress, and set a wall-clock deadline that returns the best partial answer.
+
+**Observability.** A trace tree per run (run, step, model and tool calls) with tokens, cost, latency and stop reason per span. Dashboards for steps per task (p50, p95), exit reasons, cost per task and errors per tool. Review sampled traces weekly; turn failures into eval cases.
+
+**Security.** Match autonomy to blast radius: read tools run freely, reversible writes are logged, irreversible or costly writes wait for a human approval saved as a checkpoint. Use the narrowest credentials that work. Treat tool results as untrusted input; a run that has read untrusted content does not write without approval. Never auto-retry non-idempotent tools.
+
+</Production>
+
+<Interview>
+
+<Q q="Workflow or agent: how do you decide?">
+
+- Define both: in a workflow my code owns the control flow; in an agent the model chooses the next step and when to stop.
+- Default to the simplest thing that passes the eval: one augmented call, then a workflow (chain, router, fan-out), then an agent.
+- Agent only when the steps cannot be known in advance: the next search depends on the last result, sub-step count varies widely, or recovery needs judgment.
+- Name the cost of autonomy: unbounded latency and spend (quadratic tokens in steps), compounding error (0.95^10 ≈ 0.60), harder testing, wider blast radius.
+- Hybrids are common: a model writes a plan once, code executes it; or a workflow with one agentic node.
+- Decide with data: run both on the same eval set and compare success rate, p95 latency and cost per task.
+- **The trap:** "agents are more powerful, so use an agent", or choosing by what a framework demo makes easy.
+
+</Q>
+
+<Q q="Implement a ReAct loop from scratch.">
+
+- State the exits first: final answer (no tool call or a `finish` tool), max steps, token or dollar budget, consecutive errors, stuck detection.
+- Loop: call model with messages and tool schemas; append the assistant turn; if no tool calls, return; else run each call, append each result with the matching call id, repeat.
+- Tool errors become tool results (short, says how to fix), not exceptions that kill the run; reset the error count on success.
+- Check the budget before running tools; return a status and the messages on every exit so the caller can tell done from gave up.
+- Text-format variant: parse `Action: tool[input]` with a regex and set `stop=["Observation:"]` so the model cannot invent observations.
+- Mention what you would add next: checkpoint per step, approval gate for write tools, one trace span per step.
+- **The trap:** a `while True` with no exits except the final answer, or letting a tool exception crash the loop.
+
+</Q>
+
+<Q q="Design a support agent that drafts replies and escalates complex tickets." reported>
+
+- **Scope and SLOs:** email and chat tickets; agent drafts, a human sends at first (draft-only mode), auto-send later only for low-risk categories that meet a quality bar. Draft within about 30 s; escalation precision and recall as the key metrics.
+- **Architecture:** mostly a workflow with one agentic node. Route (category, language, risk) → retrieve policy docs and customer history (pre-fetched) → agent loop with read tools (`get_order`, `get_account`, `search_kb`) to draft → verifier → send-or-escalate.
+- **Escalation rules in code, not only in the prompt:** legal, refunds above a threshold, angry or vulnerable customers, low retrieval confidence, any budget or error exit, and an `escalate` tool the model can call with a reason and a summary for the human.
+- **Models:** small model for routing and classification, stronger model for drafting; step cap around 6 to 8, dollar cap per ticket.
+- **Evals:** labelled set of past tickets with gold escalate/no-escalate and good replies; measure escalation precision and recall, policy faithfulness of drafts (judge validated against humans), agent edit rate, resolution rate.
+- **Guardrails:** no write tools without approval (refunds go through a human), PII redaction in logs, ticket text treated as untrusted (injection), template fallback if the model fails.
+- **Observability and cost:** trace per ticket; with about 4 steps on a 4K-token context, input is 4 × 4K plus history growth, on the order of 20K tokens per ticket; multiply by the current price.
+- **The trap:** a fully autonomous agent that sends replies and issues refunds on day one, with escalation left to the model's discretion.
+
+</Q>
+
+<Q q="How do you stop an agent from looping forever?">
+
+- Layered exits: max steps (set near the p99 of successful runs), token and dollar budget per run, wall-clock deadline.
+- Consecutive-error cap (about 3, reset on success) and stuck detection on repeated identical calls.
+- Fix the cause too: errors that tell the model how to correct the call, and a `finish` tool so "done" is explicit.
+- Every exit returns a status and partial state; nothing ends silently.
+- Global controls: per-user and per-tenant daily caps, alerting on cap hits, a kill switch.
+- Quote the cost math: tokens grow as `n × P + d × n(n − 1) / 2`, so a stuck run at 50 steps costs about 15 times a 10-step run.
+- **The trap:** "set max_iterations = 10" as the whole answer, with no budget, no stuck detection, and no status for the caller.
+
+</Q>
+
+<Q q="Framework or hand-rolled? Defend your choice.">
+
+- The loop itself is under 100 lines; the hard parts are context control, error handling, checkpoints, approvals and tracing.
+- Frameworks give tool schemas from functions, graph state with checkpointers, interrupts, tracing hooks and multi-agent handoffs.
+- Costs of frameworks: hidden prompts and context, abstractions that fight custom control flow, upgrade churn, harder debugging.
+- My default: hand-roll the loop, borrow focused libraries (schema generation, tracing, durable execution); use a full framework when durable interrupts and graphs are needed and the team knows it.
+- Non-negotiable either way: I can print the exact request sent at every step.
+- **The trap:** an absolute answer ("never use frameworks" or "always LangChain") with no criteria.
+
+</Q>
+
+<Q q="Your agent reported success but only finished part of the task. How do you catch this?">
+
+- Make "done" a check, not an opinion: a `finish` tool whose result includes `unresolved_items`.
+- A harness verifier checks the original task list (tests, record counts), not the model's summary.
+- Keep progress in external state (a JSON todo list the model can only tick).
+- Return `partial` as a first-class status, and add the case to the eval set.
+- **The trap:** "ask the model to double-check its work", which is ungrounded self-review.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** hand-roll an agent loop of about 200 lines with no framework, with step, token and dollar limits, error feedback, checkpointing to disk and resume, and use it on one real workflow. Do it in **Memory Agent** (`~/memory-agent`), in TypeScript next to `src/agent.ts`, because Memory Agent already has the pieces a loop needs (a planner, a memory store, a cost formula) but no client-side tool loop.
+
+**Model:** run offline. Either a mock model that replays a scripted list of replies (as in this chapter), or Ollama with a tool-calling model (for example a Qwen 2.5 or Llama 3.1 instruct model) through its local chat API with a `tools` field. No paid API.
+
+**Steps**
+
+1. Create `src/loop.ts` with a `Budget` type (`maxSteps`, `maxTokens`, `maxUsd`, `maxConsecutiveErrors`) and a `runLoop(state, model, tools, budget)` that returns `{ status, steps, spent, messages }` on every exit.
+2. Wrap two or three existing Memory Agent capabilities as client tools: topic recall over the memory store, the date resolver, and a stub `fetch_page` that reads from a local fixture. Each tool returns JSON and turns failures into short, fixable error messages.
+3. Add stuck detection (same call and args 3 times in the last 6 calls) and a consecutive-error cap of 3.
+4. Add a checkpoint: after every step, write the state atomically to `data/runs/<run-id>.json`. Add `resume(runId)` that loads and continues.
+5. Mark one tool as needing approval; the loop saves `awaiting_approval` and returns. A small CLI command approves or rejects and resumes.
+6. Log one line per step (step, tools called, input tokens, running cost) and print the exit status.
+7. Write five scripted runs: success, recoverable bad argument, stuck loop, budget exceeded, approval then resume after killing the process.
+
+**Definition of done:** all five scripted runs end in the expected status; killing the process mid-run and calling `resume` finishes the run without repeating completed tool calls; the cost per run printed matches `n × P + d × n(n − 1) / 2` within rounding for the mock; and you can explain each exit out loud in two sentences.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Say it plainly: none of your repos has an open-ended tool loop.** Every "agent" you have shipped is a bounded pipeline. That is the right call for those products and a good interview answer to "workflow or agent?", but it is a gap for agent roles, and Memory Agent is where to close it (Apply it above).
+- **Memory Agent is a routed workflow with a speculative branch.** The header of `src/agent.ts` spells out the pipeline: deterministic date and memory prep, a Haiku planner, a streamed search-and-write call, a code number guard, then claim extraction after the reply. The planner's intent routes to a model per turn type (`config.models.chat`, `search`, `recheck` in `src/config.ts`), and if the planner throws, `fallbackPlan` in `src/planner.ts` keeps the turn alive. The speculative writer (`src/gate.ts`) runs alongside the planner and is kept or discarded once the plan arrives; it is off by default in `src/config.ts` until its quality effect is measured.
+- **Memory Agent already has budgets, just not a loop.** The search budget scales with the entity count and is capped (`maxSearchesPerTurn` 6, `maxSearchesCap` 10), each writer call is aborted at a 45 s deadline (`turnDeadlineMs`), and per-turn cost discounts cache reads. The closest thing to a loop is in `src/answer.ts` at line 85: at most 3 rounds, re-sending the turn when the server-side `web_search` returns `pause_turn`. That is a bounded continuation of a provider-run tool, not your own tool loop.
+- **Chat Insights is an evaluator-optimizer with a code evaluator and one round.** `produceReply` in `backend/src/lc/services/chatService.js` (line 66) generates, runs `guardReply` (`backend/src/lc/domain/guard.js`, line 180), retries once with the violations appended as "REVISION REQUIRED" (hotter sampling when the problem was a repeated reply), and falls back to a rung-aware template otherwise. A kill switch (`LC_KILL_LLM`) short-circuits to the template, and an atomic daily hint cap (around line 152) bounds spend. Use it to explain grounded reflection and why the evaluator is code, not a model.
+- **The story:** "I chose bounded pipelines because the steps were known and I needed predictable latency and cost; Memory Agent bounds itself with a search cap and a deadline, Chat Insights with one retry and a template fallback. For open-ended tasks I hand-rolled a loop in Memory Agent with budgets, checkpoints and an approval gate." Say the last sentence only once it is built.
+
+</YourProject>

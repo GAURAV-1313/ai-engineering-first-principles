@@ -1,0 +1,7 @@
+---
+import { highlight } from '../lib/highlight';
+interface Props { code: string; file: string; from?: number | null; numbered?: boolean }
+const { code, file, from = null, numbered = false } = Astro.props;
+const html = await highlight(code, file);
+---
+<div class:list={['ev-code', { numbered: numbered && from }]} style={numbered && from ? `--ln: ${from - 1}` : undefined} set:html={html} />

@@ -1,0 +1,738 @@
+---
+id: "19"
+title: "Evals I: Methodology and Error Analysis"
+summary: "Turn real traces into a failure taxonomy, the taxonomy into a versioned eval set with cheap checks, and eval scores into decisions you can defend with error bars."
+readingTime: "36 min"
+---
+
+You change one line in a prompt. You try it on the three questions you always try. Two answers look better, one looks the same. You ship. Ten days later a user writes in: the bot now answers Hindi questions in English. Nothing in your test habit could have caught that, because your test habit was three questions you picked from memory and your own eyes on the output.
+
+That is the normal state of an LLM product with no evals. The input space is open, the output is sampled, and every prompt edit or model upgrade moves behaviour in places you did not look. Unit tests cover the deterministic code around the model, not the answers.
+
+Evals are the measurement system for that behaviour. This chapter covers the method: finding what actually goes wrong (error analysis), turning it into test cases with checks (eval sets and metrics), and reading the numbers without fooling yourself (statistics). The next chapter covers the tools built on top: [LLM judges](/20-evals-judges-and-ci/#llm-as-judge-design), RAG and agent evals, and [evals in CI](/20-evals-judges-and-ci/#evals-in-ci).
+
+One idea runs through all of it: **look at the data before you choose the metric.** Most failed eval efforts start with a metric ("helpfulness, 1 to 5") and never connect it to the failures users hit.
+
+## Evals as the core loop
+
+### The problem
+
+"POST /orders returns 201 and writes a row" is true or false, and a test checks it. An LLM feature has no complete spec: "answer the farmer's question correctly, in their language, citing the document" hides a hundred sub-requirements you discover only when an output violates one.
+
+So the work is a loop, not a checklist:
+
+```text
+   production traces / test inputs
+              │
+              ▼
+   ┌─────────────────────┐
+   │ 1. look at outputs  │  read 50-100 traces end to end
+   └─────────┬───────────┘
+             ▼
+   ┌─────────────────────┐
+   │ 2. error analysis   │  note what went wrong, group into failure modes, count
+   └─────────┬───────────┘
+             ▼
+   ┌─────────────────────┐
+   │ 3. measure          │  a check per failure mode: code assertion or judge
+   └─────────┬───────────┘
+             ▼
+   ┌─────────────────────┐
+   │ 4. change           │  prompt, retrieval, code guard, model, data
+   └─────────┬───────────┘
+             ▼
+   ┌─────────────────────┐
+   │ 5. compare          │  before vs after, with error bars, per slice
+   └─────────┬───────────┘
+             ▼
+          ship, monitor, collect new traces ──► back to 1
+```
+
+### Why it is the core skill
+
+Every other skill in this book needs a way to tell whether a change helped. Without evals, prompt engineering is guessing and model selection is reading leaderboards. Hamel Husain's essay "Your AI Product Needs Evals" (2024) frames the work in three levels of rising cost:
+
+- **Level 1, assertions.** Cheap code checks that run on every change: the output parses, cites only retrieved ids, is in the right language, contains no leaked system prompt.
+- **Level 2, human and model review.** Someone (or a validated judge) reads outputs and grades them against criteria that code cannot check.
+- **Level 3, online tests.** A/B tests and production metrics, once you have users. See [A/B tests and shadow traffic](/32-deployment-and-llmops/#a-b-tests-and-shadow-traffic).
+
+You run Level 1 constantly, Level 2 on every meaningful change, and Level 3 when traffic allows.
+
+### The trap
+
+The tempting first step is to write evals for the failures you imagine. Memory Agent's design notes record what happened when Gaurav did that: he predicted three failures before the first eval iteration, all three passed, and what actually failed was an honesty-under-pressure case he had not thought of (a simulated skeptical user got the agent to deny searches it had made and call its own correct quotes "made up"). Your imagination is a poor sampler of failure, which is why step 1 of the loop is reading.
+
+<Callout type="tip">
+
+Husain and Shankar's rule of thumb: 60 to 80 percent of development time goes to error analysis and evaluation, mostly reading data, not building infrastructure. Teams that invert this build beautiful dashboards of the wrong numbers.
+
+</Callout>
+
+## Model vs system evals
+
+### Two different questions
+
+A **model eval** asks how capable a model is, holding everything else fixed: a standard dataset and harness so models can be compared. MMLU (Hendrycks et al. 2021), GSM8K (Cobbe et al. 2021) and SWE-bench (Jimenez et al. 2024) are model evals.
+
+A **system eval** asks whether your application does its job for your users. The thing under test is the whole pipeline (retrieval, prompt, model, tools, guards, formatting), the data is your distribution, and "correct" is your product's definition.
+
+| | Model eval | System eval |
+|---|---|---|
+| Unit under test | model weights + a fixed harness | your whole pipeline |
+| Data | public benchmark | your traces, your golden set |
+| Success definition | benchmark's answer key | your product's requirements |
+| Used for | shortlisting models | shipping decisions, regressions |
+| Who builds it | labs, academics | you |
+
+### Component vs end-to-end inside a system
+
+A **component eval** isolates one stage (retrieval hit@k or nDCG@k on labelled queries, a classifier's accuracy). An **end-to-end eval** runs the real request path and grades the final output. Component evals are cheap and tell you *where* a problem is; end-to-end evals tell you *whether users are affected*. A retrieval tweak can raise nDCG and lower end-to-end quality if the generator relied on a document the new ranking pushed out.
+
+Gaurav's repos show both kinds. Answer Grader's `scripts/eval_retrieval.py` is a component eval: it reruns only candidate selection over 26 real student questions with stored vectors and graded labels, no API calls. Scheme Assistant's persona-critic eval is end-to-end: `scripts/critic_api.py` serves the deployed commit locally with the cloud's settings (reranker off, thinking budget 0), and `scripts/critic_run.py` sends every turn through the real `/v1/chat` endpoint so follow-ups use the real history path.
+
+### How it fails in production
+
+The classic failure is picking a model from a leaderboard and assuming the system gets better. The leaderboard measured a task you do not do, with a prompt you will not send. A model that wins on a reasoning benchmark can lose on your extraction task because it is more verbose and breaks your JSON. Model evals narrow the shortlist; only a system eval picks the winner.
+
+## Benchmarks and contamination
+
+### What benchmarks are good for
+
+Public benchmarks give a common yardstick: MMLU for knowledge, GSM8K for arithmetic reasoning, HumanEval (Chen et al. 2021) and SWE-bench for code, HELM (Liang et al. 2022) as a multi-metric suite, and Chatbot Arena (Chiang et al. 2024) for crowd preference. They are good for one decision: which three models to put into your own system eval. For how to read them critically, see [reading benchmarks critically](/11-serving-and-model-economics/#reading-benchmarks-critically).
+
+### Contamination
+
+A benchmark measures generalisation only if the model has not seen the test items. **Contamination** is when it has: the items, answers or close paraphrases were in the training data. Web crawls include repos and forums that copy benchmark items, so contamination is the default unless someone prevents it.
+
+How people detect it:
+
+- **N-gram overlap.** Search the training corpus for long n-grams from each test item. The GPT-3 paper (Brown et al. 2020) used 13-gram overlap to flag contaminated items and reported scores on clean subsets.
+- **Canary strings.** BIG-bench (Srivastava et al. 2022) embeds a unique GUID in its files so model makers can filter them and anyone can test whether a model memorised it.
+- **Fresh parallel sets.** GSM1k (Zhang et al. 2024) wrote new grade-school maths items in GSM8K's style; some model families scored noticeably lower on them, the signature of memorisation.
+- **Time splits.** Use only items created after the training cutoff, as LiveBench (White et al. 2024) and LiveCodeBench (Jain et al. 2024) do.
+
+### Saturation and harness noise
+
+Once top models score in the high 90s, a benchmark stops separating them (**saturation**), and the last points are mostly label errors. Harness details also move scores: prompt template, few-shot count, answer parsing, and for agent benchmarks the machine. Anthropic's engineering post "Quantifying infrastructure noise in agentic coding evals" (February 2026) found a six-point spread on Terminal-Bench 2.0 between its most- and least-resourced container setups, larger than many gaps between top models. Read a two-point leaderboard gap as a tie unless the harness is identical.
+
+### Your own eval set can be contaminated too
+
+Your golden set gets contaminated by you:
+
+- You paste a failing eval case into the prompt as a few-shot example. Now the eval tests memory.
+- You iterate a prompt 30 times against the same 50 cases, and it is now fitted to them.
+- Synthetic questions are generated from the very chunks the retriever indexes.
+
+The fix is ML's old one: keep a **holdout** split you look at rarely, and confirm the final candidate on it. If dev improves and holdout does not, you tuned to noise.
+
+## Trace review
+
+### What a trace is
+
+A **trace** is the full record of one request: input, history, retrieved documents with scores, every prompt sent, every model output, tool calls and results, guard decisions, the final response, and metadata (prompt version, model id, latency, tokens, cost, feedback). Without the intermediate steps you cannot tell a retrieval miss from a generation error. See [traces and spans for LLM calls](/30-observability/#traces-and-spans-for-llm-calls) for how to capture them.
+
+### Reading them well
+
+Trace review is the unglamorous core of error analysis. What makes it work:
+
+1. **One screen per trace.** Input, context, output and metadata visible together. If reviewing one trace takes four clicks, you will review twenty and stop.
+2. **Sample deliberately.** A random sample shows you the typical case. Add targeted samples: thumbs-down, abstentions, long latency, high cost, guard flags, the first turn after a follow-up. Random alone under-samples rare, costly failures; targeted alone over-represents them.
+3. **The domain expert reads.** For Scheme Assistant, someone who knows the rural schemes; for Answer Grader, someone who knows how Mains answers are marked. An engineer cannot tell a subtly wrong eligibility rule from a right one.
+4. **Write a note, then move on.** Do not fix anything while reading. Fixing as you go means you never see the distribution.
+
+A minimal viewer is twenty lines; no vendor tool needed to start:
+
+```python
+import json, random
+
+def render(trace: dict) -> str:
+    lines = [f"# {trace['id']}  prompt={trace['prompt_version']}  model={trace['model']}",
+             f"latency={trace['latency_ms']}ms  cost=${trace['cost_usd']:.4f}",
+             "## User", trace["input"], "## Retrieved"]
+    for d in trace.get("retrieved", []):
+        lines.append(f"- [{d['id']}] score={d['score']:.2f} {d['text'][:200]}")
+    for step in trace.get("steps", []):          # tool calls, guard decisions
+        lines.append(f"## Step: {step['kind']}\n{json.dumps(step['data'])[:500]}")
+    lines += ["## Output", trace["output"], "## Note (fill in)", ""]
+    return "\n".join(lines)
+
+def sample(traces: list[dict], n_random=70, n_flagged=30, seed=7) -> list[dict]:
+    rng = random.Random(seed)
+    flagged = [t for t in traces if t.get("thumbs") == "down" or t.get("abstained")]
+    rest = [t for t in traces if t not in flagged]
+    return rng.sample(rest, min(n_random, len(rest))) + rng.sample(flagged, min(n_flagged, len(flagged)))
+
+traces = [json.loads(l) for l in open("traces.jsonl")]
+with open("review.md", "w") as f:
+    f.write("\n\n---\n\n".join(render(t) for t in sample(traces)))
+```
+
+### How many
+
+Start with about 100. Keep going until new traces stop producing new kinds of failure (**theoretical saturation**, in qualitative-research terms). At about one minute per trace, 100 traces is under two hours of an expert's time: the highest-yield two hours in the eval programme.
+
+### How it fails
+
+- **Reviewing only complaints.** Users report a wrong language but never notice a confident wrong number. Mix random and flagged samples.
+- **Traces without versions.** Without prompt version and model id you cannot tell last week's failure from today's.
+- **PII in the review sheet.** Redact names, phone numbers and IDs before export, and keep review files out of git.
+
+## Open/axial coding of failures
+
+### Borrowing from qualitative research
+
+The error-analysis method Hamel Husain and Shreya Shankar teach comes from grounded theory (Glaser and Strauss 1967; Strauss and Corbin later formalised the coding stages). When you do not know what categories exist, do not invent them up front. Let them emerge from the data, in two passes.
+
+**Open coding.** For each trace, write a short free-text note about what went wrong. No fixed list of labels. Be concrete: not "bad answer" but "said documents don't cover the allowance; clause 7.2 two chunks down covers it". Focus on the **first** thing that went wrong in the pipeline (the most upstream error), because downstream errors are often consequences of it. If retrieval missed the clause, the generator's refusal is a symptom, not a separate failure.
+
+**Axial coding.** After 50 to 100 notes, group them into categories: merge notes with the same mechanism, split categories that mix two mechanisms with different fixes, and give each a name and a one-sentence definition. Then re-label every trace with the final categories, and count.
+
+### A worked example
+
+Suppose you reviewed 100 traces of a scheme-information chatbot and 41 had at least one problem. Your open codes cluster like this:
+
+| Axial code | Example open notes | Count |
+|---|---|---|
+| retrieval miss | "answer was in clause 7.2, not retrieved"; "Hindi doc had it, only English searched" | 15 |
+| over-refusal | "said not in documents, but it is"; "refused a general 'how to apply' question" | 9 |
+| wrong language | "Hinglish question, English refusal"; "Hindi app, English answer" | 7 |
+| wrong scheme | "answered PMAY question with MMAY rules" | 5 |
+| tone | "cold reply to a greeting"; "lectured the user" | 3 |
+| other | two one-offs | 2 |
+
+The counts tell you where to work: retrieval misses dominate. Over-refusal and retrieval miss overlap (a missed clause often produces "the documents don't say"); the "first upstream failure" rule decides which owns the trace.
+
+### Code for the bookkeeping
+
+The thinking is manual. The bookkeeping is code:
+
+```python
+import collections, csv
+
+# review.csv columns: trace_id, open_note, axial_code (filled in the second pass)
+rows = list(csv.DictReader(open("review.csv")))
+coded = [r for r in rows if r["axial_code"]]
+counts = collections.Counter(r["axial_code"] for r in coded)
+n = len(rows)
+print(f"{len(coded)}/{n} traces with a failure")
+for code, k in counts.most_common():
+    examples = [r["open_note"] for r in coded if r["axial_code"] == code][:2]
+    print(f"{code:20s} {k:3d}  {k/n:5.1%}  e.g. {examples}")
+```
+
+### Can an LLM do the coding?
+
+It can help with the second pass: propose clusters from your open notes, which you accept, merge or rename. It should not write the notes. It does not know your product's requirements and tends to produce generic labels ("hallucination", "incomplete answer") that are true of everything and actionable for nothing. The reading is where you learn what "good" means.
+
+### How it fails
+
+- **Labels that are too abstract.** "Hallucination" covers an invented number, a right number from the wrong scheme, and a stale fact. They have three different fixes (a number guard, metadata filtering, freshness). Keep codes at the level of the fix.
+- **Stopping at the notes.** Notes without counts are anecdotes. Counts are what let you say "fix retrieval first" in a planning meeting.
+
+## Failure taxonomies
+
+### From codes to a taxonomy
+
+A **failure taxonomy** is the axial codes promoted to a maintained, versioned artefact. Each entry carries a one-sentence definition a new annotator can apply, a positive and a near-miss negative example, a pass/fail criterion, the likely fix location (data, retrieval, prompt, code guard, routing, model), and frequency and severity.
+
+Scheme Assistant's persona-critic judging brief (`docs/critic-eval/JUDGE.md`) is a real example: a pass/partial/fail scale, eleven failure types (`retrieval_miss`, `wrong_source`, `hallucination`, `over_refusal`, `language`, `context_lost`, `data_gap_handled_badly` and others), and a `fix_hint` per verdict. Tallying the verdict files: of 129 non-passing items, 60 were `retrieval_miss` and 21 `over_refusal`; `hallucination` never appears. The report's headline matched: no amount, date or phone number invented in 232 turns, but too many "the documents don't say" replies when the answer was in the next clause. A retrieval problem wearing a refusal's clothes, made visible by the taxonomy.
+
+### Prioritising
+
+Rank by roughly **frequency × severity × fixability**. A rare data leak outranks a common tone issue. A common failure with an obvious code fix should be fixed now, not measured for weeks.
+
+### Specification failures vs generalisation failures
+
+Hamel and Shreya draw a distinction that saves wasted eval work. Some failures happen because **you never told the system what you wanted** (the prompt never said to reply in the user's script). These are specification failures: fix the prompt or code and move on. Others persist although the instruction is clear. These generalisation failures deserve a permanent eval, because they return with every model or prompt change.
+
+### Generic metrics vs failure-mode metrics
+
+"Helpfulness: 4.2 / 5 (last week 4.1)" moves for reasons nobody can explain. "Retrieval miss: 15% (last week 19%); wrong language: 0% (last week 7%, fixed by a script check); over-refusal: 9%" names the fix. Generic scores look like measurement and track nothing.
+
+<Callout type="warn">
+
+Taxonomies go stale. A new feature, a new user group or a model upgrade creates failure modes your categories do not cover. Re-run open coding on fresh traces every few weeks or after any big change, and version the taxonomy alongside the eval set.
+
+</Callout>
+
+## Building eval sets
+
+### What goes in a case
+
+An eval set (a **golden set** when expected outputs are curated and trusted) is a versioned file of cases, each more than an input and an answer:
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class EvalCase:
+    id: str                      # stable, never reused
+    input: str                   # or a list of turns for conversations
+    context: dict = field(default_factory=dict)   # user locale, app language, seeded memory
+    expected: dict = field(default_factory=dict)  # e.g. must_include, must_not, outcome
+    checks: list[str] = field(default_factory=list)  # names of check functions to run
+    tags: dict = field(default_factory=dict)      # slice keys: language, intent, difficulty
+    source: str = "production"   # production | expert | synthetic | adversarial
+    failure_mode: str | None = None  # which taxonomy entry this case guards
+    added_in: str = "v1"         # eval-set version
+```
+
+Scheme Assistant's critic brief (`docs/critic-eval/BRIEF.md`) uses nearly this shape, with an `expected` block of `outcome`, `must_include` (each fact cited to a registry key and page) and `must_not`. Outcomes include "clarify", "deny_redirect" and "data_gap" as well as "answer", because a correct refusal is a correct output.
+
+### Where cases come from
+
+1. **Production traces** (best). Real phrasing and distribution; every failure from error analysis becomes a case.
+2. **Domain experts.** They write the questions users will ask and the edge cases they know.
+3. **Synthetic generation** (next section), for dimensions production has not reached.
+4. **Adversarial cases.** Prompt injection, empty or very long input, out-of-scope requests. Scheme Assistant's `scripts/stress_rag.py` holds 44 such probes.
+
+### Match the population you will serve
+
+Answer Grader's `scripts/calibrate_reuse_threshold.py` carries a lesson in its docstring. An earlier version found the "same question" threshold by comparing corpus rows with corpus rows. Both sides carried the same trailing metadata, identical questions scored 1.0, and the threshold it endorsed recognised only 56% of real matches in production, where the gate compares a student's typed query to a corpus row. Rebuilt on that population, 0.95 recognised 120/120 real matches with 6 false positives out of 120 (recorded in `backend/retrieval.py`). The number was right for the wrong population.
+
+### Slicing
+
+Report every metric per **slice** (language, intent, user type, document type, turn) as well as overall, because aggregates hide regressions. If Hindi is 30% of traffic and a change moves English from 80% to 86% and Hindi from 75% to 65%, the overall goes from 0.7 × 80 + 0.3 × 75 = 78.5% to 0.7 × 86 + 0.3 × 65 = 79.7%: a "win" that is a regression for almost a third of your users.
+
+```python
+import collections
+
+def report(results: list[dict], slice_key: str):
+    by = collections.defaultdict(list)
+    for r in results:
+        by[r["tags"].get(slice_key, "?")].append(r["passed"])
+    for s, xs in sorted(by.items()):
+        print(f"{slice_key}={s:10s} n={len(xs):4d} pass={sum(xs)/len(xs):.1%}")
+```
+
+Keep slices large enough to mean something. A slice of 8 cases moves 12.5 points per case.
+
+### Versioning and staleness
+
+Store the set as JSONL with stable case ids, and bump a version when cases change. Never silently edit an expected answer: a score change caused by a relabel is not a system change, so record why. Add new production failures every cycle, or the set drifts from what users do.
+
+## Synthetic inputs
+
+### Why and when
+
+Before launch you have no traffic, and after launch production rarely covers rare-but-important cases (voice-typed Hinglish, a scheme you just ingested). Synthetic inputs fill those holes. They supplement real data; they do not replace it.
+
+### Dimensions first, then text
+
+"LLM, write 100 test questions about housing schemes" gives 100 fluent, similar, slightly formal questions in the model's own voice. Separate *what to cover* from *how it is phrased*:
+
+1. **Define dimensions** that matter for your failures: persona, intent, language, scope (in, out, follow-up).
+2. **Sample tuples** across them, weighted toward the cells you care about.
+3. **Turn each tuple into a query** with a prompt that asks for the user's real register: short, misspelled, voice-to-text.
+4. **Review a sample by hand** and drop the unnatural ones.
+
+```python
+import itertools, json, random
+
+DIMS = {
+    "persona": ["daily-wage labourer", "SHG member", "panchayat secretary"],
+    "intent": ["eligibility", "amount", "how to apply", "complaint about late payment"],
+    "language": ["Devanagari Hindi", "Hinglish in Roman letters", "English"],
+    "scope": ["in corpus", "out of scope"],
+}
+
+def llm(prompt: str) -> str:            # mock: swap for a local Ollama call
+    return f"[query for: {prompt[:60]}...]"
+
+def generate(n: int, seed: int = 1) -> list[dict]:
+    rng = random.Random(seed)
+    tuples = list(itertools.product(*DIMS.values()))
+    out = []
+    for combo in rng.sample(tuples, n):
+        t = dict(zip(DIMS, combo))
+        q = llm("Write ONE message a {persona} would type to a government scheme chatbot. "
+                "Intent: {intent}. Language: {language}. Scope: {scope}. "
+                "Short, informal, typos allowed. Output only the message.".format(**t))
+        out.append({"input": q, "tags": t, "source": "synthetic"})
+    return out
+
+print(json.dumps(generate(5), ensure_ascii=False, indent=1))
+```
+
+Scheme Assistant's critic brief is this method done by agents: personas (labourers, SHG members, sarpanches typing voice-to-text), five categories, a target split of about 60% Devanagari Hindi, 20% Hinglish and 20% English, and Hindi/English pairs: 177 items. Memory Agent adds multi-turn personas, where a second model plays a skeptical engineer, a terse sales lead or a vague founder for up to four turns ([simulated users](/20-evals-judges-and-ci/#multi-turn-and-simulated-users)).
+
+### How synthetic data fails
+
+- **Too clean.** Generated questions are grammatical and specific; real ones are not. Your system looks better on synthetic data than in production.
+- **Homogeneous.** Fifty variations of one question. Deduplicate with embeddings and check coverage per dimension.
+- **Leaky.** A question generated from a chunk reuses that chunk's exact words, so lexical retrieval finds it trivially. Paraphrase, or generate from a summary rather than the chunk.
+- **Wrong expected answers.** If a model writes the expected answer too, a human must check it against the source.
+
+## Exact/functional/reference metrics
+
+### The cheapest check that captures the failure
+
+Before reaching for a judge, ask whether code can decide pass or fail. In order of preference:
+
+**Exact match.** For classification, routing and extracted fields, compare with the gold label; accuracy, precision, recall and F1 follow. Normalise first (case, whitespace, number formats), or "15 days" vs "fifteen days" counts as a miss.
+
+**Functional checks.** Test what the output does, not how it looks. Execute generated SQL and compare result sets with the gold query's; run generated code against unit tests; validate JSON against the schema. And **invariants**: properties every output must satisfy whatever the input. Scheme Assistant's `stress_rag.py` checks every answer for shape, claim/source consistency, number fidelity (every number in the summary appears in a cited quote), reply language (a Hindi reply is at least 60% Devanagari letters), no eligibility verdict (by regex), and per-probe forbidden strings ("HACKED" after an injection attempt). The sketch below is a condensed version.
+
+**Reference-based metrics.** Compare to a gold reference with a defined procedure: token-level F1 for short answers, hit@k and nDCG@k for retrieval ([retrieval metrics](/15-information-retrieval-foundations/#metrics-p-k-r-k-mrr-ndcg)). Scheme Assistant's `scripts/eval_retrieval.py` uses predicates as references: each case is a question plus a function that recognises the right chunk (the body contains "पंद्रह दिन", or the clause path starts with `Q23`).
+
+```python
+import re
+
+def check_answer(out: dict, case: dict) -> list[str]:
+    problems = []
+    src_ids = {s["id"] for s in out["sources"]}
+    for claim in out["claims"]:
+        if not set(claim["cites"]) <= src_ids:
+            problems.append(f"claim cites {claim['cites']} outside sources")
+    quotes = " ".join(s["quote"] for s in out["sources"])
+    for num in re.findall(r"\d[\d,]*(?:\.\d+)?", out["summary"]):
+        if num not in quotes:
+            problems.append(f"number {num} not in any cited quote")
+    for phrase in case["expected"].get("must_not", []):
+        if phrase.lower() in out["summary"].lower():
+            problems.append(f"forbidden: {phrase}")
+    if case["context"].get("app_language") == "hi":
+        letters = [c for c in out["summary"] if c.isalpha()]
+        dev = sum("ऀ" <= c <= "ॿ" for c in letters) / max(len(letters), 1)
+        if dev < 0.6:
+            problems.append(f"Hindi app, reply only {dev:.0%} Devanagari")
+    return problems   # empty list means pass
+```
+
+### Binary pass/fail beats scales
+
+Prefer a binary verdict per failure mode over a 1 to 5 score. A 3 vs a 4 means different things to different graders, and to one grader on different days; "is there a number not in its sources: yes or no" does not. Memory Agent's judge records six 1 to 5 scores (grounded, fresh, honest, helpful, concise, best-in-class), but the pass decision in `eval/run.ts` is binary: no hard rule broke (searched when it should not or failed to search when it should, missed a first-token budget, errored) and no judge failure of severity "major". The scores are diagnostics; the gate is yes/no.
+
+### Trade-off
+
+Code checks are cheap and deterministic but see only what a rule can express: a number guard catches an invented price, not an answer that missed the question. Use code for everything it can decide, and spend judges (chapter 20) on the rest.
+
+## Similarity metrics' limits
+
+### What they measure
+
+BLEU (Papineni et al. 2002) counts n-gram precision against references, for machine translation. ROUGE (Lin 2004) is recall-oriented n-gram overlap, for summarisation. BERTScore (Zhang et al. 2020) matches tokens by contextual embeddings; embedding cosine compares whole outputs. All measure **similarity to a reference**, a proxy for correctness only when there is one right way to say the right thing.
+
+### Why they fail for LLM outputs
+
+Take a reference and a candidate:
+
+- Reference: "wages are paid within 15 days"
+- Candidate: "wages are not paid within 15 days"
+
+ROUGE-1 by unigram overlap: the reference has 6 tokens, the candidate 7, and all 6 reference tokens appear in the candidate. Precision 6/7 = 0.857, recall 6/6 = 1.0, F1 = 2 × 0.857 × 1.0 / 1.857 = 0.923. The candidate says the opposite and scores 0.92. Embedding cosine often behaves the same way, because negation moves a sentence vector very little.
+
+The other direction fails too. "You get 125 days of work a year" and "The scheme guarantees up to one hundred and twenty-five days' employment annually" are both right and share almost no n-grams. Open-ended generation has many correct outputs, and one reference punishes all but one. Longer outputs also gain recall-based scores without being better.
+
+### Where similarity is still useful
+
+- **Change detection:** low similarity between two prompt versions' outputs flags cases for a human.
+- **Deduplication and coverage** of synthetic sets.
+- **Calibrated thresholds** on the right population, as Answer Grader did for "same question".
+
+Before trusting a similarity metric as a quality signal, check that it separates human pass from fail labels on your data. If it does not, it is decoration.
+
+## Human annotation guidelines
+
+### Why labels matter so much
+
+Every other number rests on labels: golden answers are labels, and judges are validated against them ([validating judges](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans)). If two annotators disagree on half the cases, you are measuring the annotators.
+
+### What a guideline contains
+
+- **The task in one paragraph:** who the user is and what a good outcome is.
+- **Each criterion with a definition and a binary rule.** "Fail if any number in the reply is not in a cited source" is a rule; "accuracy" is not.
+- **Worked examples:** a clear pass, a clear fail, and two or three borderline cases with the reason.
+- **What evidence to consult.** Judge against the source document, not memory. Scheme Assistant's `JUDGE.md` adds that the item writer's expectation is "a guide, not gospel": if the source disagrees, grade on the source.
+- **A rule for unsure cases**, so uncertainty is recorded rather than guessed ("mark `unsure` and write one line").
+- **Severity**, so a major and a minor failure are not counted alike.
+
+Prefer one trusted domain expert who owns "good" (Husain calls this the benevolent dictator) over a committee that averages away the product's opinion. Add a second annotator to measure agreement, not to vote.
+
+### Measuring agreement: Cohen's kappa
+
+Raw agreement overstates reliability, because two annotators who both mark 80% of cases "pass" will agree often by chance. **Cohen's kappa** (Cohen 1960) corrects for that:
+
+κ = (p_o − p_e) / (1 − p_e)
+
+where p_o is observed agreement and p_e is agreement expected by chance from each annotator's label rates.
+
+Worked example: two annotators label 100 traces. Both say pass on 70, both say fail on 15, and they disagree on 15 (A pass and B fail on 10, A fail and B pass on 5).
+
+- p_o = (70 + 15) / 100 = 0.85
+- A says pass on 80, B says pass on 75. p_e = 0.80 × 0.75 + 0.20 × 0.25 = 0.60 + 0.05 = 0.65
+- κ = (0.85 − 0.65) / (1 − 0.65) = 0.20 / 0.35 = 0.57
+
+85% raw agreement becomes a kappa of 0.57: moderate. Read the 15 disagreements together and tighten the guideline. The usual bands (Landis and Koch 1977: 0.61 to 0.80 substantial, above 0.80 almost perfect) are conventions, not laws.
+
+### Criteria drift
+
+Shankar et al. ("Who Validates the Validators?", 2024) observed that grading criteria change as people grade: seeing outputs teaches you what you care about. So write guidelines iteratively: grade 20, revise, re-grade those 20, continue. A guideline frozen before seeing data describes a product that does not exist.
+
+### Second-pass verification
+
+Scheme Assistant's critic eval added a step worth copying: a separate verifier (`docs/critic-eval/VERIFY.md`) re-checked every fail and partial, plus sample passes, against the source documents, free to overturn in either direction. In the nine scheme areas it re-checked 127 verdicts and overturned none. Be precise about what that shows: critics and verifier were both agents, so it is agreement between model graders, not human validation. A human spot-check of a sample is still needed.
+
+<Callout type="tip">
+
+Make labelling fast: one screen, keyboard shortcuts for pass and fail, a free-text box. At about one minute per label, 300 labels is a day of expert time; plan for it.
+
+</Callout>
+
+## Criteria: capability, instruction-following, cost, latency
+
+### Four axes, not one
+
+A useful scorecard for any LLM system change separates:
+
+- **Capability.** Does it solve the task? Accuracy, failure-mode pass rates, hit@k.
+- **Instruction-following.** Format, length, language, citation rules, "no eligibility verdict". Mostly code-checkable, and the axis most likely to regress on a model upgrade.
+- **Cost.** Tokens and money per task, and per *successful* task.
+- **Latency.** p50 and p95 time to first token (TTFT) and total time. Report percentiles, not the mean.
+
+A change is a candidate only if it does not lose on any axis by more than you can tolerate. Write the decision rule down before you run the comparison:
+
+```python
+def decide(base: dict, cand: dict, noise_pts: float = 3.0) -> str:
+    if cand["pass_rate"] < base["pass_rate"] - noise_pts / 100:
+        return "reject: quality regression beyond noise"
+    if cand["instr_violations"] > base["instr_violations"]:
+        return "reject: instruction-following regressed"
+    if cand["p95_ms"] > 1.2 * base["p95_ms"]:
+        return "reject: p95 latency up more than 20%"
+    if cand["cost_per_success"] > 1.1 * base["cost_per_success"]:
+        return "needs sign-off: cost per success up more than 10%"
+    return "accept"
+```
+
+### Cost per successful task
+
+Cost per success = cost per attempt / success rate. A model at $0.010 per task with an 80% pass rate costs 0.010 / 0.80 = $0.0125 per success. A cheaper one at $0.006 with a 50% pass rate costs 0.006 / 0.50 = $0.012, nearly the same, and fails half your users. Failures also cost retries, support tickets and trust.
+
+### An example from Memory Agent
+
+Memory Agent's `DESIGN.md` records choosing models per turn type by measurement: on the first ten scenarios, Opus and Sonnet tied on quality with Sonnet 35% faster, and Haiku failed every re-check. So Opus runs only on re-check turns: capability and latency traded explicitly, per slice.
+
+### How it fails in production
+
+Teams optimise the axis they measure. A prompt tightened for capability gets longer and slower; a smaller model quietly breaks the language rule. Four columns from the start make these trade-offs visible at review, not in an incident.
+
+## Noise, statistics, sample sizes
+
+### Where the noise comes from
+
+An eval score is an estimate, and it moves for reasons that are not your change:
+
+1. **Finite sample of cases.** With 28 cases, one case is 3.6 points.
+2. **Model sampling.** Even at temperature zero, batch-dependent serving numerics can change outputs ([determinism](/04-language-modeling-and-sampling/#determinism-seeds-batch-invariance)).
+3. **Judge noise.** A judge is stochastic too, and a new judge changes scores on unchanged outputs.
+4. **Infrastructure.** Timeouts, rate limits, web search returning different pages.
+
+Memory Agent's `DECISIONS.md` records three of these. The same code once scored 22/28 and 26/28. A fairer judge alone moved the core suite from 8/10 to 9/10 on unchanged answers. A partial run scored 94% on 22 scenarios; full runs scored 85% on the same set. The response was right: per-scenario pass rates over repeat runs (`eval/report.ts`), re-grading old transcripts with the new judge before claiming a gain, and stopping once three consecutive versions scored within one scenario of each other.
+
+### Standard error and confidence intervals
+
+For a pass rate p measured on n independent cases, the standard error is
+
+SE = √(p(1 − p) / n)
+
+and a rough 95% confidence interval is p ± 1.96 × SE.
+
+- n = 100, p = 0.80: SE = √(0.16 / 100) = 0.04. CI is 80% ± 7.8 points.
+- n = 28, p = 0.85: SE = √(0.1275 / 28) = √0.00455 = 0.0675. CI is ± 13.2 points, about ± 3.7 scenarios.
+
+Comparing two runs doubles the variance: the difference has SE ≈ √2 × 0.0675 ≈ 0.095, a 95% band of about ± 19 points. So Memory Agent's 22/28 vs 26/28 swing (4 scenarios, 14 points) is comfortably inside the noise, and treating it as signal would have sent iteration in circles. For small n or p near 0 or 1, the Wilson interval behaves better than this normal approximation, but the order of magnitude is what an interview needs.
+
+Evan Miller's "Adding Error Bars to Evals" (2024) is the standard reference. It recommends reporting standard errors, clustering them when cases are not independent (several questions about one document, several turns of one conversation), resampling answers per question to cut within-question noise, and comparing models with paired tests on the same questions.
+
+### How many examples to detect a 5-point change
+
+First, pin down "5%": five percentage points (80% to 75%), or 5% relative (80% to 76%)? Say which. Take five points, baseline 80%.
+
+**Independent samples.** Per-arm size for a two-proportion test at 95% confidence (z = 1.96) and 80% power (z = 0.84):
+
+n = (1.96 + 0.84)² × [p₁(1 − p₁) + p₂(1 − p₂)] / δ²
+= 7.84 × (0.80 × 0.20 + 0.75 × 0.25) / 0.05²
+= 7.84 × (0.16 + 0.1875) / 0.0025
+= 7.84 × 0.3475 / 0.0025 ≈ 1,090 per arm.
+
+**Paired** (the same cases through both versions, which you should do). Only flipped cases matter. If about 10% of cases change outcome (discordant pairs) and the net shift is 5 points, a McNemar-style approximation gives:
+
+n ≈ (1.96 + 0.84)² × p_disc / δ² = 7.84 × 0.10 / 0.0025 ≈ 314 cases.
+
+Pairing cuts the requirement about threefold by removing between-case variation. With p_disc = 0.20 you need about 630. With only 100 cases, the smallest change you can reliably detect is roughly √(7.84 × 0.10 / 100) = 0.089, about 9 points.
+
+### Paired bootstrap, in code
+
+When metrics are not simple proportions (nDCG, cost), resample cases and look at the distribution of the difference:
+
+```python
+import random
+
+def paired_bootstrap(a: list[float], b: list[float], iters=10_000, seed=0):
+    """a[i], b[i]: per-case metric for baseline and candidate on the same case i."""
+    rng = random.Random(seed)
+    n = len(a)
+    diffs = [b[i] - a[i] for i in range(n)]
+    means = []
+    for _ in range(iters):
+        sample = [diffs[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    means.sort()
+    lo, hi = means[int(0.025 * iters)], means[int(0.975 * iters)]
+    return sum(diffs) / n, (lo, hi)    # if the interval contains 0, you can't tell
+
+delta, ci = paired_bootstrap([1, 0, 1, 1, 0] * 20, [1, 1, 1, 1, 0] * 20)
+print(f"delta={delta:+.3f}  95% CI=({ci[0]:+.3f}, {ci[1]:+.3f})")
+```
+
+### Two more tools worth knowing
+
+- **Rule of three.** If you observe zero failures in n cases, a rough 95% upper bound on the failure rate is 3/n. Zero leaks in 50 injection probes means the leak rate could still be up to 6%.
+- **Multiple comparisons.** Try 20 prompt variants against one baseline and one will "win" by chance at the 5% level. Pick the winner on dev, confirm it once on holdout.
+
+### Reading Gaurav's numbers honestly
+
+Answer Grader's retrieval change moved nDCG@5 from 0.842 to 0.854 on 26 questions, and its `CHANGES.md` calls differences under about 0.02 noise, so the decision rests on the large effect (off-paper references 46 of 130 down to 19). On Scheme Assistant's 16 scored retrieval cases, one case is 6.25 points of hit@k: "the reranker helped" needs several flips, not one.
+
+## Eval-driven development
+
+### The workflow
+
+Eval-driven development is test-driven development for probabilistic behaviour:
+
+```text
+  1. find a failure (trace review, user report, critic run)
+  2. add cases that reproduce it  ──►  run: they fail (red)
+  3. change the system (prompt, code guard, retrieval, data, model)
+  4. run the target cases          ──►  they pass (green)
+  5. run the full suite            ──►  no slice regresses beyond noise
+  6. record the change and the evidence, ship
+```
+
+Two habits make it work. Every prompt rule should exist because a case failed without it, and every fix should come with the cases that justify it, so you can later delete rules that no longer earn their tokens.
+
+### Gaurav's repos do this
+
+- **Memory Agent.** `src/prompts.ts` opens by stating that each rule exists because an eval run failed without it, and `DESIGN.md` adds that whenever a failure could be fixed in code instead, code won ("this week" as a date window, digits split by page markup). The number guard shows a fix measured offline. `eval/replay-guard.ts` replays it over 545 stored turns with no API calls: version 1 flagged 543 numbers on 36% of turns, mostly false alarms because 55% of cited excerpts were truncated; the revision flagged 8 (1.3% of turns), each fair on hand review. `eval/guard-recall.ts` corrupts every stored price: only 508 of 1,630 (31.2%) sit behind complete excerpts, which bounds recall. Precision by replay, recall by corruption.
+- **Answer Grader.** `scripts/compare_prompt_change.py` (in your working tree, not yet committed) runs the "before" arm with the old prompt constants monkeypatched back in, so the baseline is the real old prompt. It exists because the old prompt demanded a diagram for every question while about 26% of 4,550 corpus answers carry one: a distribution target, so measure it. Its default of 18 questions per arm detects "always" vs "a quarter of the time", not a few points.
+- **Chat Insights.** `backend/src/lc/scripts/replay.js` runs the non-LLM domain layer over a fixture, hashes the sorted-key JSON output, and with `--twice` exits non-zero if two runs differ. Make everything that can be deterministic provably so, and the only noise left is the model's.
+
+### Stopping rules
+
+Iteration needs an end condition, or you tune to noise. Memory Agent's: stop when consecutive versions score within the noise band of each other. More formally: stop when the paired interval for the last change includes zero and no failure mode above your severity bar remains.
+
+### How it fails
+
+- **Overfitting the eval set.** The prompt grows a rule per case and generalises worse. Holdout split, and periodic fresh cases from production.
+- **Stale sets.** The eval passes at 95% while users hit new failures it does not contain. Feed new traces back in every cycle.
+- **Metric gaming.** Reward a team on the eval score and the score rises while the product does not. Keep error analysis human and periodic.
+- **Evals that never gate anything.** A suite that cannot block a deploy is a report, not a test ([evals in CI](/20-evals-judges-and-ci/#evals-in-ci)).
+
+<Production>
+
+**Failure modes.**
+
+- A generic metric ("helpfulness 4.2/5") that moves without explanation and maps to no fix. Replace it with per-failure-mode pass rates.
+- A stale eval set that passes while users hit failures it never contained. Add production failures every cycle; re-run open coding after big changes.
+- An eval set built on the wrong population, or a decision made on a single run.
+
+**Cost.** Per run: cases × (system tokens + judge tokens) × price. Example with assumed prices of $1 per million input and $5 per million output tokens (check the current price page): 300 cases, each 3K input and 500 output tokens for the system and 4K input and 300 output for the judge. System: 300 × (3,000 × 1 + 500 × 5) / 10⁶ = $1.65. Judge: 300 × (4,000 × 1 + 300 × 5) / 10⁶ = $1.65. That is $3.30 a run, $9.90 with three repeats, and about $200 a month at 20 compared changes. Cap it in code: Scheme Assistant's `critic_api.py` meters every Gemini call into a ledger and refuses calls past the cap (₹380 by default); Memory Agent's runner stops starting scenarios at `--budget`. Offline replays over stored outputs cost nothing and should be the default.
+
+**Latency.** Suite runtime gates deploys. 300 end-to-end cases at about 8 s each is 40 minutes serially, 4 minutes at a concurrency of 10 (if rate limits allow). Tier it: code checks and offline replays on every commit (seconds), a 30 to 50 case smoke subset per PR (minutes), the full suite with repeats before release.
+
+**Observability.** Evals are built from production traces, so the trace schema decides what you can evaluate: log input, retrieved ids and scores, prompt version, model id, tool calls, guard decisions, output, latency, tokens, cost and user feedback. Store eval results with code SHA, prompt, judge and dataset versions so a score change can be attributed, and re-grade old outputs when the judge changes.
+
+**Security.** Eval data is production data and contains PII: names, phone numbers, government ids, health and financial details. Redact before export, keep eval sets out of public repos, apply log retention rules, and use test identities in harnesses (Scheme Assistant's `critic_run.py` uses a fake test phone number). Adversarial cases (prompt injection, system-prompt extraction) belong in the set as first-class cases with forbidden-string checks.
+
+</Production>
+
+<Interview>
+
+<Q q="How do you build an eval set for a new feature with no users yet?">
+
+- Start from the spec and the users: who asks, what they ask, what a good outcome is, including correct refusals and clarifying questions.
+- Define dimensions (persona, intent, language, scope) and generate inputs per tuple in a natural register; a domain expert writes the high-value cases and checks every expected fact against a source.
+- Run the system on 50 to 100 of them and error-analyse the outputs. The first eval cases come from those failures, not imagination.
+- Add adversarial probes (injection, empty, long, out of scope) and invariant checks that hold for any input.
+- Tag cases for slicing, version the file, keep a holdout, and swap synthetic cases for real traces as soon as traffic (even dogfooding) arrives.
+- **The trap:** "I'd use a public benchmark" or "I'd ask an LLM to generate 500 test questions and score helpfulness 1 to 5." Neither reflects your users or your failure modes.
+
+</Q>
+
+<Q q="What is error analysis, and how do you run it?">
+
+- Systematic reading of real outputs to learn how the system fails, before choosing metrics.
+- Sample about 100 traces (random plus thumbs-down, abstentions, slow, costly), each on one screen with input, context, tool calls and output.
+- Open coding: a domain expert writes a short concrete note per trace about the first upstream thing that went wrong. No predefined labels.
+- Axial coding: cluster notes into failure modes at the level of the fix, define each, re-label all traces, and count. Keep going until new traces stop adding categories (saturation).
+- Prioritise by frequency × severity × fixability; fix specification failures directly; build permanent evals for generalisation failures.
+- Example: Scheme Assistant's critic eval found 60 of 129 non-passing items were retrieval misses and no hallucinated numbers in 232 turns, which pointed the fix at retrieval, not the prompt.
+- **The trap:** jumping to "we'll measure hallucination and helpfulness with an LLM judge" without reading traces, or letting an LLM do the open coding.
+
+</Q>
+
+<Q q="Model eval vs system eval: what's the difference?" reported>
+
+- A model eval measures the model's capability with a fixed harness on a public benchmark (MMLU, SWE-bench); its job is comparing models.
+- A system eval measures your whole pipeline (retrieval, prompt, model, tools, guards, formatting) on your data against your definition of success; its job is shipping decisions.
+- Inside a system: component evals (retrieval hit@k, a classifier's accuracy) localise problems; end-to-end evals tell you whether users are affected. A component can improve while end-to-end gets worse.
+- Benchmarks shortlist models; only your system eval picks one, and contamination and harness differences make small leaderboard gaps meaningless.
+- **The trap:** "the new model is 3 points better on MMLU, so our app will be better." Different task, format and prompt; often it breaks instruction-following.
+
+</Q>
+
+<Q q="How many examples do you need to detect a 5% regression?">
+
+- First clarify: 5 percentage points or 5% relative, at what baseline, with what confidence and power. Assume 80% → 75%, 95% confidence, 80% power.
+- Independent samples: n = (1.96 + 0.84)² × (0.8 × 0.2 + 0.75 × 0.25) / 0.05² ≈ 7.84 × 0.3475 / 0.0025 ≈ 1,090 per arm.
+- Paired on the same cases (what you should do): only flipped cases matter. With 10% discordant pairs, n ≈ 7.84 × 0.10 / 0.0025 ≈ 314.
+- Sanity check from the other side: with 100 cases at 80%, SE = 0.04, so the 95% CI is ± 8 points; you cannot see a 5-point change.
+- Ways to need fewer: pair the comparison, repeat-sample each case to cut model noise, use code checks with lower variance than a judge, and cluster standard errors when cases share a document or conversation.
+- **The trap:** "a few hundred examples" with no arithmetic, or "50 golden examples is enough" without saying what effect size 50 can detect (about 12.5 points, paired with 10% flips: √(7.84 × 0.10 / 50) ≈ 0.125).
+
+</Q>
+
+<Q q="Your eval pass rate went from 82% to 85% after a prompt change. Do you ship?">
+
+- Ask n and whether the comparison was paired. On 100 cases, 3 points is inside the noise (± 8 points at 95%).
+- Look at per-case flips (fail → pass, pass → fail) by slice. A net +3 can hide a language slice that dropped 10.
+- Check the other axes: instruction-following violations, p95 latency, cost per successful task.
+- Re-run with repeats (or a paired bootstrap on per-case results) and confirm on the holdout set if the prompt was tuned on dev.
+- Ship if no slice regresses beyond noise and the change fixes a named failure mode with its target cases now passing; the aggregate is secondary.
+- **The trap:** "yes, it went up." Or the opposite: blocking every change that is not statistically significant, when one that fixes a known failure mode and regresses nothing is fine to ship.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal.** Review 100 real traces from one of your apps, open-code the failures into a taxonomy, and turn the top three failure modes into a versioned eval set with pass/fail checks. Everything runs offline.
+
+**Where.** Memory Agent (`~/memory-agent`): `eval/results/*/results.json` already stores hundreds of real turns with answers, searches, cited sources and evidence, and `eval/replay-guard.ts` shows how to replay checks over them with no API calls.
+
+**Steps.**
+
+1. Write `eval/export-traces.ts` (or a Python script) that reads every stored turn and writes `eval/review/traces.md` with one block per turn: scenario id, user message, searches, cited sources with page dates, cited evidence, answer. Sample 70 at random and 30 that the judge marked as failing, with a fixed seed.
+2. Open coding: read all 100. For each, write a one-line note about the first thing that went wrong, or "ok", into `eval/review/notes.csv` (`trace_id, open_note, axial_code`). Do not fix anything.
+3. Axial coding: group the notes into 4 to 8 failure modes at the level of the fix (optionally let a small local model via Ollama propose clusters, which you accept or rename). Write `eval/taxonomy.md` with name, definition, one positive and one negative example, likely fix location, and count per mode.
+4. Pick the top three by frequency × severity. For each, write 10 to 20 cases in `eval/failure-modes/v1.jsonl` with `id`, `input`, `expected`, `checks`, `tags`, `failure_mode` and `source`.
+5. Write a check function per mode in code (for example: a number in the answer that is absent from complete cited excerpts; a price with no as-of date; an answer in the wrong language). Where code cannot decide, write the criterion as a binary question for a later judge (chapter 20) and label those cases by hand now.
+6. Write `eval/check-failure-modes.ts` that runs every check over stored outputs (no API calls), prints pass rate per mode and per slice with a 95% interval (p ± 1.96 × √(p(1 − p)/n)), and exits non-zero if any mode falls below a threshold you set.
+7. If you want fresh outputs, run the agent against a mocked LLM function that replays stored answers, so the harness itself is tested without spending money.
+
+**Definition of done.** `taxonomy.md` has counts that sum to the number of failing traces; `failure-modes/v1.jsonl` has at least 30 versioned cases covering three modes; the checker runs offline in under a minute, prints per-mode and per-slice pass rates with intervals, and fails (exit 1) when you deliberately corrupt one stored answer.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader: a careful component eval.** `scripts/eval_retrieval.py` reruns candidate selection over the 26 questions students actually submitted, with 286 candidates graded 0/1/2 blind (the pool does not say which variant found them). It is how BM25 fusion was rejected (nDCG@5 0.842 down to 0.70–0.79) and the soft paper penalty shipped. Say the honest part: one model grader (Claude), and the repo's own note treats nDCG differences under about 0.02 as noise, so the decision rests on the off-paper drop (46 to 19 of 130) and robustness across settings.
+- **Answer Grader: population and calibration.** `scripts/calibrate_reuse_threshold.py` is the wrong-population story (56% of real matches caught; 120/120 at 0.95 once rebuilt on student queries). `backend/calibration.py` maps rubric scores to marks with anchors from 143 real marksheets, after a user said the scores were inflated: a failure found from feedback, fixed with external ground truth.
+- **Scheme Assistant: taxonomy, verification, invariants.** `docs/critic-eval/JUDGE.md` defines the taxonomy; 177 persona-written items over 232 turns gave 48 pass, 63 partial, 66 fail, retrieval misses the largest bucket, no invented numbers. `VERIFY.md` overturned none of 127 verdicts (agent vs agent, not human). `scripts/stress_rag.py` is your best invariant-check example.
+- **Memory Agent: noise, repeats and stopping.** 28 scenarios in three suites; pass means no broken hard rule and no "major" judge failure. Use 22/28 vs 26/28 on the same code, and the final 24, 24, 24, to explain standard error (n = 28 gives about ± 13 points per run). The guard's precision by replay and recall by corruption is your cleanest offline-eval story.
+- **Chat Insights: determinism first.** `backend/src/lc/scripts/replay.js` fails if two runs of the domain layer differ, which keeps non-model logic out of your eval noise.
+- **Gaps to name honestly.** No harness computes a confidence interval or a paired test; no repo gates deploys on evals in CI; labels in Answer Grader and Scheme Assistant come from models, so no judge is validated against human labels yet. The Apply-it closes the first gap; chapter 20 the other two.
+
+</YourProject>

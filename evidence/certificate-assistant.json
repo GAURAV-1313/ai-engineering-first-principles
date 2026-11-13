@@ -1,0 +1,581 @@
+{
+  "repo": "",
+  "local_path": null,
+  "role": "owner",
+  "product": "Certificate Assistant is a hackathon decision-support tool for Chhattisgarh caste and domicile certificates: it links an applicant to relatives' archived certificates and drafts orders, with the officer deciding.",
+  "stack": [
+    "Python",
+    "FastAPI",
+    "Splink (Fellegi-Sunter, EM)",
+    "DuckDB",
+    "rapidfuzz",
+    "Jinja2",
+    "React + TypeScript",
+    "tesseract.js",
+    "jsQR"
+  ],
+  "architecture": "There is no LLM in this repo. An applicant record is normalised, blocked against a synthetic certificate archive and scored by a Splink-trained Fellegi-Sunter model exported to JSON. Rules produce flags and a checklist; bilingual Jinja2 templates draft orders and messages, and an entity checker verifies them against the source record. The browser runs OCR and QR decoding locally and sends only a perceptual hash. Officers confirm or dismiss each match, and those acts feed a ridge-regularised recalibration. Evaluation is on held-out synthetic families. The 'AI' chapters map to classical retrieval, evals, guardrails and product UX only.",
+  "components": [
+    {
+      "name": "matcher and training",
+      "path": "app/backend/matcher.py, train_model.py",
+      "tech": "Splink, rapidfuzz"
+    },
+    {
+      "name": "rules and engine",
+      "path": "app/backend/engine.py, rules.py",
+      "tech": "Python"
+    },
+    {
+      "name": "templates and checker",
+      "path": "app/backend/messages.py, templates/",
+      "tech": "Jinja2"
+    },
+    {
+      "name": "eval and learning",
+      "path": "app/backend/evaluate.py, learning.py",
+      "tech": "numpy"
+    },
+    {
+      "name": "API",
+      "path": "app/backend/api.py",
+      "tech": "FastAPI"
+    },
+    {
+      "name": "reader (OCR)",
+      "path": "app/frontend/src/reader/",
+      "tech": "tesseract.js"
+    },
+    {
+      "name": "UI",
+      "path": "app/frontend/src/",
+      "tech": "React"
+    }
+  ],
+  "gaurav_share": "6 commits at the pin: 5 by GAURAV singh and 1 by Gaurav, so all by Gaurav.",
+  "evidence": [
+    {
+      "chapter": 15,
+      "concept_id": "15.02",
+      "concept": "Blocking indexes as an inverted index over name keys",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "166-176",
+      "snippet": "    def candidates(self, qf: dict) -> list[int]:\n        \"\"\"Blocking — identical to the Splink prediction blocking rules.\"\"\"\n        out: set[int] = set()\n        for hyp in HYP:\n            if qf.get(\"district_lgd\"):\n                out.update(self.idx_dist_sur.get((hyp, qf[\"district_lgd\"], qf[\"rel_surname_skel\"]), []))\n            if qf.get(\"village_lgd\"):\n                out.update(self.idx_village.get((hyp, qf[\"village_lgd\"]), []))\n            if qf[\"rel_given_skel\"]:\n                out.update(self.idx_names.get((hyp, qf[\"rel_given_skel\"], qf[\"rel_surname_skel\"]), []))\n        return sorted(out)",
+      "what": "Candidate generation looks up three precomputed dict indexes (district+surname skeleton, village, given+surname skeleton) and unions the hits, so only a few certificates are scored instead of the whole archive.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Same idea as an inverted index: cheap recall-oriented candidate generation first, expensive scoring second."
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.05",
+      "concept": "Analyzer for Indian names (transliterate, fold, skeleton)",
+      "layer": "backend",
+      "file": "app/backend/normalise.py",
+      "lines": "6-14",
+      "snippet": "Pipeline for one name string:\n  1. strip honorifics / relation markers (Shri, Smt, श्री, S/O, पिता ...)\n  2. Devanagari -> Latin with indic_transliteration (ITRANS) + Hindi schwa deletion\n  3. lowercase, phonetic folding (aa->a, ee->i, w->v, sh->s, ksh->x ...),\n     collapse doubled letters (\"Markaam\" -> \"markam\")\n  4. tokens; surname = last token; given = the rest joined WITHOUT spaces\n     (\"Ram Lal\" == \"Ramlal\")\n  5. consonant skeleton = folded string with vowels removed\n\"\"\"",
+      "what": "One normalisation pipeline (strip honorifics, Devanagari to Latin, phonetic folding, consonant skeleton) is shared by training and runtime so both sides tokenise names identically.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Index-time and query-time analyzers must be the same code; here the same module serves Splink training and the live scorer."
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.05",
+      "concept": "Graded fuzzy comparison levels for a name field",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "47-59",
+      "snippet": "def level_given(a_given: str, a_skel: str, b_given: str, b_skel: str) -> str:\n    if not a_given or not b_given:\n        return \"null\"\n    if a_given == b_given:\n        return \"exact\"\n    if a_skel and a_skel == b_skel:\n        return \"skeleton\"\n    s = jw(a_given, b_given)\n    if s >= 0.92:\n        return \"jw>=0.92\"\n    if s >= 0.80:\n        return \"jw>=0.80\"\n    return \"else\"",
+      "what": "A name pair is bucketed into null, exact, skeleton, Jaro-Winkler >=0.92, >=0.80 or else. Each bucket later gets a learned weight, so fuzziness is graded rather than a single threshold.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.09",
+      "concept": "Score fusion by summing learned log-odds weights",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "230-231",
+      "snippet": "    def log2_odds(self, levels: dict[str, str]) -> float:\n        return self.model.prior + sum(self.model.weight(k, lv) for k, lv in levels.items())",
+      "what": "The final score is the model prior plus the weight of each field's comparison level (naive-Bayes style Fellegi-Sunter), then converted to a probability. This is the classical-ML analogue of fusing several retrieval signals.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "RRF fuses ranks; this fuses calibrated evidence. The weights come from EM, not hand tuning."
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.01",
+      "concept": "Relevance expressed as a calibrated match probability",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "328-333",
+      "snippet": "def match_level(p: float) -> str | None:\n    if p >= 0.95:\n        return \"exact\"\n    if p >= 0.60:\n        return \"possible\"\n    return None",
+      "what": "Two tiers decide what the officer sees: >=0.95 'exact' and >=0.60 'possible'; below 0.60 nothing is shown. The probability is the relevance judgment.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.14",
+      "concept": "Metadata filter: like-for-like certificate kind and LGD place levels",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "288-291",
+      "snippet": "            if is_self(qf, v, c):\n                continue\n            if kind and (c[\"service\"] == \"domicile\") != (kind == \"domicile\"):\n                continue",
+      "what": "Candidates are filtered by certificate kind (caste vs domicile) before scoring, and place comparison uses Local Government Directory codes, i.e. structured metadata rather than free text.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Evidence of the wrong kind is excluded up front rather than down-weighted."
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.11",
+      "concept": "Precision/recall/F1 and recall that counts blocking misses",
+      "layer": "eval",
+      "file": "app/backend/evaluate.py",
+      "lines": "185-195",
+      "snippet": "        for ci, rel in truth.items():\n            n_pos_total += 1\n            if ci not in seen:\n                missed_by_blocking += 1\n                c = certs[ci]\n                sl = set(base)\n                if c[\"village_lgd\"] == q[\"village_lgd\"] and norm(c[\"_holder_raw\"]).surname_skel == qn.surname_skel:\n                    sl.add(\"hard\")\n                if c[\"_script\"] != q[\"script\"]:\n                    sl.add(\"cross_script\")\n                rows.append((0.0, True, False, sl))",
+      "what": "Every true link the blocking never surfaced is added as a score-0 positive, so end-to-end recall is not flattered by a candidate generator that dropped relatives.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Recall must be measured over the whole corpus, not only over the candidates the retriever returned."
+    },
+    {
+      "chapter": 15,
+      "concept_id": "15.11",
+      "concept": "Slice metrics: precision/recall per cohort",
+      "layer": "eval",
+      "file": "app/backend/evaluate.py",
+      "lines": "218-224",
+      "snippet": "    slice_defs = [\n        (\"hard\", {\"en\": \"Same village & common surname (the relative is in the candidate set; the test is telling families apart)\", \"hi\": \"एक ही ग्राम व सामान्य उपनाम (संबंधी उम्मीदवार-सूची में रहता है; परीक्षा परिवारों को अलग पहचानना है)\"}),\n        (\"tribal_div\", {\"en\": \"Bastar & Surguja divisions\", \"hi\": \"बस्तर और सरगुजा संभाग\"}),\n        (\"plains\", {\"en\": \"Plains divisions (Raipur, Durg, Bilaspur)\", \"hi\": \"मैदानी संभाग (रायपुर, दुर्ग, बिलासपुर)\"}),\n        (\"women\", {\"en\": \"Women applicants\", \"hi\": \"महिला आवेदक\"}),\n        (\"cross_script\", {\"en\": \"Cross-script (Devanagari ↔ Latin)\", \"hi\": \"भिन्न लिपि (देवनागरी ↔ लैटिन)\"}),\n    ]",
+      "what": "Metrics are reported separately for hard same-village cases, tribal divisions, plains, women and cross-script pairs rather than one global number.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Slices expose where a system fails for specific groups; matches the chapter on failure taxonomies."
+    },
+    {
+      "chapter": 19,
+      "concept_id": "19.07",
+      "concept": "Held-out eval set built from generator ground truth",
+      "layer": "eval",
+      "file": "app/backend/evaluate.py",
+      "lines": "1-9",
+      "snippet": "\"\"\"Evaluate the lineage matcher on HELD-OUT synthetic families (30% of lineages, never used\nfor training) against the generator's ground truth. Writes model/eval.json in the\n/api/eval shape.\n\nA candidate pair is (applicant, archived certificate). It is a TRUE link when the\ncertificate holder is the applicant's father or a sibling (ground truth from\npopulation.csv). Recall counts every true link in the archive, including those the\nblocking never surfaced (so blocking misses are counted as misses).\n",
+      "what": "Evaluation uses 30% of synthetic lineages never used for training, scored against the generator's known father/sibling truth.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Honest about being synthetic; real-archive accuracy is explicitly deferred."
+    },
+    {
+      "chapter": 19,
+      "concept_id": "19.06",
+      "concept": "Failure slices as a taxonomy of hard cases",
+      "layer": "eval",
+      "file": "app/backend/evaluate.py",
+      "lines": "167-173",
+      "snippet": "        base = set()\n        if q[\"division\"] in (\"Bastar\", \"Surguja\"):\n            base.add(\"tribal_div\")\n        else:\n            base.add(\"plains\")\n        if q[\"gender\"] == \"F\":\n            base.add(\"women\")",
+      "what": "Each scored pair is tagged with slice labels (tribal division, plains, women) so errors can be grouped; hard and cross-script tags are added below.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 19,
+      "concept_id": "19.08",
+      "concept": "Synthetic officer labels with injected error rate",
+      "layer": "backend",
+      "file": "app/backend/learning.py",
+      "lines": "112-122",
+      "snippet": "def simulated_labels() -> list[dict]:\n    u = universe()\n    shown = [p for p in u[\"pairs\"] if p[\"part\"] == \"pool\" and _p(p[\"s\"]) >= POSSIBLE]\n    rng = random.Random(SEED)\n    out = []\n    for p in rng.sample(shown, min(N_SIMULATED, len(shown))):\n        y = p[\"y\"]\n        if rng.random() < OFFICER_ERROR:\n            y = 1 - y\n        out.append({\"pair_id\": p[\"id\"], \"y\": y, \"source\": \"simulated\", \"officer_error\": y != p[\"y\"]})\n    return out",
+      "what": "300 simulated officer confirmations are drawn from ground truth with a 3% flipped-label rate, labelled 'simulated' everywhere, to exercise the learning loop when few real labels exist.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Injecting annotator noise is a good habit; the label is tagged so it is never mistaken for a real one."
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.02",
+      "concept": "Honesty note on every eval result",
+      "layer": "eval",
+      "file": "app/backend/evaluate.py",
+      "lines": "267-270",
+      "snippet": "        \"honesty_note\": {\n            \"en\": \"Measured on synthetic data generated by us; real-archive accuracy must be re-measured on a labelled sample before any pilot.\",\n            \"hi\": \"यह माप हमारे द्वारा बनाए गए नमूना डेटा पर है; किसी भी पायलट से पहले वास्तविक अभिलेखों के लेबल किए गए नमूने पर पुनः मापना आवश्यक है।\",\n        },",
+      "what": "The eval output carries a bilingual note saying the numbers are measured on synthetic data and must be re-measured on a labelled real sample before any pilot.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Expectation setting shipped in the data, not just in a slide."
+    },
+    {
+      "chapter": 20,
+      "concept_id": "20.03",
+      "concept": "Calibrating the scorer against human (officer) labels with ridge shrinkage",
+      "layer": "backend",
+      "file": "app/backend/learning.py",
+      "lines": "193-203",
+      "snippet": "def fit(kind: str, rows: list[tuple[float, list[float], int]], prior: float) -> np.ndarray:\n    \"\"\"Ridge-regularised logistic regression (IRLS), shrunk towards the EM model (theta0).\"\"\"\n    th0 = _init(kind, prior)\n    if not rows:\n        return th0\n    X = np.array([_features(kind, s, w) for s, w, _ in rows])\n    y = np.array([yy for _, _, yy in rows], dtype=float)\n    lam = RIDGE[kind]\n    def loss(t):\n        z = X @ t\n        return float(np.sum(np.logaddexp(0, z) - y * z) + 0.5 * lam * np.sum((t - th0) ** 2))",
+      "what": "Officer 'same family' / 'not this family' labels fit a ridge-regularised logistic recalibration shrunk toward the EM weights, so a few hundred labels cannot swing the model.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Validate an automated judge against human labels; here the human labels also tune it."
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.09",
+      "concept": "Implicit feedback: officer dispositions become training labels",
+      "layer": "backend",
+      "file": "app/backend/learning.py",
+      "lines": "166-175",
+      "snippet": "        for lm in an.get(\"lineage_matches\") or []:\n            no = lm[\"certificate\"][\"cert_no\"]\n            d = per.get(no)\n            if not d:\n                continue\n            w = {FIELD_TO_COMP.get(x[\"field\"]): x[\"weight\"] for x in lm.get(\"weights\") or []}\n            out.append({\"pair_id\": f\"{app_id}|{no}\", \"y\": 1 if d[\"decision\"] == \"same\" else 0, \"source\": \"officer_case\",\n                        \"app_id\": app_id, \"cert_no\": no, \"ts\": d.get(\"ts\"),\n                        \"w\": [w.get(c, 0.0) for c in COMPARISONS], \"s\": lm.get(\"prior_weight\", 0) + sum(w.get(c, 0.0) for c in COMPARISONS)})\n    return out",
+      "what": "Each officer confirmation or dismissal on a live file is converted to a labelled pair with its model features; approve/reject decisions are deliberately not used as labels.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Choosing which user acts count as labels is the key design decision."
+    },
+    {
+      "chapter": 14,
+      "concept_id": "14.02",
+      "concept": "In-browser OCR worker served from own origin",
+      "layer": "frontend",
+      "file": "app/frontend/src/reader/ocr.ts",
+      "lines": "17-29",
+      "snippet": "  if (!workerP) {\n    const t0 = performance.now();\n    const origin = window.location.origin;\n    // English first: research (and our tests) found Hindi-first garbles the digits in certificate numbers and dates\n    workerP = createWorker([\"eng\", \"hin\"], 1, {\n      workerPath: `${origin}/tesseract/worker.min.js`,\n      corePath: `${origin}/tesseract`,\n      langPath: `${origin}/tessdata`,\n      gzip: false,\n      logger: (m: { status: string; progress: number }) => listener?.({ status: m.status, progress: m.progress }),\n    }).then((w) => {\n      engineReadyMs = Math.round(performance.now() - t0);\n      return w;",
+      "what": "tesseract.js is loaded lazily as a single shared worker with local wasm and language data (English first, then Hindi), with a progress listener for the UI.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "English-first language order is an empirical fix: Hindi-first garbled digits in certificate numbers."
+    },
+    {
+      "chapter": 14,
+      "concept_id": "14.09",
+      "concept": "OCR confidence per field, low confidence shown as 'unclear' not 'mismatch'",
+      "layer": "frontend",
+      "file": "app/frontend/src/reader/extract.ts",
+      "lines": "192-200",
+      "snippet": "export function compareBi(field: Field | undefined, ref: { hi?: string; en?: string } | undefined): Verdict {\n  if (!field || !ref) return \"na\";\n  const vs = [compareText(field.hi, ref.hi), compareText(field.en, ref.en)].filter((v) => v !== \"na\");\n  if (!vs.length) return \"na\";\n  const order: Verdict[] = [\"match\", \"variant\", \"mismatch\"];\n  const best = vs.sort((x, y) => order.indexOf(x) - order.indexOf(y))[0];\n  if (best === \"mismatch\" && field.confidence < 60) return \"unclear\";\n  return best;\n}",
+      "what": "A text mismatch is downgraded to 'unclear' when the field's OCR confidence is under 60, so a shaky read never reads as a finding against the applicant.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 13,
+      "concept_id": "13.06",
+      "concept": "Rule-based field extraction from OCR text",
+      "layer": "frontend",
+      "file": "app/frontend/src/reader/extract.ts",
+      "lines": "111-123",
+      "snippet": "  // ---- prose (affidavit): \"मैं सुनीता मरकाम पुत्री श्री रामलाल मरकाम, ...\"\n  const NAME3 = `(${WORD}(?:\\\\s+${WORD}){0,2}?)`; // up to three words (\"रमेश कुमार साहू\")\n  const me = t.match(new RegExp(`मैं\\\\s+${NAME3}\\\\s+(?:पुत्री|पुत्र|पत्नी|पिता)\\\\s+(?:श्री\\\\s+)?${NAME3}\\\\s*[,।]`));\n  if (me) {\n    put(\"name\", { hi: me[1] });\n    put(\"father\", { hi: me[2] });\n  }\n  // ---- certificate prose: \"... कि श्री रामलाल मरकाम (Ram Lal Markaam) पिता श्री बुधराम मरकाम, ...\"\n  const cert = t.match(new RegExp(`(?:कि\\\\s+)?(?:श्री|श्रीमती|कुमारी|सुश्री)\\\\s+${NAME2}\\\\s*(?:\\\\(([A-Za-z .]+)\\\\))?\\\\s*(?:पिता|पुत्र|पुत्री)\\\\s+(?:श्री\\\\s+)?(\\\\S+(?:\\\\s+${WORD})?)`));\n  if (cert) {\n    put(\"name\", { hi: cert[1], en: cert[2]?.trim() });\n    put(\"father\", { hi: stripQuotes(cert[3]) });\n  }",
+      "what": "Regexes pull name and father from affidavit and certificate prose. Deterministic and offline, but brittle to any wording change; no model or schema-constrained extraction.",
+      "quality": "naive",
+      "mine": true,
+      "lesson": "An LLM or layout model with a typed schema would handle wording drift; the regexes are fine for three known paper types."
+    },
+    {
+      "chapter": 13,
+      "concept_id": "13.04",
+      "concept": "Typed request schema validates the fingerprint input",
+      "layer": "backend",
+      "file": "app/backend/reader_api.py",
+      "lines": "73-77",
+      "snippet": "class Fingerprint(BaseModel):\n    app_id: str = Field(min_length=3, max_length=40)\n    phash: str = Field(pattern=r\"^[0-9a-f]{16}$\")\n    kind: str = Field(default=\"unknown\", max_length=20)\n    label: str = Field(default=\"\", max_length=80)",
+      "what": "A Pydantic model constrains the perceptual hash to 16 hex digits and bounds the string lengths before any logic runs.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Not LLM output, but the same validate-at-the-boundary habit."
+    },
+    {
+      "chapter": 29,
+      "concept_id": "29.03",
+      "concept": "Data minimisation: only a perceptual hash leaves the browser",
+      "layer": "backend",
+      "file": "app/backend/reader_api.py",
+      "lines": "64-67",
+      "snippet": "# ------------------------------------------------------------------ duplicate-paper check (perceptual hash)\n# The browser sends only a 64-bit perceptual hash (pHash, DCT-based, as in Python's imagehash) of the page image —\n# never the image. A rescan or a tilted phone photo of the same paper lands within a few bits (synthetic aff.png vs\n# aff_noisy.jpg: 4 bits; different papers: >= 18). Held in memory, cleared by a demo reset.",
+      "what": "The page image is never uploaded; the browser sends a 64-bit DCT perceptual hash, and the server compares hash distances to flag the same paper on another file.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 12,
+      "concept_id": "12.12",
+      "concept": "Reviewed Jinja2 templates with StrictUndefined as versioned 'prompts'",
+      "layer": "backend",
+      "file": "app/backend/messages.py",
+      "lines": "27-31",
+      "snippet": "def render_pair(template: str, **ctx) -> dict:\n    out = {lang: env.get_template(f\"{template}.{lang}.j2\").render(**ctx).strip() for lang in (\"en\", \"hi\")}\n    for a, b in HI_AGREEMENT:\n        out[\"hi\"] = out[\"hi\"].replace(a, b)\n    return out",
+      "what": "All citizen-message wording lives in reviewed .j2 files; StrictUndefined makes a missing variable a hard error. This is the template-bound alternative to generating text with a model.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "If an LLM were added, it would sit behind the entity checker below."
+    },
+    {
+      "chapter": 29,
+      "concept_id": "29.05",
+      "concept": "Entity checker validates finished output against the source record",
+      "layer": "backend",
+      "file": "app/backend/messages.py",
+      "lines": "69-82",
+      "snippet": "        for tok in _tokens(text.get(lang, \"\")):\n            low = tok.lower()\n            is_id = \"/\" in tok or any(ch.isdigit() for ch in tok)\n            is_name_like = tok[:1].isupper() or \"ऀ\" <= tok[:1] <= \"ॿ\"\n            if not is_id and (low in vocab or not is_name_like):\n                continue\n            if low in vocab and not is_id:\n                continue\n            if tok not in checked:\n                checked.append(tok)\n            if low not in corpus and low not in vocab:\n                if tok not in unsupported:\n                    unsupported.append(tok)\n    return {\"passed\": not unsupported, \"unsupported_entities\": unsupported, \"checked_entities\": checked}",
+      "what": "Every number, certificate id and name-like word in the message must appear in the template's fixed wording or the source record; anything else is returned as an unsupported entity.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Docstring says it is the same guard an LLM rewrite would have to pass."
+    },
+    {
+      "chapter": 17,
+      "concept_id": "17.10",
+      "concept": "Grounding: message checked against only the records used",
+      "layer": "backend",
+      "file": "app/backend/messages.py",
+      "lines": "121-123",
+      "snippet": "    text = render_pair(f\"msg_{action}\", **ctx)\n    source = [app, office, SHORT_SERVICE[app[\"service\"]], deficiencies or [], findings or \"\", records]\n    return {\"channel\": \"whatsapp\", \"text\": text, \"generator\": \"template\", \"checker\": check_entities(text, source)}",
+      "what": "The message is rendered from the case data, then checked with the application, office, service and deficiencies as the allowed source set.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 29,
+      "concept_id": "29.12",
+      "concept": "Unit test proves the guard catches invented entities",
+      "layer": "eval",
+      "file": "app/backend/tests/test_api.py",
+      "lines": "159-165",
+      "snippet": "def test_entity_checker_catches_invented_entities():\n    from messages import check_entities\n    app = client.get(f\"/api/applications/{enc(HERO)}\").json()[\"application\"]\n    ok = check_entities({\"en\": f\"Namaste Sunita Markam. Your application {HERO} is APPROVED.\", \"hi\": \"\"}, [app])\n    assert ok[\"passed\"]\n    bad = check_entities({\"en\": f\"Namaste Sunita Markam. Certificate CG/KDG/SDO/2011/999999 for Rahul, fee 500.\", \"hi\": \"\"}, [app])\n    assert not bad[\"passed\"] and \"CG/KDG/SDO/2011/999999\" in bad[\"unsupported_entities\"] and \"500\" in bad[\"unsupported_entities\"]",
+      "what": "A positive case passes and a message with an invented certificate number and fee '500' fails with both listed as unsupported entities.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Guardrails need their own positive and adversarial tests."
+    },
+    {
+      "chapter": 22,
+      "concept_id": "22.01",
+      "concept": "Workflow, not an agent: the 'Certificate Assistant agent' never decides",
+      "layer": "backend",
+      "file": "app/backend/agent_trace.py",
+      "lines": "1-6",
+      "snippet": "\"\"\"Round 8b: the visible \"प्रमाण एजेंट\" trace — what the system did for one file, step by step.\n\nBuilt only from the real analysis and the timing marks engine.analyse() records while it runs (additive; the\nanalysis itself is unchanged). Honest labels: the agent reads, searches, scores, checks and drafts. It never decides.\nThe last step is always \"waiting for the officer\"; the frontend shows it as done once the file is decided.\n\"\"\"",
+      "what": "The module documents that the 'agent' only reads, searches, scores, checks and drafts, and that the last step is always the officer. It is a fixed pipeline of rules and one ML scorer.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Honest labelling: a deterministic workflow with a human final step."
+    },
+    {
+      "chapter": 30,
+      "concept_id": "30.05",
+      "concept": "Step-by-step trace of one file's analysis",
+      "layer": "backend",
+      "file": "app/backend/agent_trace.py",
+      "lines": "139-148",
+      "snippet": "    # ⑥ waiting for the officer (the agent never decides)\n    steps.append({\n        \"code\": \"officer\", \"status\": \"waiting\", \"ms\": None,\n        \"title\": {\"en\": \"Waiting for the officer\", \"hi\": \"अधिकारी की प्रतीक्षा\"},\n        \"detail\": {\"en\": \"The agent never decides, approves or rejects. You decide; the audit records what this screen showed.\",\n                   \"hi\": \"एजेंट निर्णय, स्वीकृति या अस्वीकृति नहीं करता। निर्णय आपका है; इस स्क्रीन पर दिखी जानकारी ऑडिट में दर्ज होती है।\"},\n    })\n    for i, s in enumerate(steps, 1):\n        s[\"step\"] = i\n    return steps",
+      "what": "The trace ends with a mandatory 'waiting for the officer' step and numbers the steps; earlier steps carry timings and a status of ok, attention or waiting.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 30,
+      "concept_id": "30.06",
+      "concept": "Per-stage latency and count metrics",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "307-310",
+      "snippet": "        if stats is not None:\n            stats.update({\"archive_certs\": len(self.archive.certs), \"blocked_views\": len(set(cand)),\n                          \"candidates\": len(best), \"above_threshold\": len(out),\n                          \"block_ms\": round((tb - t0) * 1000, 2), \"score_ms\": round((time.perf_counter() - tb) * 1000, 2)})",
+      "what": "Blocking and scoring report archive size, candidate counts and block_ms/score_ms, which the trace later shows.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Counts and timings per stage are the same metrics an LLM pipeline needs."
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.04",
+      "concept": "Collapsible trace with step icons and timings",
+      "layer": "frontend",
+      "file": "app/frontend/src/components/AgentTrace.tsx",
+      "lines": "15-26",
+      "snippet": "export default function AgentTrace({ trace, decided }: { trace?: TraceStep[]; decided: boolean }) {\n  const { t, tx } = useI18n();\n  const [open, setOpen] = useState(false);\n  if (!trace || trace.length === 0) return null;\n  const steps = trace.map((s) =>\n    s.code === \"officer\" && decided\n      ? { ...s, status: \"ok\" as const, title: { en: \"Decided by the officer\", hi: \"अधिकारी ने निर्णय लिया\" } }\n      : s,\n  );\n  const total = steps.reduce((a, s) => a + (s.ms ?? 0), 0);\n  const attention = steps.filter((s) => s.status === \"attention\").length;\n  const ico = (s: TraceStep) => (s.status === \"ok\" ? \"✓\" : s.status === \"attention\" ? \"!\" : \"⏳\");",
+      "what": "A one-line summary (steps, total ms, items to check) opens into the full list; the officer step flips to 'Decided by the officer' only once decided.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 21,
+      "concept_id": "21.13",
+      "concept": "Approval gate: reject needs show-cause, approve needs every possible match disposed",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "681-686",
+      "snippet": "    if body.action == \"reject\" and not (an.get(\"show_cause\") and an[\"show_cause\"].get(\"reply\")):\n        raise HTTPException(422, \"a rejection needs a show-cause notice first: issue it (action 'show_cause') and record the \"\n                                 \"reply or its absence before the final order\")\n    if body.action == \"approve\" and an[\"disposition_required\"] and not native:\n        raise HTTPException(422, \"every possible family record shown must be disposed of first ('same family' or \"\n                                 f\"'not this family'): {an['disposition_required']}\")",
+      "what": "The server returns 422 unless a show-cause reply is recorded before rejection, and unless every possible family record has been marked 'same' or 'not' before approval.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Human approval enforced in the API, not just the UI."
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.11",
+      "concept": "Reversibility: undo a confirmation until the decision is signed",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "468-480",
+      "snippet": "@app.post(\"/api/applications/{app_id:path}/clear-match\")\ndef clear_match(app_id: str, body: ClearMatchBody):\n    \"\"\"Undo a 'same family' / 'not this family' act — allowed until the decision is signed.\"\"\"\n    e = STATE.entry(app_id)\n    _pending_or_409(e[\"application\"])\n    an = STATE.analysis(app_id)\n    _match_or_400(an, body.cert_no)\n    with STATE.lock:\n        prev = STATE.dispositions.get(app_id, {}).pop(body.cert_no, None)\n        STATE.invalidate(app_id)\n    if prev is None:\n        raise HTTPException(400, f\"no confirmation or dismissal recorded for {body.cert_no}\")\n    an = STATE.analysis(app_id)",
+      "what": "clear-match removes a 'same family' or 'not this family' act while the file is still pending, and the audit trail records the withdrawal.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 30,
+      "concept_id": "30.04",
+      "concept": "Audit log of every record access and decision",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "164-177",
+      "snippet": "    def add_audit(self, role: str, action: str, app_id: str | None = None, records: list[str] | None = None,\n                  note: str | None = None, actor: str | None = None, extra: dict | None = None) -> dict:\n        entry = {\"ts\": datetime.now(IST).isoformat(timespec=\"seconds\"), \"actor_role\": role,\n                 \"actor\": actor or DEFAULT_ACTOR.get(role, role), \"action\": action,\n                 \"records_accessed\": records or []}\n        if app_id:\n            entry[\"app_id\"] = app_id\n        if note:\n            entry[\"note\"] = note\n        if extra:\n            entry.update(extra)\n        with self.lock:\n            self.audit.append(entry)\n            self.save()",
+      "what": "Each action is appended with timestamp, role, actor, action and the records accessed, then persisted.",
+      "quality": "solid",
+      "mine": true,
+      "lesson": "Logs records touched; no prompts exist here, but the pattern carries over."
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.01",
+      "concept": "UX that states facts and never pre-selects an outcome",
+      "layer": "frontend",
+      "file": "app/frontend/src/components/VerdictCard.tsx",
+      "lines": "1-6",
+      "snippet": "/**\n * Round 3: ONE evidence verdict at the top of the case view. It answers, in fixed rows and fixed icons,\n * what the evidence is, what the officer must decide, what needs attention, what the file relies on and\n * what is missing. Every other restatement of the same facts was removed from the page.\n * It states facts and the officer's task; it never pre-selects an outcome (round-2 anti-anchoring).\n */",
+      "what": "One fixed-row evidence verdict tells the officer what is known and what they must decide; it avoids anchoring the decision on the machine's guess.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.05",
+      "concept": "Per-field evidence weights shown for each suggested match",
+      "layer": "backend",
+      "file": "app/backend/matcher.py",
+      "lines": "261-263",
+      "snippet": "            label = COMP_LABEL.get((comp, v.hyp)) or COMP_LABEL[(comp, None)]\n            items.append({\"field\": FIELD[comp], \"label\": label, \"comparison\": {\"en\": en, \"hi\": hi},\n                          \"level\": lv, \"weight\": round(self.model.weight(comp, lv), 3)})",
+      "what": "Each comparison returns a bilingual label, level and learned weight so the officer sees why a record was proposed.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.05",
+      "concept": "Uncertainty vocabulary in the Reader",
+      "layer": "frontend",
+      "file": "app/frontend/src/pages/Reader.tsx",
+      "lines": "103-109",
+      "snippet": "const VERDICT: Record<Verdict, { hi: string; en: string; cls: string }> = {\n  match: { hi: \"✓ मेल\", en: \"✓ matches\", cls: \"v-match\" },\n  variant: { hi: \"≈ वर्तनी भिन्न\", en: \"≈ spelling variant\", cls: \"v-variant\" },\n  mismatch: { hi: \"⚠ भिन्न — मूल देखें\", en: \"⚠ differs — check original\", cls: \"v-mismatch\" },\n  unclear: { hi: \"? पढ़ाई अस्पष्ट\", en: \"? unclear read\", cls: \"v-unclear\" },\n  na: { hi: \"—\", en: \"—\", cls: \"v-na\" },\n};",
+      "what": "Five verdict states (match, spelling variant, differs - check original, unclear read, n/a) express certainty and avoid a binary fake/genuine label.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.07",
+      "concept": "Missing record is never a ground for rejection",
+      "layer": "backend",
+      "file": "app/backend/reader_api.py",
+      "lines": "54-59",
+      "snippet": "    if not c:\n        # returned (not raised): the app-wide handler flattens HTTPException details to a string\n        return JSONResponse(status_code=404, content={\"found\": False, \"cert_no\": no, \"detail\": {\"en\": f\"No record {no} in the archive. This is not a ground for rejection; \"\n                                        \"check the original paper or ask the issuing office.\",\n                                  \"hi\": f\"अभिलेखागार में {no} का अभिलेख नहीं मिला। यह अस्वीकृति का आधार नहीं है; \"\n                                        \"मूल दस्तावेज़ देखें या जारीकर्ता कार्यालय से पूछें।\"}})",
+      "what": "When the archive has no matching record, the API returns a 404 payload telling the officer this is not grounds for rejection and to check the original paper.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.08",
+      "concept": "One-tap explicit feedback schema",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "1222-1228",
+      "snippet": "class FeedbackBody(BaseModel):\n    useful: Literal[\"yes\", \"no\", \"wrong_family\"]\n    note: Optional[str] = None\n\n\n@app.post(\"/api/applications/{app_id:path}/tool-feedback\")\ndef tool_feedback(app_id: str, body: FeedbackBody):",
+      "what": "The officer rates the check with yes, no or wrong_family and an optional note, after the decision is made.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.10",
+      "concept": "Feedback pitfalls: one tap per decision and never an officer metric",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "1233-1241",
+      "snippet": "    if d.get(\"tool_feedback\"):  # one tap per decision; a repeat would silently flip the Collector's feedback tile\n        raise HTTPException(409, \"tool feedback is already recorded for this decision\")\n    with STATE.lock:\n        d[\"tool_feedback\"] = {\"useful\": body.useful, \"note\": (body.note or \"\").strip() or None,\n                              \"ts\": datetime.now(IST).isoformat(timespec=\"seconds\")}\n        d[\"snapshot\"][\"tool_feedback\"] = d[\"tool_feedback\"]\n    STATE.add_audit(STATE.entries[app_id][\"application\"][\"routed_to\"], \"tool_feedback\", app_id, [],\n                    note=f\"Tool feedback (for improving the tool, not an officer metric): {body.useful}\"\n                         + (f\" — {body.note.strip()}\" if (body.note or \"\").strip() else \"\"))",
+      "what": "A repeat submission returns 409 so it cannot flip the dashboard tile, and the audit note says the feedback is for the tool, not for judging the officer.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 34,
+      "concept_id": "34.12",
+      "concept": "Pilot targets and stop rules mix model and product metrics",
+      "layer": "backend",
+      "file": "app/backend/api.py",
+      "lines": "958-966",
+      "snippet": "PILOT_TARGETS = [\n    {\"metric\": {\"en\": \"Lineage link precision (random review of 'same family' files)\", \"hi\": \"वंश-कड़ी की परिशुद्धता ('वही परिवार' फ़ाइलों की यादृच्छिक समीक्षा)\"},\n     \"target\": {\"en\": \"≥ 98%\", \"hi\": \"≥ 98%\"}, \"stop_rule\": {\"en\": \"Pause if < 95% in any fortnight\", \"hi\": \"किसी पखवाड़े में < 95% हो तो रोकें\"}},\n    {\"metric\": {\"en\": \"Exclusion guard: rejection rate, pilot minus control (ST women, SC, OBC, no-record, migrants)\", \"hi\": \"बहिष्करण सुरक्षा: अस्वीकृति दर, पायलट घटा नियंत्रण (अ.ज.जा. महिलाएँ, अ.जा., अ.पि.व., बिना अभिलेख, प्रवासी)\"},\n     \"target\": {\"en\": \"Δ ≤ +1 pp in every group\", \"hi\": \"हर समूह में Δ ≤ +1 प्रतिशत बिंदु\"}, \"stop_rule\": {\"en\": \"Pause at +2 pp in any group\", \"hi\": \"किसी समूह में +2 प्रतिशत बिंदु पर रोकें\"}},\n    {\"metric\": {\"en\": \"Send-backs cured on the same application\", \"hi\": \"उसी आवेदन में पूर्ण हुई वापसियाँ\"},\n     \"target\": {\"en\": \"≥ 50%\", \"hi\": \"≥ 50%\"}, \"stop_rule\": {\"en\": \"Review the reason library if < 35%\", \"hi\": \"< 35% हो तो कारण-सूची की समीक्षा\"}},\n    {\"metric\": {\"en\": \"Officers who find the check useful (one-tap feedback, anonymous)\", \"hi\": \"जांच को उपयोगी मानने वाले अधिकारी (एक-टैप प्रतिक्रिया, अनाम)\"},\n     \"target\": {\"en\": \"≥ 60%\", \"hi\": \"≥ 60%\"}, \"stop_rule\": {\"en\": \"Redesign if < 40% after 30 days\", \"hi\": \"30 दिन बाद < 40% हो तो पुनः डिज़ाइन\"}},",
+      "what": "Link precision, exclusion guard by group, cured send-backs and officer usefulness each carry a target and a pause rule.",
+      "quality": "solid",
+      "mine": true
+    },
+    {
+      "chapter": 32,
+      "concept_id": "32.11",
+      "concept": "Model version stamped on every export and shown in the trace",
+      "layer": "backend",
+      "file": "app/backend/train_model.py",
+      "lines": "187-191",
+      "snippet": "    model = {\n        \"model\": \"Splink Fellegi–Sunter (EM)\",\n        \"model_version\": f\"lineage-fs-splink-{date.today().isoformat()}\",\n        \"trained_on\": {\"applicant_rows\": n_left, \"certificate_rows\": n_right,\n                       \"description\": \"SYNTHETIC Chhattisgarh population, training families only (70%)\",",
+      "what": "The exported model records name, a dated version and training-set size, so a result can be traced to the model that made it.",
+      "quality": "solid",
+      "mine": true
+    }
+  ],
+  "flows": [
+    {
+      "name": "Case opened -> suggested family match -> officer decision",
+      "steps": [
+        "case analysed via engine.analyse (app/backend/engine.py:840)",
+        "blocking candidates (matcher.py:166)",
+        "score_view sums weights (matcher.py:230)",
+        "trace built (agent_trace.py:23)",
+        "officer marks same/not (api.py:430)",
+        "approve gate (api.py:684)",
+        "template message + entity check (messages.py:121)"
+      ],
+      "chapters": [
+        15,
+        22,
+        29,
+        34
+      ]
+    },
+    {
+      "name": "Reader: paper photo -> compared with archive",
+      "steps": [
+        "tesseract OCR in browser (ocr.ts:40)",
+        "extractFields (extract.ts:88)",
+        "phash only sent (reader_api.py:80)",
+        "archive lookup (reader_api.py:42)",
+        "compareBi with confidence gate (extract.ts:192)"
+      ],
+      "chapters": [
+        13,
+        14,
+        34
+      ]
+    }
+  ],
+  "uncovered": [
+    "12.01",
+    "13.02",
+    "17.11",
+    "20.01",
+    "21.01",
+    "22.05",
+    "27.01",
+    "31.03",
+    "33.02"
+  ]
+}

@@ -1,0 +1,21 @@
+---
+import type { Chapter } from '../lib/outline';
+import { linkify } from '../lib/outline';
+import { libraryForChapter } from '../lib/library';
+interface Props { chapter: Chapter }
+const { chapter } = Astro.props;
+const docs = libraryForChapter(chapter.id);
+---
+<section class="block" aria-labelledby="read-alongside">
+  <h2 class="block-h" id="read-alongside">Read alongside</h2>
+  <div class="block-body">
+    {docs.length > 0 && (
+      <ul class="ra-list">
+        {docs.map((d) => (
+          <li><span class="ra-kind">Library</span><span><a href={d.href}>{d.title}</a><span class="ra-meta">{d.sourceTitle} · {d.license}{d.note ? ` · ${d.note}` : ''}</span></span></li>
+        ))}
+      </ul>
+    )}
+    <p class="ra-best"><strong>Best sources for this chapter:</strong> <span set:html={linkify(chapter.sources)} /></p>
+  </div>
+</section>

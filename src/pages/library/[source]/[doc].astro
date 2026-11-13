@@ -1,0 +1,62 @@
+---
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createMarkdownProcessor } from '@astrojs/markdown-remark';
+import Page from '../../../layouts/Page.astro';
+import { libraryDocs, type LibraryDoc } from '../../../lib/library';
+import { chapterById, chapterHref } from '../../../lib/outline';
+
+export function getStaticPaths() {
+  return libraryDocs.map((d) => ({ params: { source: d.source, doc: d.doc }, props: { d } }));
+}
+const { d } = Astro.props as { d: LibraryDoc };
+
+// The generated file is the vendored text with MDX/JSX stripped; frontmatter carries the path in the repo.
+const raw = readFileSync(join(process.cwd(), 'data/gen/library', d.source, `${d.doc}.md`), 'utf8');
+const fm = raw.match(/^---\n([\s\S]*?)\n---\n/)!;
+const path: string = JSON.parse(fm[1].match(/^path: (.*)$/m)![1]);
+const md = await createMarkdownProcessor({
+  shikiConfig: { themes: { light: 'github-dark-dimmed', dark: 'github-dark-dimmed' }, wrap: false },
+});
+const { code: html } = await md.render(raw.slice(fm[0].length));
+
+const gh = d.repo.replace(/\/$/, '');
+const sourceUrl = `${gh}/blob/${d.commit}/${path.split('/').map(encodeURIComponent).join('/')}`;
+const short = d.commit.slice(0, 7);
+const sameSource = libraryDocs.filter((x) => x.source === d.source);
+---
+<Page title={`${d.title} · ${d.sourceTitle} · Library`} description={`${d.title}, from ${d.sourceTitle} by ${d.author} (${d.license}), mirrored with attribution.`} noindex crumb="Library" current="library">
+  <article class="lib-doc">
+    <header class="view-head">
+      <p class="view-crumbs"><a href="/library/">Library</a> <span aria-hidden="true">/</span> {d.sourceTitle}</p>
+      <h1 class="view-title">{d.title}</h1>
+      <dl class="repo-facts lib-attr">
+        <div><dt>Author</dt><dd>{d.author}</dd></div>
+        <div><dt>Licence</dt><dd>{d.license}</dd></div>
+        <div><dt>Source file</dt><dd><a href={sourceUrl} target="_blank" rel="noopener noreferrer">{path}</a></dd></div>
+        <div><dt>Commit</dt><dd><a href={`${gh}/tree/${d.commit}`} target="_blank" rel="noopener noreferrer"><code>{short}</code></a></dd></div>
+        {d.chapters.length > 0 && (
+          <div><dt>Supports</dt><dd>{d.chapters.map((id, i) => <><a href={chapterHref(id)} title={chapterById[id]?.title}>{id}</a>{i < d.chapters.length - 1 ? ', ' : ''}</>)}</dd></div>
+        )}
+      </dl>
+      {d.licenseNote && <p class="lib-note" role="note">{d.licenseNote}</p>}
+      <p class="sec-note">Vendored text from <a href={gh} target="_blank" rel="noopener noreferrer">{gh.replace('https://github.com/', '')}</a>, shown unchanged except that MDX components and import lines are removed and relative links point at GitHub. Not our writing.</p>
+    </header>
+
+    <div class="prose lib-prose" set:html={html} />
+
+    <footer class="lib-foot">
+      <p class="sec-note">{d.title} by {d.author}, {d.license}. <a href={sourceUrl} target="_blank" rel="noopener noreferrer">Original at commit {short}</a>.</p>
+      <p class="sec-note">More from this source:
+        {sameSource.filter((x) => x.doc !== d.doc).slice(0, 40).map((x, i) => <>{i > 0 ? ' · ' : ' '}<a href={x.href}>{x.title}</a></>)}
+      </p>
+    </footer>
+  </article>
+</Page>
+
+<style>
+  .lib-note { margin-top: 14px; padding: 10px 14px; border-left: 3px solid var(--accent); background: var(--surface); font-size: var(--text-sm); color: var(--ink-2); max-width: 46rem; line-height: 1.55; }
+  .lib-doc :global(.lib-prose) { margin-top: var(--space-6); }
+  .lib-doc :global(.lib-prose img) { max-width: 100%; height: auto; }
+  .lib-foot { margin-top: var(--space-7); padding-top: 14px; border-top: 1px solid var(--line); }
+</style>

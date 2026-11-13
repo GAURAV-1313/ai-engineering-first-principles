@@ -1,0 +1,166 @@
+---
+id: "D08"
+title: "LLM gateway with routing, caching and fallbacks"
+prompt: "Twenty internal teams call three LLM providers directly, each with its own keys and retry code. Design a shared LLM gateway that handles routing, caching, fallbacks, rate limits and cost attribution."
+sections: ["11.08", "11.09", "11.10", "31.03", "31.04", "32.08", "32.09", "30.06"]
+minutes: 45
+---
+
+## Clarify and scope
+
+A gateway is a reverse proxy with opinions; the design follows from traffic and rules. Ask:
+
+- **Traffic shape.** Assume 50 requests/s on average and 200/s at peak. The mix is interactive chat (streamed), background jobs (not latency-sensitive) and embeddings.
+- **Providers.** Two hosted API providers plus one self-hosted open-weight model. Do any teams have data that must not leave a region or a provider?
+- **Who pays.** Is cost attributed per team, per feature or per end user? Are there hard budgets?
+- **Gateway SLOs.** The gateway should add at most about 20 ms at p99, excluding model time (a design target). Its own availability must be higher than any single provider's, or it is a net loss.
+- **API surface.** Do teams want an OpenAI-compatible endpoint so existing SDKs work, or a house SDK?
+
+Out of scope: training and model hosting (the self-hosted model is just a backend).
+
+## Baseline architecture
+
+```text
+ clients (house SDK or OpenAI-compatible HTTP)
+        |
+ [auth]          virtual key -> team, feature tag, budget, allowed aliases
+        |
+ [policy]        size limits, PII redaction (per team), provider/region allowlist
+        |
+ [rate limiter]  per-team RPM + TPM token buckets in a shared store (Redis)
+        |
+ [exact cache]   opt-in per alias, temperature 0 only  --hit--> response
+        |
+ [router]        alias "fast" / "smart" / "vision" -> ordered candidate list
+        |        filtered by health, region policy, context length, capability
+        |
+ [adapters]      provider A (primary)   provider B (fallback)   self-hosted
+        |        retries honour Retry-After, jitter, retry budget, circuit breaker
+        |
+ [stream proxy]  SSE pass-through, usage captured from the final event
+        |
+ [usage ledger]  async: trace id, tokens (in / cached / out), cost, latency,
+                 attempts, fallback_from, cache status -> warehouse + dashboards
+```
+
+The gateway is stateless apart from Redis (rate limits, exact cache) and an async log pipeline. Run at least three replicas across zones: every AI feature now depends on it.
+
+## Key choices and trade-offs
+
+**Aliases, not model ids.** Teams ask for `smart-v3`, not a dated model string. The platform team maps aliases to models. A model upgrade becomes a config change that has to pass that alias's eval suite before it ships. Teams that need a pinned model can ask for one, and pinned requests never fall back silently.
+
+**How much to normalise.** Messages, tool calls, structured output and streaming events all differ between providers. A lowest-common-denominator API is portable but hides useful features (prompt-cache hints, reasoning effort, server-side tools). The usual compromise is a normalised core plus a `provider_options` pass-through, with adapters that fail loudly when an option is not supported.
+
+**Routing, in increasing order of risk:**
+
+1. **Static:** alias to one model.
+2. **Health-aware:** skip a provider whose circuit breaker is open.
+3. **Rule-based:** route long contexts to a long-context model, a premium tier to a bigger model, background jobs to a batch lane.
+4. **Cascade:** try a cheap model first and escalate when a validator fails or confidence is low.
+5. **Learned router:** a classifier predicts which model is good enough.
+
+Start with 1 to 3. Add a cascade only for an alias whose eval shows the cheap model passes on most traffic.
+
+**Caching has three layers, and they behave very differently.**
+
+- **Provider prompt caching** is the biggest win for most traffic. The gateway's job is to keep prompt prefixes byte-stable (no timestamps up front), pass cache hints through, and record cached tokens so the hit rate is visible.
+- **Exact response caching** keys on a hash of (model, normalised messages, tools, parameters). It is safe only for deterministic, non-personalised calls such as classification or extraction of the same document. Make it opt-in per alias.
+- **Semantic caching** returns a stored answer for a "similar enough" query. Two queries can be close in embedding space and still need different answers ("cancel my order" vs "don't cancel my order"). Use it only for narrow FAQ-style aliases, scoped per tenant, with the threshold calibrated on labelled pairs and a TTL. Most companies get more from prompt caching.
+
+**Fallbacks.** First classify the error:
+
+- **Retryable:** 429, 5xx, timeouts, "overloaded".
+- **Not retryable:** 400s, auth failures, out of credit, context too long, and a content refusal. A refusal is an answer, not an outage.
+
+For retryable errors: honour the provider's Retry-After, otherwise use exponential backoff with jitter. Cap total retries with a retry budget (for example, retries may add at most 10% to traffic). Open a circuit breaker per provider, model and region after repeated failures. Fall back to a different provider only if the alias allows it, because a fallback model can change output quality, cost and data residency. With streaming, transparent fallback is possible only before the first token reaches the client.
+
+**Rate limiting.** Use token buckets per team for both requests per minute and tokens per minute. Estimate tokens before the call, then reconcile with real usage afterwards. Add priority classes so interactive traffic preempts batch traffic when the shared provider quota is tight.
+
+**Build or buy.** Open-source and hosted gateways (LiteLLM, Portkey, Kong and others) already do the adapter and logging work. Aliases, fallback policy, residency and attribution stay your decisions.
+
+## Evals
+
+A gateway should not change what a model says. That means it needs:
+
+- **Adapter contract tests** per provider: a tool-call round trip, structured output, streaming with usage at the end, and error mapping. These run in CI with recorded responses.
+- **Alias evals.** When an alias's mapping changes, run that alias's eval suite (owned by the teams that use it) on old and new models, paired.
+- **Fallback evals.** Run the same suite on every fallback candidate. A fallback that has never been evaluated causes a silent quality drop during an outage, exactly when nobody is looking.
+- **Cache evals.** For a semantic cache, measure the false-hit rate on labelled query pairs at the chosen threshold. For an exact cache, check that the key includes everything that changes the output (tools, system prompt, parameters).
+- **Router evals.** Pass rate and cost per route, so you can see the cascade is still saving money without losing quality.
+
+## Guardrails and fallbacks
+
+- **Budgets:** increment spend atomically before the call and refuse once a team's daily cap is reached. Do this before spending, not after.
+- **Kill switch** per alias and per provider, read on each request.
+- **PII:** redact before sending for teams that require it. By default, log metadata and hashes. Store payloads only for teams that opt in, with a retention period.
+- **Residency:** the policy filters the candidate list. Fallbacks are filtered by the same policy, so an outage can never route regulated data to a disallowed region.
+- **Outage playbook:** when a provider degrades, the circuit breaker opens, traffic shifts to evaluated fallbacks, and aliases with no allowed fallback return a clear 503 the client can show.
+
+## Observability and cost
+
+Every request logs:
+
+- identity: trace id, team, feature tag, alias and resolved model;
+- routing: provider, attempt count, `fallback_from`, cache status;
+- usage: input, cached and output tokens (and thinking tokens where billed);
+- latency: time to first token and total;
+- cost: the provider-reported figure when available, otherwise a price table that carries its own effective date.
+
+Follow the OpenTelemetry GenAI semantic conventions so traces join with the callers' traces. Dashboards show cost per team and per feature, error and fallback rate per provider, cache hit rate per alias, and p95 TTFT. Reconcile with invoices monthly.
+
+<Callout type="tip">
+
+Say early that a gateway is the cheapest route to org-wide visibility: before it, nobody can answer "what does feature X cost per user?"
+
+</Callout>
+
+## The numbers
+
+**Token throughput at peak.** Assume 2,000 input and 400 output tokens per request.
+200 req/s × 60 s × 2,400 tokens = 28.8M tokens per minute. Compare that with your provider rate-limit tiers. You will likely need several keys or projects, more than one region, or more than one provider just for capacity.
+
+**Concurrent streams.** Assume a streamed response lasts 10 s on average. By Little's law, concurrency = arrival rate × duration = 200/s × 10 s = 2,000 open streams. That calls for an async server, not one thread per request.
+
+**Gateway overhead budget (design targets).** Auth from an in-memory cache, about 0. One Redis round trip for rate limiting and one for the cache lookup, typically around a millisecond each in the same zone (measure yours). Logging off the request path. That leaves plenty of room under the 20 ms p99 target. A synchronous call to a remote database on every request would use it up.
+
+**Cost per 1K requests** (P in USD per million tokens; check current prices). Assume 1,500 of the 2,000 input tokens are a cached prefix:
+
+```text
+C_1K = 1000 x [(T_in - T_cached) x P_in + T_cached x P_cached + T_out x P_out] / 1e6
+     = 0.5 x P_in + 1.5 x P_cached + 0.4 x P_out   dollars
+```
+
+**Retry amplification.** Suppose a provider has a 30% error rate during a brownout and clients make up to 3 attempts. Expected attempts per request = 1 + 0.3 + 0.09 = 1.39, so the struggling provider gets 39% more load. That is why you need retry budgets and circuit breakers.
+
+**Availability.** Two providers that are each 99.5% available and fail independently are both down 0.005² = 0.0025% of the time, which is 99.9975% combined. They are not fully independent (shared clouds, your own gateway), so the gateway's replicas and zones now limit the real number.
+
+**Exact cache memory.** 1M entries × (32-byte key + about 2 KB response) ≈ 2 GB of Redis, before per-key overhead.
+
+## Follow-ups they will ask
+
+1. **A stream fails halfway. Can you fall back?** Not transparently. Before the first token you can. After it, return an error event with the partial text and let the client retry, or re-request with the partial output as a prefix where the provider allows it.
+2. **How do you attribute cost to features?** Virtual keys per team plus a required feature tag. The ledger keeps both, and a request without a tag is rejected or billed to the team's "untagged" line.
+3. **Would you add a semantic cache?** Only for narrow, non-personalised, high-repeat aliases, scoped per tenant, with the threshold calibrated on labelled pairs. Prompt caching comes first.
+4. **How do you roll out a new model behind an alias?** Run the alias eval suite, then shadow traffic, then a canary percentage with per-alias dashboards. Roll back by changing config.
+5. **How do you stop one team starving the others?** Per-team TPM buckets, priority classes, and a separate batch lane that uses provider batch APIs.
+6. **What if the fallback provider is not allowed for a team's data?** The residency policy filters fallbacks too. That team gets a clean 503, never a silent reroute.
+
+## How to bring in your own work
+
+You have built the in-process version of this gateway more than once. You have not run a shared, multi-tenant one.
+
+- **Answer Grader, `backend/llm.py`, the gateway in miniature:**
+  - `generate_json` (lines 394 to 401 at the pinned commit) is the one choke point. It dispatches to Gemini, OpenRouter or OpenAI and returns `(parsed, raw, usage)`.
+  - `_is_retryable` (lines 159 to 171) never retries out-of-credit errors and matches status codes as whole tokens, because a bare "500" once matched errors about "500 tokens" and permanent failures were retried five times.
+  - `_backoff_seconds` (lines 174 to 182) prefers the delay the provider names, plus 2 s, capped. Otherwise it uses 5 × 2^attempt. There is no jitter, which is a fair critique to raise yourself.
+  - The fallback (lines 413 to 422) switches provider after `FALLBACK_AFTER` tries, and a caller that pinned a provider never falls back.
+  - `record_usage` keeps a per-run ledger that prefers the provider-reported cost over the price table.
+- **Answer Grader, `backend/vision.py`, lines 376 to 384:** the vision fallback re-raises `NotAnAnswerSheet` instead of asking a second model. That is the "a refusal is not an outage" point, in your code.
+- **Chat Insights:**
+  - `backend/src/lc/services/llm/index.js` is a provider interface over Anthropic and Gemini, with injectable fetch and clock for tests.
+  - `anthropic.js` (lines 122 to 131) drops the `effort` parameter at runtime when a model rejects it, and logs that it did.
+  - The legacy `backend/src/services/llm.js` (lines 46 to 59) honours a 429's Retry-After header.
+  - `chatService.js` (lines 152 to 154) increments an atomic daily cap before the paid call.
+  - `middleware/limiters.js` keeps its counters in process memory, so they do not add up across replicas. That is exactly the problem a shared Redis limiter in a gateway solves.
+- **Memory Agent:** `src/config.ts` (lines 21 to 25) gives each route its own model env var, with one override for A/B evals. That is aliasing on a small scale. Retries are delegated to the SDK, and there is no fallback provider.
+- **Gaps:** no shared rate-limit store, no circuit breaker, no semantic cache (zero hits across the repos), no OpenTelemetry, no residency-aware routing, and no multi-tenant attribution. Present it as: "I've built the single-app version three times. Here is what changes at org scale."

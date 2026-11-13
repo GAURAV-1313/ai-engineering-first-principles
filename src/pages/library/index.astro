@@ -1,0 +1,77 @@
+---
+import Page from '../../layouts/Page.astro';
+import { chapterById, chapterHref, parts, linkify } from '../../lib/outline';
+import sources from '../../../data/sources.json';
+import { libraryDocs } from '../../lib/library';
+
+type Src = { title: string; author: string; url: string; license: string; open: boolean; chapters: string[]; what: string };
+const list = sources as Src[];
+const open = list.filter((s) => s.open);
+const linkOnly = list.filter((s) => !s.open);
+const vendored = [...new Set(libraryDocs.map((d) => d.source))].map((id) => {
+  const docs = libraryDocs.filter((d) => d.source === id);
+  return { id, docs, ...docs[0] };
+});
+---
+<Page title="Library: Open-Licence Readings on LLMs, RAG and Agents" description="Open-licence chapters and courses on LLMs, RAG, evals and agents by other authors, with attribution, mapped to the chapters of AI Engineering from First Principles." crumb="Library" current="library">
+  <header class="view-head">
+    <p class="home-kicker">Read alongside</p>
+    <h1 class="view-title">The library</h1>
+    <p class="view-lede">The book is written in its own words. These are the sources it leans on. Open-licence sources can be quoted with credit; the rest are summarised in our words and linked, never copied.</p>
+  </header>
+
+  <section class="iv-sec" aria-labelledby="open-h">
+    <h2 class="sec-h" id="open-h">Open licence</h2>
+    <ul class="src-list">
+      {open.map((s) => (
+        <li>
+          <a class="src-t" href={s.url} target="_blank" rel="noopener noreferrer">{s.title}</a>
+          <span class="src-meta">{s.author} · {s.license}</span>
+          <p>{s.what}</p>
+          {s.chapters.length > 0 && <p class="src-ch">Chapters {s.chapters.map((id) => <a href={chapterHref(id)} title={chapterById[id].title}>{id}</a>)}</p>}
+        </li>
+      ))}
+    </ul>
+  </section>
+
+  {vendored.length > 0 && (
+    <section class="iv-sec" aria-labelledby="vend-h">
+      <h2 class="sec-h" id="vend-h">Vendored pages</h2>
+      <p class="sec-note">Full pages from the open-licence sources, fetched at a pinned commit and shown with author, licence and a link to the original. Run <code>npm run setup</code> to fetch them.</p>
+      {vendored.map((v) => (
+        <details class="exch lib-vend">
+          <summary><span class="exch-t">{v.sourceTitle}</span> <span class="src-meta">{v.author} · {v.license} · {v.docs.length} pages · <code>{v.commit.slice(0, 7)}</code></span></summary>
+          {v.docs[0].licenseNote && <p class="sec-note">{v.docs[0].licenseNote}</p>}
+          <ul class="src-list">
+            {v.docs.map((d) => (
+              <li><a class="src-t" href={d.href}>{d.title}</a>{d.chapters.length > 0 && <span class="src-meta"> · ch {d.chapters.join(', ')}</span>}</li>
+            ))}
+          </ul>
+        </details>
+      ))}
+    </section>
+  )}
+
+  <section class="iv-sec" aria-labelledby="link-h">
+    <h2 class="sec-h" id="link-h">Link only</h2>
+    <ul class="src-list">
+      {linkOnly.map((s) => (
+        <li>
+          <a class="src-t" href={s.url} target="_blank" rel="noopener noreferrer">{s.title}</a>
+          <span class="src-meta">{s.author} · {s.license}</span>
+          <p>{s.what}</p>
+          {s.chapters.length > 0 && <p class="src-ch">Chapters {s.chapters.map((id) => <a href={chapterHref(id)} title={chapterById[id].title}>{id}</a>)}</p>}
+        </li>
+      ))}
+    </ul>
+  </section>
+
+  <section class="iv-sec" aria-labelledby="per-h">
+    <h2 class="sec-h" id="per-h">Best sources, chapter by chapter</h2>
+    <dl class="per-ch">
+      {parts.flatMap((p) => p.chapters).map((id) => (
+        <div><dt><a href={chapterHref(id)}><span class="iv-id">{id}</span> {chapterById[id].title}</a></dt><dd set:html={linkify(chapterById[id].sources)} /></div>
+      ))}
+    </dl>
+  </section>
+</Page>

@@ -1,0 +1,460 @@
+---
+id: "05"
+title: "Transformer Intuition"
+summary: "Build a working engineer's model of a decoder-only transformer, from embeddings through attention, MLP and residual stream to logits, so you can explain attention on a whiteboard and turn parameters, context length, GQA and MoE into memory, FLOPs and cost."
+readingTime: "25 min"
+---
+
+You will never write a transformer at work, but you will make decisions that only make sense if you know what is inside. Why does a 3B model fit a 4 GB laptop GPU when a 7B one does not? Why does a 100K-token prompt cost over 100 times the compute of a 2K prompt? Why does a model card brag about "8 KV heads"? Why does a 47B mixture-of-experts model run like a 13B one but need a 47B one's memory? Each answer is one or two equations.
+
+This is not a math course. The goal is a model you can trace a request through: token ids become vectors, attention lets each position read earlier positions, an MLP transforms each position alone, everything is added into a running "residual stream", and a final matrix multiply turns the last vector into scores over the vocabulary. Then we turn it into numbers: parameters, FLOPs, memory, and the O(n²) term that makes long context expensive.
+
+The architecture comes from "Attention Is All You Need" (Vaswani et al. 2017); today's models are descendants with a handful of changes, each added below with the problem it solves. Model shapes come from the published `config.json` files of Llama 3.1 8B and Qwen2.5-3B on Hugging Face.
+
+## RNN limits
+
+Before 2017, sequence models read text the way you read a tape: one token at a time, carrying a hidden state vector forward. A recurrent network (RNN, and its gated version the LSTM, Hochreiter and Schmidhuber 1997) computes `h_t = f(h_{t-1}, x_t)`. Everything the model knows about the first 500 tokens has to survive inside one fixed-size vector by token 501.
+
+Three problems follow.
+
+- **No parallelism over time.** `h_500` needs `h_499`, so a 2,000-token document is 2,000 sequential steps on hardware built for wide parallel work.
+- **A memory bottleneck.** A fact from token 3 must survive hundreds of state updates, and gradients through them vanish or explode. LSTM gates soften this; they do not remove it.
+- **Distance costs path length.** For token 500 to use token 3, information crosses 497 steps. In attention, one.
+
+Attention first appeared as an add-on to RNN translation models (Bahdanau, Cho and Bengio 2014): the decoder looks back at all encoder states and takes a weighted average. The 2017 paper dropped the recurrence and kept only attention, so every position reaches every other in one step and training runs in parallel. The price, the subject of half this chapter, is n² pairwise interactions and a per-token cache. [State-space models](#ssm-and-hybrids-brief) try to win back the RNN's cost.
+
+## Attention as soft lookup (Q/K/V)
+
+A hash map lookup finds the one key that matches the query exactly and returns its value. Attention is the soft version: compare the query with **every** key, turn match scores into weights that sum to 1, and return a weighted average of **all** the values. Each token's vector is projected three ways by learned matrices:
+
+- **Query (Q)**: what this position is looking for.
+- **Key (K)**: what this position offers to others who are looking.
+- **Value (V)**: what this position hands over if someone attends to it.
+
+The first layer's input is `x = token_embedding[id] + position_info` ([embeddings](/03-embeddings-and-vector-space/#one-hot-to-dense); [positions](#positional-encoding-rope)). For n vectors stacked into a matrix X:
+
+```text
+Q = X·Wq     K = X·Wk     V = X·Wv          (each n × d_k)
+scores  = Q·Kᵀ / √d_k                       (n × n: every query against every key)
+weights = softmax(scores, row-wise)         (each row sums to 1)
+output  = weights·V                         (n × d_k: a blend of values per position)
+```
+
+### A 3-token example you can check by hand
+
+Take "the cat sat". To keep it readable, give each token four hand-made features, `[is_det, is_noun, is_verb, const]`, and hand-write the projections so the story is visible: keys advertise "I am a noun" or "I am a determiner", a verb's query looks for nouns, and a noun's query looks for determiners. A trained model learns matrices like these from data; it does not get them labelled.
+
+```python
+import numpy as np
+X = np.array([[1., 0., 0., 1.],    # "the"
+              [0., 1., 0., 1.],    # "cat"
+              [0., 0., 1., 1.]])   # "sat"
+Wk = np.zeros((4, 4)); Wk[1, 0] = 1; Wk[0, 1] = 1   # key dim0 = noun, dim1 = det
+Wq = np.zeros((4, 4)); Wq[2, 0] = 4; Wq[1, 1] = 2   # verb seeks nouns, noun seeks det
+Wv = np.eye(4)                                      # value = the features themselves
+
+Q, K, V = X @ Wq, X @ Wk, X @ Wv
+S = Q @ K.T / np.sqrt(4)                            # scale by sqrt(d_k)
+mask = np.triu(np.ones((3, 3), dtype=bool), k=1)    # hide future positions
+S = np.where(mask, -np.inf, S)
+W = np.exp(S - S.max(1, keepdims=True)); W /= W.sum(1, keepdims=True)
+print(W.round(2)); print((W @ V).round(2))
+```
+
+The output, which you can reproduce:
+
+```text
+scores (masked)          weights                 output = weights · V
+the: [0.  -inf -inf]     [1.00 0.00 0.00]        [1.00 0.00 0.00 1]
+cat: [1.   0.  -inf]     [0.73 0.27 0.00]        [0.73 0.27 0.00 1]
+sat: [0.   2.   0. ]     [0.11 0.79 0.11]        [0.11 0.79 0.11 1]
+```
+
+Read the last row. The query for "sat" scored 2 against the key of "cat" and 0 against the others, so 79% of its attention goes to "cat", and its output is now mostly noun features: the verb has gathered information about its subject. That is all attention does: **each position builds a new vector from a weighted mix of other positions**, with weights computed from content. Stack it 30 to 80 layers deep and vectors become context-dependent, which is why "bank" differs next to "river" and "loan" ([contextual embeddings](/03-embeddings-and-vector-space/#contextual-vs-static)).
+
+Two properties matter in production. Attention is **content-addressed**, so a fact on page 1 is one hop from a question on page 40. And it is **a weighted average that sums to 1**: add 50,000 irrelevant tokens and the weight left for the relevant ones thins out, one mechanism behind [context rot](/27-context-engineering/#context-rot).
+
+## Scaled dot-product and multi-head
+
+**Why divide by √d_k.** If the entries of q and k are roughly independent with variance 1, their dot product over d_k dimensions has variance d_k. With d_k = 128 (the head size in Llama 3.1 8B and Qwen2.5-3B), scores have a standard deviation around 11. Softmax over numbers that far apart is almost one-hot: one weight near 1, the rest near 0, and gradients near zero for everything else. Dividing by √d_k brings the standard deviation back to about 1, so training starts with soft attention and learns to sharpen it. The original paper calls this scaled dot-product attention.
+
+**Why many heads.** One attention pattern per layer is a poor fit for language. "sat" needs its subject; "it" needs its antecedent; a closing bracket needs its opening bracket. So the model runs h smaller attentions in parallel. Split the model width d into h heads of size `d_head = d / h`, give each head its own slice of Wq, Wk and Wv, run attention independently, concatenate the h outputs back to width d, and mix them with an output matrix Wo.
+
+```text
+d = 4096, h = 32, d_head = 128            (Llama 3.1 8B)
+head i:  softmax(Q_i K_iᵀ / √128) V_i    → n × 128
+concat 32 heads                          → n × 4096
+× Wo (4096 × 4096)                       → n × 4096, added to the residual stream
+```
+
+Multi-head attention costs about the same parameters and FLOPs as one full-width head (the projections are only sliced), and buys 32 different "questions" per layer. The original Transformer used d = 512 with 8 heads of 64. The bill arrives at serving time: every head's keys and values are cached for every past token ([KV cache](/10-inference-mechanics/#kv-cache-and-memory)), which [MQA and GQA](#mqa-gqa-sliding-window) attack.
+
+## Causal masking
+
+A language model predicts token t+1 from tokens 1..t ([next-token prediction](/04-language-modeling-and-sampling/#next-token-prediction)). Training feeds the whole sequence at once and predicts at every position in parallel. But if position 2 can attend to position 3, predicting token 3 is trivial. Run the toy above without the mask and the row for "cat" becomes `[0.58 0.21 0.21]`: it takes 21% of its information from "sat", a token that, at generation time, does not exist yet.
+
+The fix is the **causal mask**: before the softmax, set every score above the diagonal to −∞. `exp(−∞) = 0`, so future positions get zero weight. The weights matrix becomes lower-triangular.
+
+```text
+          keys →  the   cat   sat
+queries  the      ✓     ✗     ✗
+         cat      ✓     ✓     ✗
+         sat      ✓     ✓     ✓
+```
+
+Two consequences:
+
+- **Earlier tokens never change.** Appending token 6 cannot alter anything computed for positions 1 to 5, in any layer. That is why their keys and values can be cached across decode steps ([prefill vs decode](/10-inference-mechanics/#prefill-vs-decode)) and a shared prompt prefix cached across requests.
+- **Only the last position has seen everything**, which matters when you want one vector for a whole text ([below](#decoder-only-vs-encoder-only-vs-encoder-decoder)).
+
+The same mechanism hides padding in a batch; a padding-mask bug is a classic cause of batched outputs differing from single ones.
+
+## Positional encoding (RoPE)
+
+Attention as written is blind to order. The scores depend only on the contents of q and k, so "dog bites man" and "man bites dog" contain the same pairs. Position has to be injected.
+
+The original paper added fixed sinusoids of different frequencies to the embeddings; GPT-2 learned one vector per absolute position (1,024 of them, and nothing beyond). Most current open models (Llama, Qwen, Mistral) use **rotary position embedding, RoPE** (Su et al. 2021, the RoFormer paper). RoPE does not add anything to the embedding. Inside each attention layer, it **rotates** the query and key vectors by an angle proportional to their position before the dot product.
+
+### RoPE in one picture
+
+Split a 128-dimensional head into 64 pairs of numbers, and treat each pair as a point in 2D. For the token at position m, rotate pair i by angle `m·θ_i`, where θ_i ranges from fast (about 1 radian per position) to very slow.
+
+```text
+        pair i of q at position m          pair i of k at position n
+
+              q·(rotated by mθ)                   k·(rotated by nθ)
+               ↗                                  ↗
+              /  angle mθ                        /  angle nθ
+      -------•--------                   -------•--------
+
+  dot product of two rotated vectors depends on the angle BETWEEN them:
+        (m − n)·θ          → only the relative offset survives
+```
+
+Rotating both vectors and taking the dot product gives the same answer as rotating one of them by the difference. So the score between positions 1,005 and 1,003 is identical to the score between 5 and 3: attention sees "two tokens back", not "absolute slot 1,003". You can check it:
+
+```python
+import numpy as np
+def rope(x, pos, base=10000.0):
+    theta = base ** (-np.arange(0, len(x), 2) / len(x))   # one frequency per pair
+    a = pos * theta
+    out = np.empty_like(x)
+    out[0::2] = x[0::2] * np.cos(a) - x[1::2] * np.sin(a)
+    out[1::2] = x[0::2] * np.sin(a) + x[1::2] * np.cos(a)
+    return out
+
+q, k = np.random.default_rng(1).normal(size=(2, 8))
+for m, n in [(5, 3), (105, 103), (1005, 1003), (5, 4)]:
+    print(m, n, round(float(rope(q, m) @ rope(k, n)), 4))
+# 5 3 -1.1076 | 105 103 -1.1076 | 1005 1003 -1.1076 | 5 4 -0.7765
+```
+
+Why it matters to you: **context-window extension is mostly RoPE surgery.** A model trained on 8K positions has never seen the angles of position 100K. Raising the base (`rope_theta` in `config.json`: 500,000 for Llama 3.1 8B, 1,000,000 for Qwen2.5-3B) slows the rotations, and position interpolation (Chen et al. 2023) and YaRN (Peng et al. 2023) rescale positions into the familiar range, followed by some long-document training. The advertised window is what the vendor trained and tested, not a promise that quality holds at its end ([position effects](/12-prompting-fundamentals/#long-context-position-effects)).
+
+## MLP, residual stream, layer norm
+
+Attention moves information **between** positions. The other half of each block, the MLP (also called the feed-forward network), transforms each position **on its own**: expand the vector to a wider hidden size, apply a nonlinearity, project back.
+
+```text
+MLP(x) = W_down · act(W_up · x)              original: hidden = 4·d, ReLU
+SwiGLU(x) = W_down · (silu(W_gate·x) ⊙ (W_up·x))   Llama/Qwen: three matrices
+```
+
+Most of a dense model's parameters live here: per layer of Llama 3.1 8B, 176M in the MLP against 42M in attention. A useful intuition (Geva et al. 2021): MLPs act like key-value memories, where one matrix detects a pattern and the other writes associated information back, so much of what the model "knows" sits here. The gated SwiGLU variant (Shazeer 2020, "GLU Variants Improve Transformer") is standard in current open models.
+
+### The residual stream
+
+Here is the structural idea that makes deep transformers trainable and, for an engineer, the clearest picture of what a forward pass does. Each sub-layer does not **replace** the vector; it **adds** to it:
+
+```text
+x0 = embed(tokens)                     ┐
+x1 = x0 + Attn_1(norm(x0))             │  one vector per position flows up
+x2 = x1 + MLP_1(norm(x1))              │  the "residual stream"; every layer
+...                                    │  reads from it and writes an update
+xL = ...                               ┘
+logits = norm(xL) · W_unembedᵀ         → one score per vocabulary entry
+```
+
+The interpretability literature calls this running sum the **residual stream** ("A Mathematical Framework for Transformer Circuits", Elhage et al. 2021). Think of it as a shared bus of width d: the embedding puts the token's identity on it, attention heads copy in information from other positions, MLPs add stored associations, and the unembedding matrix reads it out as one score per vocabulary entry (about 128K for Llama 3.1, 152K for Qwen2.5). Those are the logits that [sampling](/04-language-modeling-and-sampling/#logits-softmax) turns into a token. The residual path also gives gradients a direct route back to layer 1, so 80-layer models train.
+
+### Layer norm
+
+As layers add to the stream, vector sizes drift and training destabilises. **LayerNorm** (Ba et al. 2016) rescales each vector to zero mean and unit variance; current models use the cheaper **RMSNorm** (Zhang and Sennrich 2019), which skips the mean. The original paper normalised after the residual add ("post-norm"); modern models normalise each sub-layer's input and leave the stream untouched ("pre-norm", analysed in Xiong et al. 2020), which is more stable at depth.
+
+## Decoder-only vs encoder-only vs encoder-decoder
+
+The same blocks assemble into three families, distinguished by the mask.
+
+| Family | Attention | Trained to | Examples | Use it for |
+|---|---|---|---|---|
+| Encoder-only | bidirectional (no causal mask) | fill in masked tokens | BERT (Devlin et al. 2019), RoBERTa, XLM-R, BGE-M3 | embeddings, classification, cross-encoder rerankers |
+| Decoder-only | causal | predict the next token | GPT family, Llama, Qwen, Mistral | generation, chat, tools, most things |
+| Encoder-decoder | encoder bidirectional; decoder causal plus cross-attention to encoder | map input sequence to output sequence | original Transformer, T5 (Raffel et al. 2020), BART | translation, summarisation, speech recognition (Whisper) |
+
+**Why decoders won generation.** One objective (next token) works on any unlabelled text, every position gives a training signal, and any task you can phrase as a prompt is in scope.
+
+**Why encoders still matter for retrieval.** In an encoder every token sees the whole input, so pooling gives a vector for the whole text, and a small encoder can embed millions of chunks cheaply. A decoder embedder must use the last token's vector or be adapted to attend both ways. Decoder-based embedders exist and score well (for example Wang et al. 2023, "Improving Text Embeddings with Large Language Models"), but at billions of parameters each chunk costs more to embed. The production default remains encoders for embeddings and cross-encoder reranking ([bi-encoders](/03-embeddings-and-vector-space/#bi-encoders-and-sentence-bert)), decoders for generation.
+
+## Parameter and FLOPs accounting
+
+"8B parameters" is a physical thing: about 8 billion numbers in a file. Each number is a weight in one of the matrices above. You can count them from `config.json`.
+
+### Counting Llama 3.1 8B
+
+Config: `hidden_size` 4096, 32 layers, 32 attention heads, 8 KV heads (head size 128), `intermediate_size` 14336, vocabulary 128,256, untied input and output embeddings.
+
+```text
+attention per layer:  Wq 4096×4096 + Wk 4096×1024 + Wv 4096×1024 + Wo 4096×4096 =  41.9M
+MLP per layer:        3 × 4096 × 14336                                        = 176.2M
+per layer (+ norms)                                                           = 218.1M
+× 32 layers                                                                   =  6.98B
+embedding 128,256 × 4096 = 525M, output matrix another 525M                   =  1.05B
+total                                                                         ≈  8.03B
+```
+
+The same count for Qwen2.5-3B (width 2048, 36 layers, 16 query heads, 2 KV heads, MLP 11008, vocabulary 151,936, tied embeddings) gives 2.77B in the layers plus 0.31B of embeddings, about 3.09B. For the original GPT-2 small, the rule of thumb `12·L·d²` for the layers (4d² attention, 8d² MLP) gives `12 × 12 × 768² ≈ 85M`, plus 39M of embeddings: the familiar 124M.
+
+### Memory
+
+Weights in memory = parameters × bytes per parameter. Llama 3.1 8B is about 16 GB at bf16 and roughly 4.5 to 5 GB at a typical 4-bit GGUF quantization (about 4.5 to 5 bits per weight, approximate). Qwen2.5-3B is about 6 GB at bf16 and roughly 2 GB at 4-bit. Add the [KV cache](/10-inference-mechanics/#kv-cache-and-memory), which grows with context. Full fine-tuning needs roughly 16 bytes per parameter ([training memory](/09-fine-tuning-in-practice/#training-memory-math)).
+
+### FLOPs
+
+Each parameter takes part in one multiply-add per token in a forward pass, so:
+
+```text
+forward FLOPs per token  ≈ 2 · N            (N = parameters in the matrices)
+training FLOPs per token ≈ 6 · N            (backward pass ≈ 2× forward)
++ attention term per token at position t ≈ 4 · t · d · L   (next section)
+```
+
+This is the standard approximation of the scaling-law literature (Kaplan et al. 2020, who leave embeddings out of N and count only the `Q·Kᵀ` half of the attention term, `2·n_ctx·d·L`; [scaling laws](/06-pretraining-and-scaling/#scaling-laws-kaplan-chinchilla)). A 2,000-token prompt on Llama 3.1 8B is `2 × 8.03e9 × 2,000 ≈ 3.2e13` FLOPs of prefill. Each output token costs the same 2N FLOPs, but decode is limited by reading 16 GB of weights per token, not by arithmetic ([compute vs memory bound](/10-inference-mechanics/#compute-vs-memory-bound)), one reason output tokens are priced higher than input.
+
+## Quadratic context cost
+
+Each token at position t compares its query with t keys and mixes t values, in every head of every layer. Per layer that is about `2·t·d` FLOPs for `Q·Kᵀ` and `2·t·d` for `weights·V`. Summing over a causal prompt of n tokens gives about `2·n²·d·L` attention FLOPs, on top of the `2·N·n` for the weight matrices. The first term is the O(n²).
+
+For Llama 3.1 8B (d = 4096, L = 32, N ≈ 8.03B), prefill FLOPs:
+
+```text
+prompt n     weights 2·N·n    attention 2·n²·d·L    attention ÷ weights
+  2,048        3.3e13            1.1e12                 3%
+  8,192        1.3e14            1.8e13                13%
+ 32,768        5.3e14            2.8e14                53%
+131,072        2.1e15            4.5e15               214%
+```
+
+Up to a few thousand tokens the quadratic term is noise and cost is effectively linear. Past about 61K tokens (where `n·d·L = N`), attention costs more than all the weight matrices combined. Going from 8K to 128K multiplies input tokens by 16 but prefill compute by about 44 (1.5e14 to 6.6e15).
+
+Memory is the second bill. A naive implementation materialises the n × n score matrix: at 8K tokens, `8,192² × 2 bytes ≈ 134 MB` per head per layer (4.3 GB for 32 heads); at 128K, 34 GB for a single head. [FlashAttention](/10-inference-mechanics/#flashattention) computes the exact result in tiles without storing that matrix, so memory becomes linear. It does **not** remove the n² FLOPs. In decode, each new token reads the whole KV cache, so tokens per second fall as a conversation grows.
+
+What this means for you as an API user:
+
+- **Billing** is usually linear per input token; some providers charge a higher rate above a long-context threshold (check the current price page).
+- **Latency** is not linear: TTFT at 100K is far more than 50 times TTFT at 2K.
+- **Quality** degrades before the window is full ([context rot](/27-context-engineering/#context-rot)), so 5 good retrieved chunks usually beat 200 pasted pages on cost, latency and accuracy at once ([RAG vs long context](/17-rag-pipelines/#rag-vs-long-context-vs-fine-tuning)).
+
+## MQA/GQA, sliding window
+
+Decode is limited by bytes, not FLOPs: every step reads the weights and every cached key and value, and with standard multi-head attention each of h heads caches its own.
+
+**Multi-query attention (MQA)** (Shazeer 2019, "Fast Transformer Decoding: One Write-Head is All You Need") keeps h query heads but **one** shared key and value head: the cache shrinks h times, with some quality loss.
+
+**Grouped-query attention (GQA)** (Ainslie et al. 2023) is the middle ground: h query heads share g key/value heads in groups.
+
+```text
+MHA  (h = 16, g = 16):   q q q q q q q q q q q q q q q q
+                         k k k k k k k k k k k k k k k k
+GQA  (h = 16, g = 2):    q q q q q q q q | q q q q q q q q
+                         k               | k                 ← 8 queries share each KV head
+MQA  (h = 16, g = 1):    q q q q q q q q q q q q q q q q
+                         k
+```
+
+The cache per token is `2 × layers × kv_heads × head_dim × bytes`. Qwen2.5-3B has 36 layers, 16 query heads, 2 KV heads, head size 128:
+
+```text
+GQA as shipped:  2 × 36 × 2  × 128 × 2 bytes = 36 KiB per token → 288 MiB at 8,192 tokens
+if it were MHA:  2 × 36 × 16 × 128 × 2 bytes = 288 KiB per token → 2.25 GiB at 8,192 tokens
+```
+
+An 8× smaller cache means 8× more concurrent sequences, or a long context that fits on a laptop at all. Llama 3.1 8B (8 KV heads for 32 query heads) saves 4×. Per-model tables and concurrency arithmetic are in [chapter 10](/10-inference-mechanics/#kv-cache-and-memory). GQA changes cache bytes per token, not prefill's O(n²) FLOPs.
+
+**Sliding-window attention** limits each token to the last W positions. Mistral 7B (Jiang et al. 2023) uses W = 4,096 over 32 layers; since each layer passes information one window further back, the top layer can in theory reach about 131K tokens, and the paper reports an 8× cache saving at 32K. Cost becomes O(n·W), and the cache stops growing after W tokens, at the price of one-hop access to distant tokens. Some models **interleave** local and global layers (Gemma 2, 2024) to keep most of the saving.
+
+## Mixture-of-Experts
+
+A dense model uses all its parameters for every token. A **mixture-of-experts (MoE)** model replaces each MLP with E smaller MLPs ("experts") plus a small **router** that, for each token, picks the top k experts and blends their outputs. Attention layers stay shared.
+
+```text
+token vector ──► router (d × E matrix) ──► scores for E experts
+                                     └──► top-k (e.g. 2 of 8) ──► run only those MLPs
+                                                                  weighted sum ──► residual stream
+```
+
+The idea dates to Shazeer et al. 2017 ("Outrageously Large Neural Networks"). Mixtral 8x7B (Jiang et al. 2024) has 8 experts per layer and routes each token to 2: about 47B total parameters, about 13B active per token. DeepSeek-V3 (2024) reports 671B total and 37B active.
+
+That split is the whole serving story:
+
+- **Compute follows active parameters.** Mixtral costs roughly `2 × 13B` FLOPs per token, like a 13B dense model.
+- **Memory follows total parameters.** All 47B must be resident, because the next token may route anywhere: about 94 GB at bf16.
+- **Batching is messier.** Tokens in a batch go to different experts, so load balancing matters (training adds an auxiliary loss so the router does not favour a few experts), and at scale experts sit on different GPUs, adding network traffic (expert parallelism).
+
+For an API user, MoE shows up only as price and speed: some big models are cheaper per token than their size suggests. For self-hosting, the gate is memory for the total, not compute for the active.
+
+## SSM and hybrids (brief)
+
+State-space models (SSMs) revisit the RNN idea with better engineering. Mamba (Gu and Dao 2023) keeps a fixed-size state per layer, updated with input-dependent ("selective") rules, and uses a parallel scan so training still parallelises. The payoff: linear time and **constant memory per sequence** in generation, with no growing KV cache.
+
+The cost is the RNN's old weakness in milder form: everything is compressed into the state, so exact recall of an earlier string (copy this ID, quote that clause) is harder than for attention. **Hybrids** mix mostly SSM layers with some attention layers for precise lookup; Jamba (Lieber et al. 2024) interleaves Transformer and Mamba layers and adds MoE. The trade is cheaper long context for possibly weaker exact recall: evaluate on your own long-context tasks.
+
+## Interpretability intuitions
+
+A few findings from interpretability research make model behaviour less mysterious.
+
+- **The residual stream is a shared workspace.** Elhage et al. 2021 treat each head and MLP as reading from and writing to the stream. The "logit lens" trick (decoding the stream at a middle layer with the final unembedding) often shows the eventual answer forming partway through the network.
+- **Induction heads.** Olsson et al. 2022 describe a two-head circuit: one head marks "the token before me was A", another finds earlier occurrences of A and copies what came next. It is a mechanism behind in-context learning and behind models copying patterns from your prompt, including a malformed example's format.
+- **Superposition.** Models represent more features than they have dimensions by overlapping them ("Toy Models of Superposition", Elhage et al. 2022). Individual neurons are therefore often uninterpretable. Sparse autoencoders ("Towards Monosemanticity", Bricken et al. 2023; "Scaling Monosemanticity", Templeton et al. 2024) recover more interpretable features from the stream.
+- **Attention maps are not explanations.** Jain and Wallace 2019 ("Attention is not Explanation") showed that attention weights can often be changed substantially without changing the output. A heatmap is a debugging aid, not proof of why the model answered.
+
+The production lesson: when the model ignores an instruction, fix it with evals and prompt changes, not by reading heatmaps.
+
+## Build a tiny GPT
+
+This NumPy forward pass is a complete decoder-only GPT: embeddings plus learned positions, causal multi-head attention, an MLP, pre-norm residual blocks and tied unembedding to logits. The weights are random, so predictions are noise; the shapes and data flow are real.
+
+```python
+import numpy as np
+
+def rmsnorm(x, eps=1e-6):
+    return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+
+def softmax(s):
+    e = np.exp(s - s.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+
+def attention(x, Wq, Wk, Wv, Wo, n_heads):
+    n, d = x.shape; hd = d // n_heads
+    split = lambda t: t.reshape(n, n_heads, hd).transpose(1, 0, 2)   # (heads, n, hd)
+    q, k, v = split(x @ Wq), split(x @ Wk), split(x @ Wv)
+    s = q @ k.transpose(0, 2, 1) / np.sqrt(hd)                      # (heads, n, n)
+    s = np.where(np.triu(np.ones((n, n), bool), 1), -np.inf, s)      # causal mask
+    return (softmax(s) @ v).transpose(1, 0, 2).reshape(n, d) @ Wo    # concat, mix
+
+def block(x, p, n_heads):
+    x = x + attention(rmsnorm(x), *p["attn"], n_heads)    # read, attend, write back
+    return x + np.maximum(0, rmsnorm(x) @ p["W1"]) @ p["W2"]   # MLP, write back
+
+def gpt_forward(ids, P, n_heads=4):
+    x = P["tok_emb"][ids] + P["pos_emb"][: len(ids)]
+    for p in P["blocks"]:
+        x = block(x, p, n_heads)
+    return rmsnorm(x) @ P["tok_emb"].T                     # logits (n, vocab)
+
+rng = np.random.default_rng(0); V, d, L, ctx = 65, 32, 2, 16
+w = lambda *s: rng.normal(0, 0.02, s)
+P = {"tok_emb": w(V, d), "pos_emb": w(ctx, d),
+     "blocks": [{"attn": [w(d, d) for _ in range(4)], "W1": w(d, 4 * d), "W2": w(4 * d, d)}
+                for _ in range(L)]}
+print(gpt_forward(np.array([5, 17, 42]), P).shape)        # (3, 65)
+```
+
+Missing compared with a production model: RoPE, SwiGLU, GQA, a KV cache for decode, and training. Training adds one idea: cross-entropy between each position's logits and the actual next token, backpropagation, an AdamW update. That needs autograd, so use PyTorch. Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and Raschka's [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) (whose bonus material covers KV cache, GQA and MoE) walk through it end to end. A character-level model with 4 layers and width 128 trains on a laptop in minutes and visibly learns spelling, then syntax.
+
+<Production>
+
+**Failure modes.** Long-context quality degradation is the main one: models miss or misuse facts as input grows, well inside the advertised window ([context rot](/27-context-engineering/#context-rot)). A local model's window is whatever you configure (Ollama's `num_ctx`); check how your runtime handles a longer prompt (it may truncate rather than fail loudly) and log prompt token counts. RoPE-scaled windows can pass short tests and fail long ones; test at your real lengths.
+
+**Cost.** Long prompts cost more compute than their token count suggests once attention dominates (past about 61K tokens for an 8B model): long-context surcharges via APIs, a bigger GPU bill when self-hosting. MoE: memory for total parameters, compute for active ones. GQA is what makes long context affordable on a modest GPU. The cheapest lever is still fewer tokens ([context trimming](/31-cost-and-latency-engineering/#context-trimming)).
+
+**Latency.**
+- TTFT grows with prompt length, faster than linearly at long context (quadratic prefill attention).
+- Decode speed per token slows as the KV cache grows, because each step reads all of it.
+- Bigger dense models decode more slowly: each token reads every weight. Small models (3B to 8B) are the latency play when quality allows.
+
+**Observability.** Log input tokens per call (by prompt section), the model and its context limit, TTFT against prompt length (the curve shows when you pay the quadratic term), and for local models `num_ctx` and quantization.
+
+**Security.** Little is architecture-specific, with one link: attention does not separate instructions from data. Every token in context can influence every later token, the root reason prompt injection is hard to stop at the model level.
+
+</Production>
+
+<Interview>
+
+<Q q="Explain self-attention to a backend engineer.">
+
+- It is a soft key-value lookup: each token emits a query, a key and a value; the query is scored against every key, softmax turns scores into weights summing to 1, and the output is the weighted average of the values.
+- Weights depend on content, so "sat" pulls from "cat" wherever it is: one hop, no fixed window.
+- Many heads run in parallel, each a different kind of lookup, concatenated and projected back into the residual stream.
+- In a decoder a causal mask hides the future, which is also why past keys and values can be cached.
+- Quote the formula: `softmax(QKᵀ/√d_k)·V`, and say why the √d_k is there (keeps softmax from saturating).
+- **The trap:** describing it as "the model focuses on important words" with no mechanism, or confusing attention weights with an explanation of the output.
+
+</Q>
+
+<Q q="Why is attention O(n²), and what do GQA and FlashAttention change?">
+
+- Every one of n queries is scored against up to n keys in every head and layer: an n × n matrix. Prefill attention FLOPs are about `2·n²·d·L` for a causal prompt.
+- Number: Llama 3.1 8B at 8K tokens, attention adds about 13% on top of the weight FLOPs; at 128K it is about twice them. 16× more tokens, about 44× more compute.
+- FlashAttention computes exactly the same result in tiles with an online softmax, never storing the n × n matrix: memory goes from quadratic to linear and HBM traffic drops, but FLOPs stay O(n²).
+- GQA shares each key/value head across a group of query heads, shrinking the KV cache by h/g (Qwen2.5-3B: 16/2 = 8×). It speeds up memory-bound decode and raises concurrency; it does not change prefill's n² FLOPs.
+- What actually changes the asymptotics: sliding-window attention (O(n·W)) or SSM layers.
+- **The trap:** saying FlashAttention "makes attention linear" or that GQA reduces attention compute.
+
+</Q>
+
+<Q q="Decoder-only vs encoder-only: which would you use for embeddings and why?">
+
+- Default: an encoder (BERT-style, e.g. BGE-M3) for embeddings. Bidirectional attention means every token sees the whole text, so pooling gives a vector for the whole text.
+- Encoders are small (hundreds of millions of parameters), so embedding millions of chunks is cheap; same for cross-encoder rerankers.
+- A decoder's tokens only see the past, so you pool the last token or adapt the model; decoder embedders can score well but cost billions of parameters per chunk.
+- Decide on your own retrieval eval (recall@k on your data), cost per million chunks and latency, not on a leaderboard.
+- **The trap:** "use GPT for everything" without considering the cost of re-embedding a corpus, or not knowing why the causal mask matters for pooling.
+
+</Q>
+
+<Q q="What is MoE, and how does it affect serving cost?">
+
+- Each MLP is replaced by E expert MLPs plus a router that sends each token to the top k; attention stays shared.
+- Total parameters set memory; active parameters set compute per token. Mixtral 8x7B: about 47B total, 13B active, 2 of 8 experts.
+- So it serves like a smaller model in FLOPs and often in speed, but needs the GPU memory of the full model (about 94 GB bf16 for Mixtral).
+- Costs to name: load balancing (auxiliary loss, capacity limits), expert parallelism and its network traffic, uneven batching.
+- **The trap:** "a 47B MoE only needs 13B of memory".
+
+</Q>
+
+<Q q="What do 'parameters' and 'context window' mean physically for a model you self-host?">
+
+- Parameters are the numbers in the weight matrices: count from `config.json` (Llama 3.1 8B: 8.03B, mostly in the MLPs). Memory = params × bytes: 16 GB bf16, about 5 GB at 4-bit.
+- The context window is the number of positions the model was trained and tested on (RoPE range), and at serving time the KV cache you reserve: `2 × L × kv_heads × head_dim × bytes` per token.
+- Example: Qwen2.5-3B at 8K context needs about 288 MiB of KV cache next to about 2 GB of 4-bit weights.
+- Quality falls before the window is full, so the usable window is set by your eval, not the model card.
+- **The trap:** treating context length as free or as only an API limit.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Train a tiny GPT on your own code and look inside it, in **Memory Agent** (`~/memory-agent`), in a new `experiments/tiny-gpt/` folder kept out of the app build. It runs offline on a laptop CPU or Apple GPU; no API calls.
+
+1. Build a corpus: concatenate Memory Agent's `src/*.ts`, `DECISIONS.md` and the README into `input.txt` (about 100 KB at the pinned commit; add `eval/*.ts` for more, and expect validation loss to turn up early on so little text).
+2. Follow nanoGPT's character-level recipe (or Raschka's chapter 4 to 5 code). Start small: 4 layers, 4 heads, width 128, block size 128, dropout 0.1. Print the parameter count and check it against `12·L·d²` plus embeddings.
+3. Train until validation loss stops improving. Record the starting loss, which should be close to `ln(vocab size)` (the uniform-guess baseline), and the final loss.
+4. Sample 500 characters from the prompt `export const ` and keep the output.
+5. Instrument attention: disable the fused attention path so the weights matrix is explicit, and save the post-softmax matrix of every head in the first and last layer as heatmaps, for one prompt containing a repeated identifier (such as `config.models.chat ... config.models.`).
+6. Look for a previous-token head (bright line just below the diagonal) and any head that jumps to the token after an earlier occurrence of the repeated identifier (induction-like).
+7. Double the block size to 256, time one training step, and compare with what the linear and n² terms predict.
+
+**Definition of done:** a short `NOTES.md` in that folder with the parameter count (predicted vs printed), start and final validation loss, a TypeScript-looking sample, the heatmaps for one prompt, one head you can name a pattern for, and the step-time ratio from step 7.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Be honest first.** None of your repos implements transformer internals; this chapter is about understanding the models you call. Answer "how is this relevant to your work?" with the consequences: context limits, cost per call, choosing small models.
+- **Scheme Assistant's local path (our pipeline; Chiman wrote these lines, so present them as a teammate's code you can defend).** `src/app/core/llm.py` lines 203-209 call Ollama with `"num_ctx": 8192`, the default model is `qwen2.5:3b` (`src/app/config.py` line 48), and `claude files/TRACKER.md` line 220 records that 7B "does not fit the 4 GB GPU here". Explain both with arithmetic: about 3.09B parameters is roughly 2 GB at 4-bit, about 7.6B is roughly 4.5 GB before any KV cache, and GQA (2 KV heads for 16 query heads) keeps the 8K cache near 288 MiB.
+- **A gap to name, measured.** `src/app/config.py` lines 43-47 note that long guideline sections pushed single prompts to 13k tokens and 17 s, which is why the character caps exist. The caps do not fit the Ollama path. With the Qwen2.5 tokenizer, 20,000 characters of Hindi Wikipedia text came to about 18,500 tokens (1.1 characters per token), and the system prompt adds about 1,300, so a full-budget prompt is near 20K tokens against a `num_ctx` of 8,192 that must also hold the answer ([non-English cost](/02-tokenization/#failure-modes-arithmetic-spelling-non-english-cost)). Ollama reportedly truncates an over-long prompt with only a log warning (compare its `prompt_eval_count` with your count). The Gemini path has room; the local one needs a cap near 6,000 Hindi characters or a token count that fails loudly.
+- **Chat Insights (your code).** `backend/src/lc/services/contextBuilder.js` lines 19-22 define `LIMITS` (message 2,000 characters, 150 code lines, 10 history turns, 3 anchors): a context budget that bounds prefill cost, TTFT and long-context degradation. The weakness: caps are in characters and lines, not tokens; no repo counts tokens before a call.
+- **Memory Agent (your code).** `src/config.ts` lines 18-27 route turns to Haiku, Sonnet or Opus, chosen from eval runs per the comment. Bigger models do more FLOPs and read more weights per token, so they are slower and cost more; with closed models you cannot see parameter counts, so routing on measured quality and latency is the right method.
+
+</YourProject>

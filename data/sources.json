@@ -1,0 +1,218 @@
+[
+  {
+    "title": "AI Agent book (English edition)",
+    "author": "Bojie Li",
+    "url": "https://github.com/bojieli/ai-agent-book",
+    "license": "Apache-2.0",
+    "open": true,
+    "chapters": [
+      "19",
+      "21",
+      "22",
+      "23",
+      "24",
+      "25",
+      "26",
+      "27",
+      "28"
+    ],
+    "what": "The closest thing to a first-principles agents textbook: context, tools, memory, planning, multi-agent, evaluation."
+  },
+  {
+    "title": "12-Factor Agents",
+    "author": "HumanLayer (Dex Horthy)",
+    "url": "https://github.com/humanlayer/12-factor-agents",
+    "license": "CC BY-SA 4.0 (text), Apache-2.0 (code)",
+    "open": true,
+    "chapters": [
+      "13",
+      "21",
+      "22",
+      "27"
+    ],
+    "what": "Principles for production agents: own your prompts, own your context window, tools are structured output, small focused agents. Share-alike applies to quoted text."
+  },
+  {
+    "title": "Hugging Face Agents Course",
+    "author": "Hugging Face",
+    "url": "https://github.com/huggingface/agents-course",
+    "license": "Apache-2.0",
+    "open": true,
+    "chapters": [
+      "09",
+      "18",
+      "20",
+      "22",
+      "30"
+    ],
+    "what": "Unit 1 (what an agent is, the thought-action-observation loop), bonus units on fine-tuning for function calling and observability, unit 3 on agentic RAG."
+  },
+  {
+    "title": "Hugging Face MCP Course",
+    "author": "Hugging Face",
+    "url": "https://github.com/huggingface/mcp-course",
+    "license": "Apache-2.0",
+    "open": true,
+    "chapters": [
+      "26"
+    ],
+    "what": "MCP architecture, building servers and clients, end to end."
+  },
+  {
+    "title": "Hugging Face LLM Course",
+    "author": "Hugging Face",
+    "url": "https://github.com/huggingface/course",
+    "license": "Apache-2.0",
+    "open": true,
+    "chapters": [
+      "02",
+      "05",
+      "07",
+      "08",
+      "09"
+    ],
+    "what": "Chapter 1 (transformers), 6 (tokenizers, BPE from scratch), 11 (fine-tuning, LoRA), 12 (reasoning and GRPO)."
+  },
+  {
+    "title": "Prompt Engineering Guide",
+    "author": "DAIR.AI",
+    "url": "https://github.com/dair-ai/Prompt-Engineering-Guide",
+    "license": "MIT",
+    "open": true,
+    "chapters": [
+      "12",
+      "17"
+    ],
+    "what": "A catalogue of prompting techniques with papers; read for breadth, not depth."
+  },
+  {
+    "title": "GraphRAG documentation",
+    "author": "Microsoft",
+    "url": "https://github.com/microsoft/graphrag",
+    "license": "MIT",
+    "open": true,
+    "chapters": [
+      "18"
+    ],
+    "what": "How GraphRAG builds entity graphs and community summaries, and global vs local search."
+  },
+  {
+    "title": "AI Agents for Beginners",
+    "author": "Microsoft",
+    "url": "https://github.com/microsoft/ai-agents-for-beginners",
+    "license": "MIT",
+    "open": true,
+    "chapters": [
+      "29",
+      "32",
+      "33"
+    ],
+    "what": "Lessons on trustworthy agents, agents in production and agent security."
+  },
+  {
+    "title": "awesome-ai-engineer-interview",
+    "author": "landedjobs",
+    "url": "https://github.com/landedjobs/awesome-ai-engineer-interview",
+    "license": "MIT",
+    "open": true,
+    "chapters": [],
+    "what": "A question bank to drill against after the interview hub."
+  },
+  {
+    "title": "Foundations of Large Language Models",
+    "author": "Tong Xiao and Jingbo Zhu",
+    "url": "https://arxiv.org/abs/2501.09223",
+    "license": "CC BY 4.0",
+    "open": true,
+    "chapters": [
+      "04",
+      "06",
+      "07"
+    ],
+    "what": "A free textbook on pretraining, generative models, prompting and alignment. Read the chapter that matches the section."
+  },
+  {
+    "title": "minbpe, nanoGPT and Neural Networks: Zero to Hero",
+    "author": "Andrej Karpathy",
+    "url": "https://github.com/karpathy",
+    "license": "MIT (code)",
+    "open": true,
+    "chapters": [
+      "02",
+      "04",
+      "05",
+      "10"
+    ],
+    "what": "Build a tokenizer and a GPT from scratch. The labs reuse the code ideas, not the videos."
+  },
+  {
+    "title": "Building effective agents; Effective context engineering; Contextual Retrieval",
+    "author": "Anthropic Engineering",
+    "url": "https://www.anthropic.com/engineering",
+    "license": "All rights reserved",
+    "open": false,
+    "chapters": [
+      "17",
+      "21",
+      "22",
+      "27",
+      "28",
+      "33"
+    ],
+    "what": "The canonical posts on workflow vs agent patterns, tool design, context engineering and contextual retrieval. Link only; summarised in our own words."
+  },
+  {
+    "title": "Evals FAQ and courses",
+    "author": "Hamel Husain and Shreya Shankar",
+    "url": "https://hamel.dev/blog/posts/evals-faq/",
+    "license": "All rights reserved",
+    "open": false,
+    "chapters": [
+      "19",
+      "20"
+    ],
+    "what": "Error analysis first: trace review, open and axial coding, validating LLM judges. Link only."
+  },
+  {
+    "title": "AI Engineering",
+    "author": "Chip Huyen",
+    "url": "https://www.oreilly.com/library/view/ai-engineering/9781098166298/",
+    "license": "Paid book",
+    "open": false,
+    "chapters": [
+      "01",
+      "11",
+      "17",
+      "19",
+      "20",
+      "31",
+      "32"
+    ],
+    "what": "The best single book on the field. Chapter 6 is RAG and agents; chapters 3 and 4 are evaluation."
+  },
+  {
+    "title": "Speech and Language Processing (3rd ed. draft)",
+    "author": "Dan Jurafsky and James H. Martin",
+    "url": "https://web.stanford.edu/~jurafsky/slp3/",
+    "license": "Free to read, no open licence",
+    "open": false,
+    "chapters": [
+      "02",
+      "03",
+      "04",
+      "15"
+    ],
+    "what": "Tokenization, embeddings, language models and information retrieval from the textbook that defined them. Link only."
+  },
+  {
+    "title": "Simon Willison's weblog: prompt injection series",
+    "author": "Simon Willison",
+    "url": "https://simonwillison.net/series/prompt-injection/",
+    "license": "All rights reserved",
+    "open": false,
+    "chapters": [
+      "33"
+    ],
+    "what": "Where the lethal trifecta and the dual-LLM pattern were named. Link only."
+  }
+]

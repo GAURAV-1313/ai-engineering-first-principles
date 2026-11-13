@@ -1,0 +1,45 @@
+---
+import Page from '../../layouts/Page.astro';
+import { repos, evidence, flows } from '../../lib/data';
+import { chapters, chapterHref } from '../../lib/outline';
+const cell = (slug: string, id: string) => {
+  const list = evidence.filter((e) => e.repo === slug && e.chapter === Number(id));
+  return { n: list.length, solid: list.some((e) => e.quality === 'solid') };
+};
+---
+<Page title="Real Code, Chapter by Chapter · AI Engineering from First Principles" description="Real LLM, RAG and agent code from production projects, mapped to every chapter of the book and tagged solid, naive or missing." crumb="Repos" current="repos" wide>
+  <header class="view-head">
+    <p class="home-kicker">In your code</p>
+    <h1 class="view-title">Your repos, side by side</h1>
+    <p class="view-lede">One strip per repo, one cell per chapter. Darker cells hold more examples; an outlined cell has only naive or missing ones. Read down a column to see which of your projects can carry an interview answer for that chapter.</p>
+  </header>
+  {repos.length === 0 ? <p class="stub">Examples from your repos are still being collected.</p> : (
+    <div class="fp">
+      <div class="fp-row fp-axis" aria-hidden="true"><span></span><span class="fp-cells">{chapters.map((c) => <i>{c.id}</i>)}</span><span></span></div>
+      {repos.map((r) => {
+        const n = evidence.filter((e) => e.repo === r.slug).length;
+        return (
+          <div class="fp-row" style={`--fam: var(--fam-${r.hue})`}>
+            <a class="fp-name" href={`/repos/${r.slug}/`}><span class="chip">{r.chip}</span> {r.name}</a>
+            <span class="fp-cells">
+              {chapters.map((c) => { const x = cell(r.slug, c.id); return (
+                <a class:list={['fp-cell', { naive: x.n && !x.solid }]} href={x.n ? `${chapterHref(c)}?repo=${r.slug}` : undefined}
+                  style={x.n ? `--n: ${Math.min(x.n, 8)}` : undefined} title={`${c.id} ${c.title}: ${x.n} example${x.n === 1 ? '' : 's'}`}></a>
+              ); })}
+            </span>
+            <span class="fp-meta">{n} examples · {flows.filter((f) => f.repo === r.slug).length} flows</span>
+          </div>
+        );
+      })}
+    </div>
+  )}
+  <ul class="repo-cards">
+    {repos.map((r) => (
+      <li style={`--fam: var(--fam-${r.hue})`}>
+        <a href={`/repos/${r.slug}/`}><span class="chip">{r.chip}</span> <b>{r.name}</b></a>
+        <p>{r.product}</p>
+        <p class="iv-meta">{r.stack.slice(0, 6).join(' · ')}</p>
+      </li>
+    ))}
+  </ul>
+</Page>

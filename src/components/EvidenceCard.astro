@@ -1,0 +1,39 @@
+---
+import { repoBySlug, qualityGlyph, localLink, type Evidence } from '../lib/data';
+import CodeBlock from './CodeBlock.astro';
+
+interface Props { e: Evidence; open?: boolean; titles: Record<string, string> }
+const { e, open = false, titles } = Astro.props;
+const repo = repoBySlug[e.repo];
+const vscode = localLink(e);
+const range = e.lines ? (e.lines[0] === e.lines[1] ? `${e.lines[0]}` : `${e.lines[0]}–${e.lines[1]}`) : '';
+const sub = e.conceptId.split('.').length === 3 ? titles[e.conceptId] : undefined;
+const authorLabel = e.author === 'mine' ? 'yours' : e.author === 'team' ? 'by teammate' : 'author unclear';
+---
+<details class="ev" data-author={e.author} data-repo={e.repo} data-quality={e.quality} data-layer={e.layer} open={open || undefined}
+  style={`--fam: var(--fam-${repo.hue})`}>
+  <summary class="ev-sum">
+    <span class="chip" title={repo.name}>{repo.chip}</span>
+    <span class="ev-concept">{e.concept}</span>
+    <span class="ev-q" data-q={e.quality} title={e.quality}>{qualityGlyph[e.quality]}</span>
+  </summary>
+  <div class="ev-body">
+    <p class="ev-meta">
+      <span class="ev-repo">{repo.name}</span>
+      <span>{e.layer}</span>
+      <span class="ev-qword" data-q={e.quality}>{qualityGlyph[e.quality]} {e.quality}</span>
+      <span class="ev-author">{authorLabel}</span>
+      {sub && <span class="ev-sub" title="Sub-section">{e.conceptId} {sub}</span>}
+    </p>
+    <div class="ev-file">
+      {e.url
+        ? <a class="ev-path" href={e.url} target="_blank" rel="noopener noreferrer" title={`${e.file}${e.branch ? ` (branch ${e.branch})` : ''}`}><bdi>{e.file}</bdi></a>
+        : <span class="ev-path" title={e.file}><bdi>{e.file}</bdi></span>}
+      <span class="ev-range">{range}</span>
+      {vscode && <a class="ev-local" href={vscode} title="Open in VS Code">edit</a>}
+    </div>
+    <CodeBlock code={e.snippet} file={e.file} from={e.shownFrom} numbered={e.numbered} />
+    <p class="ev-what">{e.what}</p>
+    {e.lesson && <p class="ev-lesson"><span>Lesson</span> {e.lesson}</p>}
+  </div>
+</details>

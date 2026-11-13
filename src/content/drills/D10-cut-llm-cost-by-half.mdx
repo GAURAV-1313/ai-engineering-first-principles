@@ -1,0 +1,164 @@
+---
+id: "D10"
+title: "Cut LLM cost by 50% with no quality loss"
+prompt: "Your LLM bill doubled last quarter. Finance wants it halved next quarter, and product says users must not notice any drop in quality. How do you do it?"
+sections: ["11.05", "31.01", "31.02", "31.03", "31.05", "31.06", "31.07", "31.10", "31.11", "31.14"]
+minutes: 45
+---
+
+## Clarify and scope
+
+This drill is about method. The candidate who opens with "switch to a cheaper model" has already lost. Open with "first I need to know where the money goes, and what 'no quality loss' means as a number."
+
+Ask:
+
+- **What is the product?** Assume a RAG chat assistant (most of the traffic), an agent feature with tool calls, and a nightly job that summarises the day's tickets.
+- **Is there a cost breakdown by feature, step and model?** Usually not, and building one is step one.
+- **How is quality measured today?** An offline eval suite? Thumbs up/down? Resolution rate? "No quality loss" has to become a test: non-inferiority within a margin agreed in advance, on the offline suite and on one product metric.
+- **Constraints.** Latency must not get worse. Some steps (safety checks, anything legal) are off limits for downgrading.
+- **Timeline.** One quarter. That rules out training a custom model as the main plan, though it can be a later stage.
+
+## Baseline architecture
+
+The architecture here is a loop, not a box diagram:
+
+```text
+  1. MEASURE              2. RANK LEVERS            3. CHANGE ONE THING      4. VERIFY
+ per-call ledger:   -->  cost share x expected  --> behind a flag      -->  paired offline eval
+ feature, step,          saving x (1 - risk)        (cache, route,          + A/B or shadow
+ model, tokens in /                                 trim, batch ...)        + billed cost delta,
+ cached / out /                                                             measured, not estimated
+ thinking, cost                                                                  |
+       ^                                                                         |
+       +----------------------- keep or revert, next lever ----------------------+
+```
+
+The request path after the changes:
+
+```text
+ request --> [code fast path / exact cache] --hit--> response
+                 |
+             [router] -- easy --> small model --(validator fails)--+
+                 |                                                 |
+                 +------ hard --> large model <--------------------+
+                               (static prefix served from the prompt cache,
+                                trimmed context, capped reasoning effort)
+
+ nightly summaries --> batch API (asynchronous, discounted)
+```
+
+## Key choices and trade-offs
+
+Rank the levers by risk to quality, lowest first.
+
+**1. Remove waste (no quality risk).** Look for:
+
+- retries on errors that will never succeed (out of credit, context too long);
+- agent loops with no step cap;
+- the same call made twice in one request;
+- calls whose results nobody uses;
+- reasoning or thinking tokens with no budget. They bill as output and can dwarf the visible answer.
+
+The ledger finds these within a day.
+
+**2. Prompt caching.** Put the stable part of the prompt first (system prompt, tool definitions, few-shot examples, static documents) and the variable part (date, user, retrieved chunks) last. Mark the cache breakpoint where the provider requires it, and record cached tokens on every call. Cached input is billed at a fraction of the normal input price. The fraction, the cache-write premium and the TTL differ by provider, so check current prices. One trap: a deploy that adds a timestamp to the top of the system prompt silently drops the hit rate to zero. Alert on the hit rate.
+
+**3. Trim context.** Fewer retrieved chunks, if recall@k holds at the smaller k. Clipped tool results. A summary in place of an old conversation history. Shorter few-shot sets. Each of these needs the eval, because removing context can remove the answer.
+
+**4. Route and cascade.** Send easy turns to a small model and hard turns to a large one. Choose the model per task with your own eval, keep the table, and revisit it when models change. A cascade (small first, escalate when a validator fails) only pays off if the escalation rate is low. See the numbers below.
+
+**5. Batch API** for anything that is not interactive: nightly summaries, backfills, eval runs. It is usually discounted (check current terms) and costs you only turnaround time.
+
+**6. Cap output and reasoning effort.** Ask for shorter formats where users do not read long ones. Use lower reasoning effort on routine steps. Caching does nothing for output tokens, so this is the lever when output dominates the bill.
+
+**7. Response caching.** Use exact caching for repeated deterministic calls (the same document classified twice). Consider a semantic cache only after you have measured the duplicate rate: personalised chat rarely repeats.
+
+**8. Longer-horizon levers.** Distil or fine-tune a small model on logged traffic. Self-host only when steady volume makes the break-even work. Both are too slow to be the core of a one-quarter plan.
+
+## Evals
+
+- **Freeze the suite before the first change.** Each lever is evaluated paired against the frozen baseline. Never move the suite and the system at the same time.
+- **Non-inferiority, not "no difference".** Agree a margin δ in advance (for example 2 or 3 points). A lever ships if the lower end of the confidence interval on the paired difference is above −δ.
+- **Per-slice checks.** A router can keep the average flat while failing one customer segment or one language. Report results by slice.
+- **Online confirmation.** A/B test, or shadow the cheaper path, on the product metric (thumbs, resolution rate, escalation to a human) for a week before the full rollout.
+- **Measure cost, do not estimate it.** Price tables in code drift. Compare billed usage from the provider before and after.
+
+<Callout type="interview">
+
+The strongest signal here is "cost per task, not price per token". A model with a lower per-token price can cost more per task if it writes longer outputs, thinks more, or needs more retries. Quote an example if you have one.
+
+</Callout>
+
+## Guardrails and fallbacks
+
+- Every lever sits behind a flag with a kill switch, so it can be reverted in minutes.
+- Routed requests escalate to the large model when a validator fails. Safety and compliance steps are never routed down.
+- Per-user and per-feature daily budgets, enforced before the call, catch runaway loops and abuse.
+- After each deploy, check that the cached-token share has not collapsed.
+- A cost alert fires on cost per task, not on total spend, so a traffic spike does not hide a regression and a quiet day does not hide one either.
+
+## Observability and cost
+
+The ledger is the whole game. Every call records feature, step, model, input / cached / output / thinking tokens, latency, cost source (provider-reported or price table) and the outcome. From it you build:
+
+- cost per task and per active user, per feature;
+- the cache hit rate per prompt;
+- the escalation rate per route;
+- a daily reconciliation against the provider's usage export.
+
+Each eval run also reports cost per case, so the cost of a prompt change is visible in the same PR comment as its quality.
+
+## The numbers
+
+**Prompt caching saving.** Let f be the share of input tokens that are a cached prefix and c the cached price as a fraction of the normal input price (check your provider). Input cost falls by f × (1 − c), ignoring cache writes.
+Illustration: f = 0.6, c = 0.1 gives 0.6 × 0.9 = 54% off input cost.
+
+**Cascade break-even.** Let C_s and C_l be the cost per request of the small and large models, and e the escalation rate. Expected cost = C_s + e × C_l. That beats "always large" only if C_s + e × C_l is less than C_l, that is e < 1 − C_s / C_l.
+If the small model costs a fifth of the large one, the cascade wins while e < 0.8. The real limit is quality and latency, not cost: every escalation pays for two calls and waits for both.
+
+**Illustrative 50% plan.** Suppose the ledger shows this split of total spend: chat writer 60 (input 42, output 18), nightly summariser 20, retries and failed calls 5, reranker LLM 10, other 5. Assumptions: f = 0.6 and c = 0.1, the small model costs 0.2 of the large one, the batch factor is 0.5 (check current terms), and 10% of routed turns escalate.
+
+| Lever | Arithmetic | Saving (points of total spend) |
+|---|---|---|
+| Prompt cache on writer input | 42 × 0.54 | 22.7 |
+| Route half of writer turns to small model | remaining writer cost (19.3 + 18 = 37.3) × 0.5 × (1 − 0.2) = 14.9, minus escalations 37.3 × 0.5 × 0.1 = 1.9 | 13.0 |
+| Nightly summariser to batch | 20 × 0.5 | 10.0 |
+| Stop non-retryable retries | about 4 of the 5 | 4.0 |
+| **Total** | | **about 49.7** |
+
+The point is not these exact numbers. The ledger tells you which rows exist, and the arithmetic tells you whether 50% is reachable before you touch anything.
+
+**Is the drop real?** On 300 paired cases, suppose 6 cases flip pass to fail and 3 flip fail to pass. The net change is −3/300 = −1 point. With b + c = 9 discordant cases, SE ≈ √9 / 300 = 0.01, so the 95% interval is −1 ± 2 points, from −3 to +1. That is non-inferior at a 3-point margin, but not at 2. Decide δ before you look.
+
+**Latency.** Caching lowers time to first token on long prompts. A small model is usually faster. A cascade adds the small model's latency to every escalated request. Batch adds hours, which is acceptable only offline.
+
+## Follow-ups they will ask
+
+1. **What if output tokens dominate the bill?** Caching will not help. Cut output length, cap reasoning effort, and route to a smaller model.
+2. **Why not move everything to the cheapest model?** Cost per task, not per token. Longer outputs, more retries and more escalations can make it dearer, and quality drops on the hard slice.
+3. **Would you add a semantic cache?** Measure the near-duplicate rate first. Personalised chat rarely repeats, and a false hit is a wrong answer delivered confidently.
+4. **When does self-hosting pay?** When the GPU cost per hour, divided by the tokens per hour you actually push at realistic utilisation, beats the API price, including ops time. That usually needs steady, high volume.
+5. **How do you stop the savings eroding?** Cost per case in every eval run, a cache hit-rate alert, per-feature budgets with owners, and a monthly reconciliation with the invoice.
+6. **Finance wants results in two weeks.** Do the zero-risk levers first: waste, prompt caching and batch. Routing waits for the eval.
+
+## How to bring in your own work
+
+You have per-call cost ledgers in three repos and a measured routing table. You have not cut a large, real invoice by half.
+
+- **Answer Grader, `backend/llm.py`:**
+  - `record_usage` (lines 91 to 104) appends step, provider, model, tokens and cost to a per-run ledger. It prefers the provider-reported charge over the `PRICES` table (lines 70 to 77), which carries a comment that one price is promotional and will roughly double.
+  - Lines 348 to 351 record that with thinking uncapped, Gemini spent about 10,300 output tokens on a model answer plus evaluation against gpt-4o's 2,400, so it cost more per evaluation despite the lower per-token price. That is your "cost per task" story, with your own numbers.
+  - The ledger does not record cached tokens (lines 296 to 300).
+- **Answer Grader, more levers:**
+  - `backend/pipeline.py` (lines 227 to 229) regenerates the model answer for every submission, even for a question already answered for another student. That is a ready caching candidate.
+  - `backend/evaluation.py` (lines 131 to 135) puts the static rubric before the per-request inputs, a cache-friendly layout, though nothing measures it.
+- **Memory Agent:**
+  - `src/answer.ts` (line 95) puts `cache_control` on the static system prompt.
+  - `src/agent.ts` (lines 230 to 233) computes per-turn cost with cache reads discounted.
+  - The routing table in `DECISIONS.md` compares Opus-only, Sonnet-only, Haiku-only and routed writers on the same scenarios and judge. That is "the cheapest model that passes your own eval".
+  - `DESIGN.md` admits the cost estimates ran "at least 2× high against the console". That is why you measure billed cost.
+  - The speculative writer stays off because a discarded call still costs tokens and no paid eval has measured it.
+- **Chat Insights:**
+  - `backend/src/lc/services/llm/anthropic.js` (lines 28 to 35) sends the system prompt with no `cache_control`, although the prompt is cache-friendly and the usage mapping already reads cache tokens. A concrete first lever.
+  - `config.js` (lines 23 to 29) picks one model per provider from env; on the Anthropic path every hint, however short, goes to the Opus default. Routing by rung is the second lever.
+- **Gaps:** no batch API use, no semantic cache, no self-hosting break-even analysis. No savings have been measured against a real invoice at scale.

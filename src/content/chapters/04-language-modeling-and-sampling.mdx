@@ -1,0 +1,602 @@
+---
+id: "04"
+title: "Language Modeling and Sampling"
+summary: "See a model call as what it is, a loop that turns logits into a probability distribution and draws one token at a time, so you can reason about temperature, top-p, min-p, log-probs, finish reasons and non-determinism, and design code that stays correct when the output is a sample."
+readingTime: "25 min"
+---
+
+In Chat Insights, when the tutor's reply comes back as a word-for-word repeat, the retry path in `chatService.js` shows the model its old text, asks for a different angle and sets `revised.temperature = 0.9`, up from the usual 0.3. On the default Gemini model, `gemini-2.5-flash`, that works. On the Anthropic provider the number goes nowhere: `generate()` never reads it, because current Claude models return a 400 if you send `temperature`. The same retry behaves differently per provider, and nothing in the logs says so.
+
+To judge whether "sample hotter" was ever the right fix, you need to know what the model returns. Not text: a score for every token in its vocabulary, which becomes a probability distribution from which a sampler draws one token, and then the loop runs again. Temperature, top-p, penalties, log-probs, why "temperature 0" still varies, and much of hallucination follow from that loop.
+
+This chapter builds the loop on a five-token toy vocabulary, works the arithmetic by hand, and turns each piece into an engineering rule.
+
+## Next-token prediction
+
+A language model has one job: given a sequence of token ids ([tokenization](/02-tokenization/#why-discrete-tokens)), output a score for every possible next token. Writing a paragraph, calling a tool and emitting JSON are all the same operation repeated: predict one token, append it, predict again.
+
+```text
+prompt tokens ──► model ──► scores for all V tokens ──► sampler ──► one token id
+      ▲                                                                 │
+      └──────────────────────── append, repeat ◄────────────────────────┘
+                     stop when: end-of-turn token, stop string, max_tokens
+```
+
+With a fake model, generation is plain control flow around a scoring function:
+
+```python
+import math, random
+
+VOCAB = [" Paris", " a", " the", " Lyon", " located", "<eot>"]
+
+def fake_model(tokens: list[str]) -> list[float]:
+    """Stand-in for a transformer: returns one score (logit) per vocab entry."""
+    if tokens[-1] == " Paris":
+        return [0.0, 0.5, 0.2, 0.0, 0.1, 4.0]        # after the answer, end the turn
+    return [5.0, 3.0, 2.5, 1.0, 0.5, -1.0]
+
+def generate(prompt: list[str], max_tokens: int = 10) -> list[str]:
+    out = list(prompt)
+    for _ in range(max_tokens):
+        logits = fake_model(out)
+        m = max(logits)
+        weights = [math.exp(l - m) for l in logits]   # softmax up to a constant
+        tok = random.choices(VOCAB, weights=weights)[0]
+        if tok == "<eot>":
+            break
+        out.append(tok)
+    return out[len(prompt):]
+
+print(generate(["The", " capital", " of", " France", " is"]))
+```
+
+Three consequences:
+
+**Training is the same game.** Pretraining adjusts the weights so the token that actually came next gets a higher score ([objective at scale](/06-pretraining-and-scaling/#objective-at-scale)). The objective rewards plausible continuation, not truth, which is the root of [hallucination](#hallucination-as-a-training-sampling-property).
+
+**Chat is a continuation too.** A chat request is rendered into one token sequence with role markers ([chat templates](/02-tokenization/#special-tokens-and-chat-templates)), and the model continues it until it emits its end-of-turn token. Post-training teaches it to continue that format helpfully; the mechanism does not change.
+
+**Every output token is one more trip around the loop**, a forward pass in the decode phase ([prefill vs decode](/10-inference-mechanics/#prefill-vs-decode)). A 600-token answer is 600 sequential steps, so output length drives latency and cost.
+
+## Logits, softmax
+
+### Logits
+
+The model's last layer projects its final hidden state onto the vocabulary: one raw score per token, often 100,000 to over 250,000 of them. These are **logits**: unbounded, possibly negative, and only their differences matter.
+
+### Softmax
+
+To sample, you need probabilities: non-negative and summing to 1. Softmax does that:
+
+```text
+p_i = exp(z_i) / Σ_j exp(z_j)
+```
+
+Exponentiating makes every score positive and turns differences into ratios: a logit 1 higher means e ≈ 2.72 times as likely. Adding a constant to every logit changes nothing, so real code subtracts the maximum first and `exp` never overflows.
+
+Worked example, the toy distribution for the token after "The capital of France is":
+
+| token | logit | exp(z − 5) | probability |
+|---|---|---|---|
+| " Paris" | 5.0 | 1.000 | 0.802 |
+| " a" | 3.0 | 0.135 | 0.109 |
+| " the" | 2.5 | 0.082 | 0.066 |
+| " Lyon" | 1.0 | 0.018 | 0.015 |
+| " located" | 0.5 | 0.011 | 0.009 |
+
+The exponentials sum to 1.247; dividing by it gives the last column. The wrong answer " Lyon" has a 1.5 percent chance: sample a thousand times and roughly 15 answers say Lyon.
+
+```python
+import math
+
+def softmax(logits: list[float], temperature: float = 1.0) -> list[float]:
+    m = max(logits)                                   # stability: exp never sees a large number
+    exps = [math.exp((z - m) / temperature) for z in logits]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+def log_softmax(logits: list[float]) -> list[float]:
+    m = max(logits)
+    lse = m + math.log(sum(math.exp(z - m) for z in logits))
+    return [z - lse for z in logits]                  # these are the "logprobs" APIs return
+
+print([round(p, 3) for p in softmax([5.0, 3.0, 2.5, 1.0, 0.5])])
+# [0.802, 0.109, 0.066, 0.015, 0.009]
+```
+
+The log of a probability is a **log-prob**: 0 or negative, with 0 meaning certainty. APIs report log-probs because they add along a sequence, where multiplying many small probabilities would underflow.
+
+Everything that edits the distribution acts on logits before softmax: logit bias adds a constant to chosen tokens, [constrained decoding](/13-structured-output/#constrained-grammar-decoding) sets illegal tokens to negative infinity, temperature divides all logits by one number. That is why these features compose.
+
+## Entropy/cross-entropy/perplexity
+
+These three numbers describe how uncertain a model is, and how surprised it is by given text.
+
+### Entropy: uncertainty of one distribution
+
+```text
+H(p) = − Σ_i p_i · log2 p_i        (bits)
+```
+
+For the toy distribution, H ≈ 1.01 bits. All mass on one token gives 0; a uniform choice among 5 tokens gives log2(5) ≈ 2.32 bits. Entropy at a position tells you whether the model "knows" what comes next or is spreading its bets.
+
+### Cross-entropy: surprise at the actual text
+
+Cross-entropy is the average negative log-prob the model assigned to the tokens that actually occurred:
+
+```text
+CE = − (1/N) Σ_t log p(x_t | x_<t)
+```
+
+This is the pretraining loss. Lower is better.
+
+### Perplexity, worked by hand
+
+Perplexity is `exp(CE)` (with natural logs). Suppose a model reads a four-token sentence and assigned the true tokens probabilities 0.5, 0.25, 0.8 and 0.1:
+
+```text
+−ln 0.5  = 0.6931
+−ln 0.25 = 1.3863
+−ln 0.8  = 0.2231
+−ln 0.1  = 2.3026
+sum      = 4.6051    CE = 4.6051 / 4 = 1.1513 nats  (= 1.661 bits)
+PPL      = e^1.1513 = 3.16
+```
+
+Check: the product of the probabilities is 0.01, the geometric mean is 0.01^(1/4) = 0.316, and perplexity is its inverse, 3.16. On this sentence the model was as uncertain as a uniform choice among about 3.2 tokens per step. The single 0.1 token contributed half the loss: perplexity is dominated by the most surprising tokens.
+
+```python
+import math
+
+def perplexity(token_probs: list[float]) -> float:
+    ce = -sum(math.log(p) for p in token_probs) / len(token_probs)
+    return math.exp(ce)
+
+print(round(perplexity([0.5, 0.25, 0.8, 0.1]), 2))   # 3.16
+```
+
+### What it is good for and where it misleads
+
+- **Not comparable across tokenizers.** It is per token, and longer tokens mean fewer, harder predictions. Compare across tokenizers in bits per byte.
+- **Not a quality score for chat.** Post-trained models often have worse perplexity on raw web text than their base models while being far more useful.
+- **Useful as a data signal.** Very high perplexity under a small model flags garbled OCR, boilerplate or the wrong language, both in pretraining [filtering](/06-pretraining-and-scaling/#filtering-dedup-quality-classifiers) and in your own ingestion pipeline.
+
+## Greedy, temperature, top-k, top-p, min-p
+
+The model gives you a distribution; the **decoding strategy** decides which token you take.
+
+### Greedy
+
+Take the argmax every time. Fine for short, single-answer outputs (a label, a number, an extraction). For open-ended text it degenerates into loops, because the likeliest continuation of a repetitive phrase is often the same phrase. Holtzman et al. (2020, "The Curious Case of Neural Text Degeneration") showed that human text is not the most probable text: real writing keeps picking tokens the model finds somewhat unlikely.
+
+### Temperature
+
+Divide every logit by T before softmax:
+
+```text
+p_i(T) = exp(z_i / T) / Σ_j exp(z_j / T)
+```
+
+Equivalently, `p_i(T)` is proportional to `p_i^(1/T)`. T below 1 sharpens the distribution, T above 1 flattens it, T → 0 approaches greedy (engines special-case T = 0), and T → infinity approaches uniform.
+
+| T | " Paris" | " a" | " the" | " Lyon" | " located" | entropy |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.975 | 0.018 | 0.007 | under 0.001 | under 0.001 | 0.19 bits |
+| 1.0 | 0.802 | 0.109 | 0.066 | 0.015 | 0.009 | 1.01 bits |
+| 2.0 | 0.528 | 0.194 | 0.151 | 0.071 | 0.056 | 1.86 bits |
+
+At T = 2 the wrong answer " Lyon" goes from 1.5 percent to 7 percent. Temperature changes how the distribution is sampled; it never changes the ranking or adds knowledge.
+
+### Top-k
+
+Keep only the k most likely tokens, renormalise, sample (Fan et al. 2018). The flaw: k is fixed while the distribution's shape is not. When the model is certain, k = 40 lets 39 bad tokens in; when it is unsure among 200 good options, k = 40 cuts real ones.
+
+### Top-p (nucleus)
+
+Keep the smallest set of tokens whose cumulative probability reaches p (Holtzman et al. 2020). With p = 0.9 on the toy, " Paris" (0.802) is not enough, adding " a" gives 0.911, so the nucleus is those two. The set adapts to the model's certainty, which is why top-p became the common default. At high temperature, though, the flattened distribution fills the nucleus with tail tokens.
+
+### Min-p
+
+Keep tokens with probability at least `p_min × p_max` (Nguyen et al. 2024, "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs"). With p_min = 0.1 the toy's floor is 0.080, so " Paris" and " a" survive. On a flat distribution (five tokens between 0.16 and 0.24) the floor drops to 0.024 and all five survive. The cut-off scales with confidence, which keeps higher temperatures usable. vLLM, llama.cpp, Ollama and transformers support it; hosted frontier APIs generally do not.
+
+### One sampler with every knob
+
+```python
+import math, random
+
+def sample(logits, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0, rng=random):
+    if temperature == 0:
+        return max(range(len(logits)), key=lambda i: logits[i])        # greedy
+    m = max(logits)
+    probs = [math.exp((z - m) / temperature) for z in logits]
+    s = sum(probs); probs = [p / s for p in probs]
+    order = sorted(range(len(probs)), key=lambda i: -probs[i])
+    keep = order[:top_k] if top_k > 0 else order                      # top-k
+    if top_p < 1.0:                                                   # top-p
+        cum, nucleus = 0.0, []
+        for i in keep:
+            nucleus.append(i); cum += probs[i]
+            if cum >= top_p:
+                break
+        keep = nucleus
+    if min_p > 0:                                                     # min-p
+        floor = min_p * probs[order[0]]
+        keep = [i for i in keep if probs[i] >= floor]
+    weights = [probs[i] for i in keep]                                # renormalised by choices()
+    return rng.choices(keep, weights=weights)[0]
+
+toy = [5.0, 3.0, 2.5, 1.0, 0.5]
+print(sample(toy, temperature=0.7, top_p=0.9))   # 0: " Paris" alone has 0.917, so the nucleus is one token
+```
+
+Order of operations differs between engines (typically penalties and logit bias, then temperature, then truncation filters); llama.cpp even lets you configure the chain. If two engines disagree on "the same" settings, check the order first.
+
+### What you can actually set in 2026
+
+- **Claude.** Current models return a 400 for `temperature`, `top_p` or `top_k` (on some, for any non-default value), and the `2026-10-21` API version rejects them on every model. The levers are effort, structured output and the prompt.
+- **OpenAI.** Reasoning models have generally rejected `temperature`, `top_p` and `logprobs`; some accept them only with reasoning turned off. The rules change between versions: check the model page.
+- **Gemini.** `generationConfig` has `temperature`, `topP`, `topK` and `seed`, but Google's API reference says the three sampling fields are silently ignored on Gemini 3.6 Flash and newer models. Older models such as Gemini 2.5 Flash still honour them.
+- **Open weights** (vLLM, SGLang, llama.cpp, Ollama, transformers): all of the above, plus penalties, seeds and log-probs.
+
+<Callout type="warn">
+
+A parameter one provider honours and another silently drops is an invisible behaviour difference. Keep a per-provider capability table and log (or fail tests) when a caller sets one the active provider will not send.
+
+</Callout>
+
+Starting points where the knobs exist (conventions, not laws): temperature 0 for extraction, classification and grading; 0.2 to 0.5 for grounded answers; 0.7 to 1.0 with top-p 0.9 to 0.95 or min-p 0.05 to 0.1 for drafting and diverse candidates.
+
+## Penalties
+
+Sampling alone does not stop a model looping on a phrase, because the loop is the model's own high-probability prediction. Penalties edit the logits of tokens that have already appeared.
+
+- **Repetition penalty** (Keskar et al. 2019, the CTRL paper). Multiplicative: for each token already present, divide its logit by θ if positive, multiply by θ if negative (θ around 1.1 to 1.3). In Hugging Face transformers this covers the prompt tokens too, because it looks at the whole input sequence.
+- **Presence penalty.** Subtract a flat amount from any token that has appeared at least once. Pushes toward new topics.
+- **Frequency penalty.** Subtract an amount proportional to how many times the token has appeared. Damps runaway repetition of one word.
+
+OpenAI documented the additive pair as `logit[j] −= count[j] × frequency_penalty + (count[j] > 0) × presence_penalty`.
+
+```python
+from collections import Counter
+
+def apply_penalties(logits, generated_ids, rep=1.0, presence=0.0, frequency=0.0):
+    out = list(logits)
+    counts = Counter(generated_ids)
+    for tok, c in counts.items():
+        if rep != 1.0:                                  # CTRL-style, multiplicative
+            out[tok] = out[tok] / rep if out[tok] > 0 else out[tok] * rep
+        out[tok] -= presence + c * frequency            # OpenAI-style, additive
+    return out
+
+print(apply_penalties([5.0, 3.0, 2.5], generated_ids=[0, 0, 1], frequency=0.5, presence=0.3))
+# [3.7, 2.2, 2.5]  -> " Paris", seen twice, loses 1.3
+```
+
+**How penalties fail.** They are token-level and blind to meaning. In JSON or code the tokens you must repeat are braces, quotes, keys and variable names, so a strong penalty corrupts structure. In RAG, a penalty that counts prompt tokens discourages quoting the source. Keep penalties at zero for structured and grounded output.
+
+Penalties also cannot fix Chat Insights's repeat, which was a whole reply repeated across turns. The fix that matches the mechanism is the one the code has: detect the repeat and show the model the text it must not resend. The temperature bump is a secondary nudge.
+
+## Beam search (and why chat rarely uses it)
+
+Greedy can walk into a dead end: a likely first token followed by unlikely ones. **Beam search** keeps the B best partial sequences by total log-prob, expands each by every next token, and keeps the best B again.
+
+```python
+import math
+
+def beam_search(next_logprobs, start, beam=3, steps=4, eos="<eot>"):
+    """next_logprobs(seq) -> dict token -> logprob. Returns the best full sequence."""
+    beams = [(0.0, [start])]
+    for _ in range(steps):
+        cand = []
+        for score, seq in beams:
+            if seq[-1] == eos:
+                cand.append((score, seq)); continue
+            for tok, lp in next_logprobs(seq).items():
+                cand.append((score + lp, seq + [tok]))
+        beams = sorted(cand, key=lambda x: -x[0])[:beam]
+    # length normalisation: otherwise shorter sequences win by having fewer negative terms
+    return max(beams, key=lambda x: x[0] / len(x[1]))[1]
+```
+
+It suits tasks with one correct output: machine translation, speech recognition, some data-to-text. Chat rarely uses it:
+
+1. **High-likelihood text is bland** and repetitive (Holtzman et al. 2020). Stahlberg and Byrne (2019) found that for many inputs an NMT model's most probable output is the empty translation.
+2. **Length bias.** Every token adds a negative log-prob, so search prefers short outputs unless you normalise by length.
+3. **Cost.** B beams mean roughly B times the decode compute and B [KV caches](/10-inference-mechanics/#kv-cache-and-memory).
+4. **No streaming.** You do not know which beam wins until the end.
+5. **Not offered** by hosted chat APIs.
+
+Chat systems instead sample several complete answers and select: best-of-n with a scorer, or [self-consistency](/08-reasoning-models/#self-consistency-and-best-of-n) by majority vote. Neither is [speculative decoding](/10-inference-mechanics/#speculative-decoding), a speed trick that preserves the model's distribution exactly.
+
+## Log-probs as signal
+
+Log-probs give you, per generated token, its log-prob and usually the top few alternatives: the model's own uncertainty. That beats a written `"confidence": 0.92`, which is just more generated tokens ([structured output](/13-structured-output/#extraction-and-classification-patterns)).
+
+### Where you can get them (late 2026)
+
+- **Anthropic Messages API:** no token log-probs.
+- **OpenAI:** `logprobs` and `top_logprobs` (up to 20) on models that support them; reasoning models have generally not returned them. Check the model page.
+- **Gemini:** `responseLogprobs` and `logprobs` exist in the generation config, but support has varied by model and developers report recent models not returning them. Check the docs for your exact model.
+- **Open weights:** vLLM, llama.cpp's server and recent Ollama versions return them; transformers' `generate(..., output_scores=True, return_dict_in_generate=True)` gives full logits per step.
+
+If your design depends on log-probs, record that as a provider constraint.
+
+### Classification confidence
+
+Make the label the first generated token, read the top log-probs at that position, and normalise over the labels:
+
+```python
+import math
+
+LABELS = ["search", "recheck", "clarify", "smalltalk", "memory_only"]
+
+def label_confidence(top_logprobs: dict[str, float]) -> tuple[str, float]:
+    """top_logprobs: token -> logprob at the label position, as an API returns them."""
+    scores = {}
+    for tok, lp in top_logprobs.items():
+        t = tok.strip().lower()
+        for lab in LABELS:
+            if lab.startswith(t) and t:              # first token of a multi-token label
+                scores[lab] = scores.get(lab, 0.0) + math.exp(lp)
+    if not scores:
+        return "unknown", 0.0
+    total = sum(scores.values())
+    best = max(scores, key=scores.get)
+    return best, round(scores[best] / total, 3)
+
+def precision_at(threshold, preds):          # preds: [(label, conf, gold)]
+    kept = [(l, g) for l, c, g in preds if c >= threshold]
+    return (sum(l == g for l, g in kept) / len(kept), len(kept) / len(preds)) if kept else (None, 0.0)
+
+print(label_confidence({"search": -0.11, "re": -2.4, "clar": -4.0}))
+# ('search', 0.891)
+```
+
+Arithmetic: e^−0.11 = 0.896, e^−2.4 = 0.091, e^−4.0 = 0.018; normalised, search gets 0.891. Then sweep thresholds on a labelled set and report precision and coverage at each ("at 0.9 we auto-route X percent at Y percent precision"), with X and Y from your data.
+
+Three traps: labels sharing a first token (" Neg" for "Negative" and "Negligible") need a full-sequence score; leading spaces make `" search"` and `"search"` different tokens; and some engines report log-probs after masking or temperature, so a constrained run looks more confident than the model is.
+
+### Other uses
+
+- **Span confidence.** A low log-prob on a name, date or number is a cheap "check this field" flag for extraction review.
+- **Scoring options without generating.** Eval harnesses compare the total log-prob of each multiple-choice option: no parsing, no sampling noise.
+- **Calibration.** Calibrated means about 80 percent of answers given 0.8 confidence are right. Kadavath et al. (2022, "Language Models (Mostly) Know What They Know") found large base models fairly calibrated on many tasks; the GPT-4 Technical Report (2023) showed post-training made calibration worse. Plot accuracy per confidence bucket (a reliability diagram) and, if needed, fit a temperature or logistic map on held-out data.
+
+## Stop sequences, max tokens, finish reasons
+
+The loop has several exits, and your code must know which one fired.
+
+| Why it stopped | Anthropic `stop_reason` | OpenAI `finish_reason` | Gemini `finishReason` |
+|---|---|---|---|
+| model emitted end-of-turn | `end_turn` | `stop` | `STOP` |
+| hit your stop string | `stop_sequence` | `stop` | `STOP` |
+| hit the token cap | `max_tokens` | `length` | `MAX_TOKENS` |
+| wants to call a tool | `tool_use` | `tool_calls` | (function call part) |
+| safety system intervened | `refusal` | `content_filter` | `SAFETY`, `RECITATION`, others |
+| server-side loop paused | `pause_turn` | n/a | n/a |
+
+**End-of-turn** is a learned token, so instructions can shorten a chatty model but never hard-limit it.
+
+**Stop sequences** are string matches on decoded output, checked after each token (the string is usually not returned). Use them to end a text-format agent step at `Observation:` so the model cannot invent the tool result. When streaming, a stop string can arrive split across tokens, so a client-side matcher must buffer the tail.
+
+**max_tokens** is a hard cap the model does not see or plan around; it is simply cut off. Three rules:
+
+1. **Size it from measurement.** Answer Grader's evaluator measured 372 to 759 output tokens and set `max_tokens=3500`, about 2.3x headroom; an overrun is a visible parse failure, not unbounded spend.
+2. **Remember hidden tokens.** Reasoning tokens usually count against the same cap. Answer Grader's `backend/llm.py` multiplies the budget by 4 (minimum 4096) for Gemini, because a limit tuned for OpenAI truncated Gemini's JSON mid-object.
+3. **Never parse a truncated output.** Check the finish reason first.
+
+```ts
+type Finish = "ok" | "truncated" | "refused" | "tool" | "paused";
+
+function classifyFinish(stopReason: string | null): Finish {
+  switch (stopReason) {
+    case "end_turn": case "stop_sequence": return "ok";
+    case "max_tokens": return "truncated";   // raise the cap or shrink the output; do not parse
+    case "refusal": return "refused";        // asking again will not help; fall back
+    case "tool_use": return "tool";
+    case "pause_turn": return "paused";      // send the turn back to continue (bounded)
+    default: return "truncated";             // unknown: treat as unsafe to use
+  }
+}
+```
+
+Memory Agent's answer writer uses exactly the `pause_turn` branch: when the server-side search loop hits its iteration limit, `src/answer.ts` appends the assistant content and calls again, at most three rounds.
+
+## Determinism, seeds, batch-invariance
+
+"Temperature 0 means deterministic" is the most common wrong belief here. There are three layers of randomness; temperature controls only the first.
+
+### Layer 1: the sampler's random draw
+
+A **seed** fixes the pseudo-random draw. vLLM, Ollama and Gemini accept one; OpenAI documents `seed` as best-effort, with a `system_fingerprint` that shows when the backend changed. Anthropic has none. Seeds fix only this layer.
+
+### Layer 2: floating-point numerics
+
+Floating-point addition is not associative:
+
+```python
+print((0.1 + 0.2) + 0.3)   # 0.6000000000000001
+print(0.1 + (0.2 + 0.3))   # 0.6
+print((1e16 + 1.0) - 1e16) # 0.0  (the 1.0 is lost)
+```
+
+A GPU sums thousands of numbers in each matrix multiply, normalisation and attention step, in an order set by how the kernel splits the work. "Defeating Nondeterminism in LLM Inference" (Horace He and Thinking Machines Lab, 2025) showed the usual culprit is not thread races: a forward pass run twice on the same batch is identical. The problem is that kernels are not **batch-invariant**: the reduction strategy, and so the rounding, changes with batch size, and on a shared server your batch size depends on other people's requests in flight ([continuous batching](/10-inference-mechanics/#static-vs-continuous-batching)). Sampling 1,000 completions of one prompt at temperature 0 gave 80 distinct outputs; with batch-invariant kernels all 1,000 were identical, at a throughput cost.
+
+### Why tiny differences become different answers
+
+When the top two logits are nearly tied, a rounding difference flips the argmax, and from then on the model conditions on a different prefix:
+
+```python
+def greedy_step(logits):
+    return max(range(len(logits)), key=lambda i: logits[i])
+
+a = [3.2000001, 3.2000000, 1.0]      # run 1
+b = [3.2000000, 3.2000002, 1.0]      # run 2: different batch, different rounding
+print(greedy_step(a), greedy_step(b)) # 0 1 -> every later token now differs
+```
+
+### Layer 3: the system around the model
+
+An unpinned model alias moves to a new snapshot, a provider routes to different hardware or quantisation, a mixture-of-experts router makes batch-dependent choices, or your prompt contains a timestamp. In an eval harness a "regression" can be pure noise ([noise and sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+### What to do instead of hoping
+
+- **Pin and log** model snapshot, prompt version and parameters.
+- **Cache outputs you depend on.** Scheme Assistant's Lane C (`ingest/lanes/lane_c.py`) caches non-deterministic VLM OCR per (file hash, page, model), so a re-ingest neither costs money nor shifts chunk text.
+- **Move decisions into code.** Answer Grader's `tests/test_eval_consistency.py` pins a case where one answer was judged "exceeded" one day and "followed" two days later; the rule now lives in code.
+- **Seed the randomness you own.** Answer Grader's `answer_plan.py` picks openings with a weighted choice seeded by a hash of the question.
+- **Measure variance** with repeated eval runs. If you need bitwise reproducibility on open weights, check whether your engine offers a batch-invariant mode.
+
+## Hallucination as a training/sampling property
+
+A **hallucination** is fluent, confident output that is false or unsupported by the input. It is not a bug in an otherwise truthful system; it is what next-token prediction does when the distribution puts weight on false continuations.
+
+### The training view
+
+For facts seen many times, the distribution concentrates on the right answer. For facts seen once or never (this year's MSME limits, an obscure paper's title) there is no signal to learn, but some token must still come next, and a plausible one scores better than a strange one. Kalai, Nachum, Vempala and Zhang (2025, "Why Language Models Hallucinate") formalise this: even with error-free data, pretraining implies errors on rare facts, roughly tracking the fraction seen only once. They add that most evaluations grade "I don't know" like a wrong answer, so models tuned to score well learn to guess ([sycophancy and reward hacking](/07-post-training-and-alignment/#sycophancy-reward-hacking-over-refusal)).
+
+Staleness is the same mechanism with a date on it. Answer Grader's `backend/facts.py` records Gemini, despite today's date and an explicit rule in the prompt, telling a student their correct 2025 MSME limits were wrong and giving the 2020 ones. A prompt rule does not change what the weights believe; a fact in front of the model does, and a code guard catches the rest.
+
+### The sampling view
+
+Errors compound over a long answer. If an answer has 10 independent factual tokens and the model puts 0.97 on the right one each time, all ten are right at temperature 1 with probability 0.97^10 = 0.74: one answer in four has a wrong detail. Greedy decoding cannot fix a fact whose top choice is wrong; it only makes the error repeatable. And once a wrong token is out, the model conditions on it: Zhang et al. (2023, "How Language Model Hallucinations Can Snowball") showed models generating false supporting claims for an early wrong answer, claims they could recognise as false when asked separately.
+
+### What engineering can do (without retraining)
+
+1. **Put the facts in the context** ([grounding](/17-rag-pipelines/#grounding-faithfulness)), so the answer is a copy from the prompt, not a recall from weights.
+2. **Make abstaining legal and rewarded:** a nullable field, an abstain gate, evals that score a correct abstention above a wrong answer.
+3. **Verify in code:** citation ids against the retrieved set, numbers against the cited excerpt (Memory Agent's number guard), values clamped to legal ranges.
+4. **Use uncertainty signals:** low log-probs on key spans, disagreement across samples (SelfCheckGPT, Manakul et al. 2023; semantic entropy, Farquhar et al. 2024).
+5. **Lower temperature on factual paths**, knowing it reduces variance, not error.
+
+More in [hallucination mitigation](/29-guardrails-and-safety/#hallucination-mitigation).
+
+## Engineering implications of probabilistic output
+
+A model call is a draw from a distribution you shape (prompt, context, constraints), sometimes truncate (sampling), and can only partly reproduce. [Probabilistic software](/01-what-ai-engineering-is/#probabilistic-software-non-determinism-as-a-design-constraint) introduced the rules; here is the mechanism-level version.
+
+**Choose decoding per call site.** Answer Grader runs its fact-checker at 0.0, its evaluator at 0.3 and its model-answer writer at 0.7: a verifier should be repeatable, a writer benefits from varied phrasing.
+
+**Make provider capabilities explicit.** Chat Insights's lesson in code:
+
+```ts
+const CAPS: Record<string, { temperature: boolean; logprobs: boolean; seed: boolean }> = {
+  anthropic: { temperature: false, logprobs: false, seed: false },
+  gemini:    { temperature: true,  logprobs: false, seed: true  }, // per model: 3.6 Flash+ ignores temperature
+  vllm:      { temperature: true,  logprobs: true,  seed: true  },
+};
+
+function buildParams(provider: string, want: { temperature?: number; seed?: number }) {
+  const caps = CAPS[provider];
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(want)) {
+    if (v === undefined) continue;
+    if ((caps as any)[k]) out[k] = v;
+    else console.warn(JSON.stringify({ evt: "llm.param_dropped", provider, param: k, value: v }));
+  }
+  return out;
+}
+```
+
+**Isolate the randomness.** Chat Insights's `backend/src/lc/scripts/replay.js` hashes the deterministic pipeline's outputs and, with `--twice`, exits 1 on any difference, so the LLM is the only non-deterministic stage.
+
+**Test with rates.** A 2 percent flake appears at least once in n runs with probability 1 − 0.98^n: 0.64 at n = 50, 0.95 at n = 150. One green run proves little.
+
+**Treat every output as untrusted until checked:** finish reason, then schema, then domain rules, then a fallback that cannot fail.
+
+<Production>
+
+**Failure modes.** Truncated output parsed as complete (treat `max_tokens` or `length` as a failure with its own metric); thinking tokens eating the output cap; sampling parameters silently dropped by one provider; penalties corrupting JSON; non-reproducible bugs from batch-dependent numerics, unpinned aliases and timestamps in prompts. Keep the full request so you can replay it.
+
+**Cost.** Over-generation is the quiet bill; output tokens cost several times input on most APIs (check the price page). 1,200 surplus output tokens per request is 1.2M tokens per 1,000 requests: 1.2 × (output price per million) dollars, or $12 at an illustrative $10 per million. Ask for brevity, bound structured fields, size `max_tokens` from measurement. Best-of-n multiplies cost by n.
+
+**Latency.** End-to-end time is roughly `TTFT + output_tokens × time_per_output_token`. With an illustrative 0.5 s TTFT and 20 ms per token, 800 tokens take 16.5 s and 250 tokens take 5.5 s. Output length is your biggest latency lever; [streaming](/31-cost-and-latency-engineering/#streaming-and-perceived-latency) hides some of it.
+
+**Observability.** Log per call: provider, model snapshot, the sampling parameters actually sent, `max_tokens`, finish reason, token counts, and log-probs where available, on the [trace span](/30-observability/#traces-and-spans-for-llm-calls). Alert on the rate of truncation and refusal finishes per route.
+
+**Security.** Higher temperature makes outputs more diverse under attack too: a [jailbreak](/33-security-prompt-injection/#direct-injection-and-jailbreaks) that fails at temperature 0 may succeed on the fifth sample at temperature 1, and attackers retry. Test safety prompts with repeated samples, and treat every output as untrusted input.
+
+</Production>
+
+<Interview>
+
+<Q q="What does temperature do mathematically?">
+
+- Divides every logit by T before softmax: `p_i ∝ exp(z_i / T)`, equivalently `p_i^(1/T)` renormalised.
+- T below 1 sharpens, above 1 flattens; T → 0 is greedy, T → infinity uniform.
+- Worked number: logits 5.0, 3.0, 2.5, 1.0, 0.5 give the top token 0.80 at T = 1, 0.975 at T = 0.5, 0.53 at T = 2. Entropy goes from 1.0 to 0.19 to 1.86 bits.
+- It never changes the ranking or the model's knowledge; it changes how often the tail gets sampled.
+- Practical note: current Claude models reject the parameter, many reasoning models do too, and newer Gemini models silently ignore it; the levers there are effort, structured output and the prompt.
+- **The trap:** "temperature controls creativity" with no formula, or "temperature 0 makes it deterministic".
+
+</Q>
+
+<Q q="Why is temperature 0 not fully deterministic?">
+
+- Temperature 0 removes the random draw (greedy), but the logits themselves can differ between runs.
+- Floating-point addition is not associative, and kernel reduction order depends on batch size, which on a shared server depends on other users' traffic. Thinking Machines (2025) identified missing batch invariance, not thread races, as the main cause: 1,000 temperature-0 runs gave 80 distinct completions, and batch-invariant kernels made them identical.
+- When the top two logits are nearly tied, a tiny rounding change flips the argmax, and every later token diverges because the prefix differs.
+- System causes: unpinned aliases, different hardware or quantisation, timestamps in prompts.
+- Seeds fix only the sampler's draw. OpenAI's is best-effort with a system fingerprint; Anthropic has none.
+- Response: pin and log, cache outputs, move decisions into code, evaluate with repeats.
+- **The trap:** "set the seed and temperature 0 and it is reproducible".
+
+</Q>
+
+<Q q="How can you use log-probs for classification confidence?">
+
+- Make the label the first output token (constrain to the label set), request top log-probs at that position, exponentiate and normalise over the labels.
+- Example: search −0.11, recheck −2.4, clarify −4.0 gives 0.896, 0.091, 0.018, so search at 0.89 after normalising.
+- Pick a threshold from a labelled set: sweep it, report precision and coverage at each value, route below-threshold cases to a safe default or a human.
+- Check calibration with a reliability diagram; post-trained models are often over-confident.
+- Watch for labels sharing a first token, leading-space tokens, and engines that report post-masking log-probs.
+- Availability is a constraint: no log-probs on the Anthropic API, patchy on reasoning models elsewhere; open-weight engines return them.
+- **The trap:** asking the model to output a confidence number and treating it as a probability.
+
+</Q>
+
+<Q q="Why do LLMs hallucinate, and what can engineering (not training) do about it?">
+
+- Training: the objective rewards plausible continuation, not truth. Rare facts give no signal, but some token must still be produced. Kalai et al. (2025) tie the error rate to facts seen roughly once, and note that evals grading "I don't know" as wrong teach models to guess.
+- Sampling: even a good distribution leaves mass on wrong tokens; 10 factual tokens at 0.97 each are all right only 74 percent of the time. Errors snowball as the model conditions on them.
+- Engineering: ground with retrieval, make abstention a legal and rewarded output, verify citations and numbers in code, use uncertainty signals (log-probs, sample disagreement, semantic entropy), lower temperature on factual paths.
+- **The trap:** "use temperature 0" or "tell it not to hallucinate" as the whole answer.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Two parts, both offline, in **Memory Agent** (`~/memory-agent`), whose planner in `src/planner.ts` is a five-way intent classifier (smalltalk, memory_only, recheck, search, clarify) with no confidence signal, because the Claude API returns no log-probs.
+
+**Part 1: sampling playground (Python, Hugging Face transformers, CPU is fine).**
+
+1. In `playground/sampling.py`, load a small open model (for example `Qwen/Qwen2.5-0.5B-Instruct`) with `AutoModelForCausalLM`.
+2. Write your own decode loop: one forward pass per step, take `outputs.logits[0, -1]`, and pass it through this chapter's `sample()`. No `model.generate`.
+3. For one prompt, print the top 10 tokens, their probabilities and the entropy in bits at T = 0.5, 1.0 and 1.5.
+4. Generate 20 continuations per setting; count distinct outputs and repeated 4-grams, then add a frequency penalty.
+5. Confirm T = 0 repeats exactly on CPU, and note why that does not transfer to a shared GPU server.
+
+**Part 2: log-prob confidence for Memory Agent's planner (Ollama).**
+
+1. Label 100 to 150 messages with the correct intent in `eval/intents.jsonl` (phrasings from `eval/cases.ts`, including hard recheck-versus-search cases).
+2. In `eval/intent_confidence.ts`, send each message with the planner's system prompt to a local model via Ollama's chat API, with a JSON schema whose first field is the intent, `logprobs: true` and `top_logprobs: 5`. If your Ollama version lacks log-probs, use Part 1's transformers setup.
+3. Compute the normalised confidence as in `label_confidence`.
+4. Sweep thresholds 0.5 to 0.95; print precision, coverage and a 5-bucket reliability table.
+5. Pick a threshold giving at least 95 percent precision on auto-accepted messages; below it, fall back to `search`, the existing safe default in `fallbackPlan`.
+
+**Definition of done:** the playground prints distributions and samples for each setting with your own sampler; the confidence script prints a precision and coverage table and a reliability table from at least 100 labelled messages; a short note in `DECISIONS.md` records the chosen threshold, the model used, and the fact that the production Claude planner cannot use this signal.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Chat Insights shows the provider-capability trap, in your own code.** `backend/src/lc/services/chatService.js` sets `REPEAT_RETRY_TEMPERATURE = 0.9` (line 55) and applies it on the repeat retry (lines 103 to 109). The Gemini provider (`services/llm/gemini.js`, lines 66 to 72) clamps it to 0 to 1.2, default 0.3; the Anthropic provider's header (`services/llm/anthropic.js`, lines 1 to 12) says temperature, top_p and top_k are never sent because they 400, and its `generate()` does not accept the field. In an interview: the retry's real fix is showing the model its previous text; the temperature bump exists only on Gemini, and Gemini 3.6 Flash and newer would ignore it too. Gap: no capability table, no log line when a parameter is dropped.
+- **Chat Insights also handles finish reasons and isolates randomness.** The Anthropic provider maps `stop_reason === 'refusal'` to a typed `LlmError` and puts `stop_reason` in parse-failure messages (lines 143 to 153). `MAX_TOKENS = 4000` is generous for a reply capped near 260 words, though thinking tokens draw from the same cap on a model that thinks by default, so measure before shrinking it. `scripts/replay.js` hashes the deterministic pipeline and fails if two runs differ.
+- **Answer Grader chooses decoding per call site and sizes caps from data.** `backend/verify.py` runs the fact-checker at 0.0; `backend/evaluation.py` runs the evaluator at 0.3 with `max_tokens=3500` derived from measured outputs; the model-answer call in `backend/model_answer.py` runs at 0.7 (a team file; defend the choice, do not claim the line). Your `backend/llm.py` sets `GEMINI_TOKEN_HEADROOM = 4` because Gemini counts reasoning tokens against `max_output_tokens`, and your `answer_plan.py` uses a hash-seeded weighted choice so the same question always gets the same plan.
+- **Answer Grader has your best non-determinism and hallucination stories:** `tests/test_eval_consistency.py` (same answer, two verdicts, rule moved into code) and `backend/facts.py` (Gemini contradicting a correct 2025 fact; fixed with a verified fact register plus a code guard).
+- **Scheme Assistant: be precise about who wrote what.** Generation at temperature 0.0 with a response schema, and the `finishReason` in the no-content error, are in `src/app/core/llm.py`, Chiman's code you should be able to defend; it sets no output-token cap. Your part is `ingest/lanes/lane_c.py`, which caches non-deterministic VLM OCR per (file hash, page, model) so re-ingests keep chunk text and citations stable.
+- **Memory Agent sends no sampling parameters at all.** It controls behaviour with model routing (`src/config.ts`) and effort (`src/agent.ts`), caps output per call (8000 for the writer, 1500 for the planner, 2000 for claim extraction) and loops on `pause_turn` up to three rounds (`src/answer.ts`, lines 159 to 160). The gap: the planner classifies intent with no confidence signal. The Apply it task builds one with a local model.
+
+</YourProject>

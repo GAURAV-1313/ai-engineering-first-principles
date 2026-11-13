@@ -1,0 +1,155 @@
+---
+id: "D07"
+title: "Eval and CI pipeline for an agent"
+prompt: "Your team ships an agent that plans, calls tools and writes answers for customers. Design the eval and CI pipeline so that a prompt, model or tool change cannot quietly make it worse."
+sections: ["19.07", "19.13", "20.03", "20.09", "20.13", "20.14", "32.11"]
+minutes: 45
+---
+
+## Clarify and scope
+
+Before drawing anything, pin down what "worse" means and what the pipeline is allowed to cost. Questions to ask:
+
+- **What changes?** Prompts, the model behind each step, tool schemas, retrieval settings, plain code. A model upgrade needs the full suite; a tool-description typo needs the smoke set.
+- **How often?** Assume several PRs a day and a model upgrade every few months.
+- **What does the agent do?** Assume a support or research agent with about five tools, multi-turn conversations and roughly 10K conversations a day.
+- **What is "worse"?** Five things: task success, groundedness (claims backed by tool results), safety (no forbidden actions), cost per task and p95 latency. The first three are quality. The last two are regressions too.
+- **Budget for the pipeline.** Per-PR feedback within about 15 minutes, a hard spend cap per run, and a nightly run that can take an hour.
+
+State the plan in one sentence: three tiers (offline tests on every commit, a small paid smoke eval on every PR, a full suite with repeats nightly and before release), plus online sampling of production traces that feeds new cases back in.
+
+## Baseline architecture
+
+```text
+        PR opened (prompt / model / tool / code change)
+                         |
+        +----------------+-----------------+
+        | Tier 0: unit + contract tests    |  no model calls, fake LLM client,
+        |  (guards, parsers, tool schemas) |  seconds, runs on every commit
+        +----------------+-----------------+
+                         |
+        +----------------+-----------------+
+        | Tier 1: smoke eval, ~40 cases    |  real agent, recorded tool fixtures,
+        |  code checks + calibrated judge  |  budget cap, paired vs main
+        +----------------+-----------------+
+                         |
+                PR comment: hard-gate failures, flipped cases,
+                pass rate with error bars, cost and p95 deltas
+                         |
+  nightly / release --> Tier 2: full suite (~300 cases x 3 repeats)
+                         |       + simulated-user personas + live sandbox tools
+                         |
+  release ------------> Tier 3: shadow traffic, then canary %
+                         |
+  production traces --> sample 1-5% --> async judge --> review queue
+                         |                                   |
+                         +--------- new cases <--------------+
+```
+
+The parts:
+
+- **Case store.** Versioned JSONL in the repo: input or setup turns, a persona if multi-turn, an expectation sentence for the judge, and hard rules (must call tool X, must not call tool Y, max steps, max first-token time). Each case is tagged with the failure category it covers.
+- **Runner.** Runs the real agent with a tool layer that is either recorded (fixtures captured from real calls) or a sandbox with fake accounts. A worker pool runs cases in parallel.
+- **Graders.** Code checks first: schema valid, forbidden tool not called, step budget kept, citations point at real tool results. An LLM judge only for what code cannot check.
+- **Result store.** One directory per run with full transcripts, model ids, prompt hash, judge version, tool-fixture version and cost split into agent, judge and simulator.
+- **Comparator and reporter.** Pairs each case with the same case on `main` and reports flips, not only the headline rate.
+
+## Key choices and trade-offs
+
+**Outcome vs trajectory grading.** Outcome asks "is the final answer or final state right?" Trajectory asks "did it get there the right way?" Grade outcome by default, because many trajectories are valid and over-specifying them makes tests brittle. Add trajectory assertions only where the path itself matters: safety (no refund before account lookup), cost (no more than N searches) and grounding (each claim cites a tool result the agent actually saw).
+
+**Recorded fixtures vs live tools.** Recorded tool responses make PR runs deterministic, cheap and offline-safe, but they go stale and cannot test the agent's reaction to new data. Live sandbox tools are realistic but flaky. Use fixtures in Tier 1 and live sandboxes nightly. Infrastructure errors (timeouts, rate limits) are recorded as "errored", never as "failed".
+
+**Judge design.** Binary pass/fail per criterion beats a 1 to 10 score: it is easier to calibrate and easier to act on. Use a judge from a different model family from the agent, so it does not prefer its own style. Calibrate it against about 100 human-labelled cases and report true-positive and true-negative rates, not raw agreement. Pin the judge version. When the judge changes, re-grade the stored baseline transcripts before claiming a gain, because a new judge moves scores on unchanged answers.
+
+**Gating policy.** Two kinds of gate:
+
+- **Hard gates** block the merge on any regression: schema failures, forbidden tool calls, a safety case that flips to fail, a crash.
+- **Soft gates** (judge pass rate, cost, p95) block only when the paired drop is outside the noise band. Below that, the PR gets a warning and the nightly run decides.
+
+**pass@k vs pass^k.** pass@k (at least one of k tries succeeds) suits a tool where a human picks the best output. A customer-facing agent needs pass^k (all k tries succeed), because every user gets one try. Run repeats nightly and track the per-case pass rate. A case that passes 2 of 3 is a reliability bug, even if the headline looks fine.
+
+**Where cases come from.** Read traces first, label the failures, group them into a taxonomy, then write cases per category. Every production bug becomes a case before it is fixed. Keep a held-out slice that nobody tunes prompts against, so you can detect overfitting to the suite.
+
+## Evals
+
+You also have to evaluate the eval pipeline itself:
+
+- **Judge validity:** TPR and TNR against human labels, re-measured whenever the judge prompt or model changes.
+- **Flakiness:** run the suite three times on unchanged code and record each case's flip rate. Cases above a threshold go to quarantine and are reported separately until fixed.
+- **Coverage:** count cases per failure category. A category with two cases cannot show a regression.
+- **Sensitivity:** plant a known regression (an old, worse prompt) and confirm the pipeline flags it. If it does not, the gate is decorative.
+
+<Callout type="interview">
+
+Interviewers listen for whether you separate model evals from system evals, and whether you treat a score as a sample with error bars. "We run 40 cases and block if the pass rate drops" without saying how big a drop is noise is the common weak answer.
+
+</Callout>
+
+## Guardrails and fallbacks
+
+The pipeline needs its own failure handling:
+
+- **Spend cap per run.** Stop scheduling new cases once estimated agent, judge and simulator spend reaches the cap. If the provider account runs out of credit, skip the remaining cases and say so. Do not grade them as failures.
+- **Timeouts per case**, and a separate "errored" status, so a provider outage does not look like a quality regression.
+- **Judge outage:** fall back to code checks only and mark the run "unjudged". Never default to pass.
+- **Contamination:** eval inputs never appear in prompts or few-shot banks. The held-out slice is only read at release.
+- **Gaming:** if the agent can tell it is being evaluated (fixture URLs, test account names), it may behave differently. Make the sandbox look like production.
+
+## Observability and cost
+
+Every run records model id per step, prompt hash, judge id, fixture version, git sha and cost split by agent, judge and simulator. A dashboard plots pass rate per suite over time with confidence bands, so a slow drift is visible even when no single PR crossed a gate.
+
+Online, sample 1 to 5% of production traces, judge them asynchronously with the same calibrated judge, and alert on a sustained drop. Low-scoring traces go to a human review queue, and reviewed failures become new cases. That loop (trace, label, case, fix) is the point.
+
+Use the provider's batch API for nightly judging. It is asynchronous and usually discounted (check current terms), and nightly runs do not need answers in seconds.
+
+## The numbers
+
+**Noise on the smoke set.** For a pass rate p on n cases, SE = √(p(1 − p) / n).
+n = 40, p = 0.85: SE = √(0.1275 / 40) = √0.00319 ≈ 0.056, so a 95% band of about ±11 points. A 40-case smoke set can only catch large drops on its own. That is why it leans on hard gates and paired flips.
+
+**Paired flips.** On the same 40 cases, only cases that change outcome carry information. If 4 cases go pass to fail and none go the other way, a two-sided sign test gives p = 2 × 0.5⁴ = 0.125: suspicious, not proof. Six of six gives 2 × 0.5⁶ ≈ 0.031. So the PR comment lists the flipped cases by name and lets a human read them.
+
+**Judge calibration.** With about 50 human-labelled positives and a measured TPR of 0.9, SE = √(0.9 × 0.1 / 50) ≈ 0.042, so TPR is known to about ±8 points. That is enough to reject a bad judge, not to rank two good ones.
+
+**Cost per run** (prices in USD per million tokens; check current prices):
+
+```text
+C_run = N x r x (T_agent_in  x P_in  + T_agent_out x P_out
+              +  T_judge_in  x Pj_in + T_judge_out x Pj_out) / 1e6
+
+Assume 6 agent steps x 4,000 input tokens = 24,000 in, 1,500 out;
+judge 8,000 in, 300 out.
+
+Tier 1 (N = 40, r = 1):
+  agent  0.96M in, 0.06M out
+  judge  0.32M in, 0.012M out
+  C = 0.96 P_in + 0.06 P_out + 0.32 Pj_in + 0.012 Pj_out dollars per PR
+
+Tier 2 (N = 300, r = 3): 900 runs = 22.5 x the Tier 1 run
+```
+
+**Wall-clock.** Assume about 30 s per agent case plus 5 s of judging. Tier 1 at concurrency 8 takes 40 × 35 / 8 = 175 s, about 3 minutes. Tier 2 at concurrency 16 takes 900 × 35 / 16 ≈ 1,970 s, about 33 minutes.
+
+**Rate limits.** Tier 2 sends about 900 × 32,000 = 28.8M input tokens (agent plus judge) in roughly 33 minutes, around 0.9M input tokens per minute. Check your account's tokens-per-minute tier before you schedule it next to production traffic.
+
+## Follow-ups they will ask
+
+1. **How do you handle a model upgrade?** Run the full suite with repeats on both models, compare paired per category (not only the headline), record the model id on every result, then shadow traffic and a canary.
+2. **Your judge is the same model as your agent. Problem?** Yes. It may prefer its own style. Use a different family, or at least calibrate against human labels and report TPR and TNR.
+3. **How do you stop the suite going stale?** Add new cases from reviewed production failures every week, keep a held-out slice and track coverage per failure category.
+4. **What about flaky cases?** Measure each case's flip rate on unchanged code, quarantine the flaky ones and use pass^k nightly so flakiness shows up as a reliability number.
+5. **How do you test the tools themselves?** Contract tests with a fake client in Tier 0, plus cases that inject tool errors and check the agent recovers or says it cannot.
+6. **What exactly blocks a merge?** Any hard-gate regression, a soft-metric drop outside the paired noise band, or cost or p95 above an agreed limit.
+
+## How to bring in your own work
+
+You have built most of the harness. You have not run it as a merge gate. Say both.
+
+- **Memory Agent's scenario suite:** `eval/cases.ts`. It has 28 scenarios in three suites (core, red-team, personas). Each scenario carries an expectation sentence and hard rules such as `noSearch`, `mustSearch` and `maxFirstTokenMs` (lines 15 to 27). The "real change" cases seed memory with true historical facts, because you cannot send the live web back in time (lines 124 to 137).
+- **Memory Agent's runner:** `eval/run.ts`. A pass needs clean code checks and zero major failures from the judge (lines 236 to 246). The judge returns rubric scores as structured output and can run its own searches (lines 95 to 102 and 140 to 153). A Sonnet-simulated user drives up to four turns (lines 178 to 190). `--budget` stops a run at a spend cap (lines 48 to 53). `--rejudge` re-grades stored transcripts (lines 275 to 287).
+- **Memory Agent's noise lesson:** `eval/report.ts` exists because the same code scored 22/28 and 26/28. `DECISIONS.md` also records that a fairer judge alone moved the core suite from 8/10 to 9/10 on unchanged answers. That is your answer on noise and on judge versioning.
+- **Memory Agent's offline Tier 0:** `src/agent.test.ts` runs whole turns with a fake client and no key. `eval/replay-guard.ts` and `eval/guard-recall.ts` measure the number guard's precision and recall offline. The recall script's header says honestly which parts of the result follow from the guard's own rules.
+- **Answer Grader:** `scripts/eval_retrieval.py` computes nDCG@5 and precision@5 on blind-labelled student questions from stored embeddings, with no API calls, which makes it the cheapest possible CI gate. `tests/test_eval_consistency.py` pins a real nondeterministic case (a 268-word answer judged "exceeded" one day and "followed" the next) by moving the deciding rule into code (lines 23 to 29). `backend/evaluation.py` stores `graded_by` because scores are model-specific (lines 549 to 551).
+- **Gaps:** nothing gates a merge. Memory Agent's `npm run eval` is a manual, paid command. Answer Grader's only workflow posts to Telegram on a cron. No repo measures judge TPR and TNR against human labels: Answer Grader calibrates marks against real marksheets, which is a different thing. Memory Agent's default judge is a Claude model grading Claude writers, so self-preference is unmeasured. No repo samples production traces for online grading. A strong next step: wire `npm test` and `eval_retrieval.py` into GitHub Actions, and fail on an nDCG drop.

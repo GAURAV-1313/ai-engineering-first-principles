@@ -1,0 +1,16 @@
+---
+import type { Chapter } from '../lib/outline';
+interface Props { chapter: Chapter; closing: { id: string; label: string }[] }
+const { chapter, closing } = Astro.props;
+---
+<nav aria-label="On this page">
+  <p class="toc-title">Chapter {chapter.id}</p>
+  <ol class="toc-list">
+    {chapter.sections.map((s) => (
+      <li><a class="toc-link" href={`#${s.slug}`} data-toc-link={s.slug}><span class="toc-num">{s.id.slice(3)}</span><span>{s.title}</span></a></li>
+    ))}
+  </ol>
+  <ol class="toc-list toc-close" style="margin-top: 16px">
+    {closing.map((c) => <li><a class="toc-link" href={`#${c.id}`}><span>{c.label}</span></a></li>)}
+  </ol>
+</nav>

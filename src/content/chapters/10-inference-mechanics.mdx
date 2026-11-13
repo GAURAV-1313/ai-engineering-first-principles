@@ -1,0 +1,625 @@
+---
+id: "10"
+title: "Inference Mechanics"
+summary: "Explain what actually happens on a GPU when a model answers a request, and do the memory, latency and throughput arithmetic (KV cache, batching, quantization, speculative decoding, caching) that decides whether a deployment fits, how fast it is and what each token costs."
+readingTime: "36 min"
+---
+
+You call an API, and 400 ms later the first word appears, then the rest stream in at a steady rate. Or you run an 8B model in Ollama on your laptop, and it is fine for one user and falls over when three people use it at once. Both experiences come from the same few mechanisms. A model answers in two phases with very different hardware profiles. One of those phases is starved for memory bandwidth, not compute. A per-request cache grows with every token and decides how many users fit on a GPU. Almost every serving trick you will hear about (continuous batching, PagedAttention, FlashAttention, quantization, speculative decoding, prefix caching) attacks one of those three facts.
+
+This matters even if you never run a GPU. Provider pricing (cheap input, expensive output, very cheap cached input) and latency behaviour (time to first token grows with prompt length, speed per token barely does) fall out of these mechanics. And "explain the KV cache" or "why is decode memory-bound" are standard interview questions, where a strong answer is a formula plus one worked number.
+
+Model shapes in this chapter come from each model's published `config.json` on Hugging Face (the model cards for Llama 3.1 8B, Llama 3.3 70B, which shares Llama 3.1 70B's architecture, Qwen2.5-7B and Qwen2.5-3B). Hardware figures are approximate datasheet values. Engines and pricing belong to [the serving chapter](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights); here we stay with the machine.
+
+## Prefill vs decode
+
+A decoder-only transformer produces one token per forward pass, each depending on all before it ([next-token prediction](/04-language-modeling-and-sampling/#next-token-prediction)). So generation is a loop, and its first pass is special.
+
+**Prefill** processes the whole prompt in one forward pass. All prompt tokens are known, so their hidden states are computed in parallel: big matrix-matrix multiplies of (prompt tokens × hidden size) against the weights. Out come the first generated token and, as a side effect, the keys and values of every prompt token at every layer, which get stored (next section).
+
+**Decode** generates the rest, one token per step: feed in the new token, compute its query, key and value, attend over everything stored, sample. Each step is a matrix-vector multiply: one row of activations against every weight matrix.
+
+```text
+prompt: "Summarise this contract: ...2,000 tokens..."
+
+PREFILL (1 forward pass, 2,000 tokens in parallel)
+  [t1 t2 t3 ... t2000] --model--> K,V for all 2,000 tokens  +  first output token o1
+  cost: ~2 x params x 2,000 FLOPs, done once       -> sets TTFT
+
+DECODE (1 forward pass per output token)
+  o1 --model(reads all weights + all K,V)--> o2
+  o2 --model(reads all weights + all K,V)--> o3
+  ...                                               -> sets ITL, repeated N times
+```
+
+A useful rule from [FLOPs accounting](/05-transformer-intuition/#parameter-and-flops-accounting): a forward pass costs about `2 × parameters` FLOPs per token (one multiply and one add per weight). For an 8B model and a 2,000-token prompt, prefill is about `2 × 8e9 × 2,000 = 3.2e13` FLOPs, 32 TFLOPs. Each decode step is `2 × 8e9 = 1.6e10` FLOPs, 2,000 times less. Yet a decode step does not take 2,000 times less time. The next sections explain why: decode must still read every weight from memory for every step.
+
+Here is the loop in plain Python with the model mocked, so the shape of the work is visible.
+
+```python
+def generate(model, prompt_ids, max_new=200, eos=2):
+    # PREFILL: one pass over the whole prompt; returns logits for the last
+    # position and the per-layer keys/values for every prompt token.
+    logits, kv_cache = model.forward(prompt_ids, kv_cache=None)
+    out = []
+    for _ in range(max_new):
+        next_id = sample(logits)          # your sampler (chapter 4): greedy, top-p, etc.
+        if next_id == eos:
+            break
+        out.append(next_id)
+        # DECODE: one token in, attend over the cache, cache grows by one.
+        logits, kv_cache = model.forward([next_id], kv_cache=kv_cache)
+    return out
+```
+
+**Prefill sets time to first token**: it grows roughly linearly with prompt length (plus a quadratic attention term at long context, see [quadratic context cost](/05-transformer-intuition/#quadratic-context-cost)). **Decode sets the streaming speed**: roughly constant per token, creeping up as context grows. This is also why input tokens are priced below output tokens: an input token rides a big parallel pass, an output token costs a full sequential pass over the weights.
+
+The classic production surprise is a RAG endpoint whose TTFT jumps from 300 ms to several seconds after someone added 30K tokens of retrieved context. Decode did not change; prefill did. The fixes are less context, [prefix caching](#prefix-prompt-caching), or chunked prefill ([batching](#static-vs-continuous-batching)).
+
+## KV cache and memory
+
+In each attention layer, the new token's query is compared with the keys of every earlier token, and the weights mix their values ([attention as soft lookup](/05-transformer-intuition/#attention-as-soft-lookup-q-k-v)). Without a cache, token 1,001 would recompute keys and values for tokens 1 to 1,000 at every layer, and token 1,002 would do it again: quadratic work in output length.
+
+But a past token's key and value never change (causal masking: later tokens cannot affect earlier ones), so compute them once and keep them. That store is the **KV cache**. Each decode step computes K and V for the new token only, appends them, and attends over the rest. The price is memory, and that memory is the central constraint of LLM serving.
+
+### The formula
+
+For each token, each layer stores one key vector and one value vector per KV head:
+
+```text
+KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_element
+KV bytes per sequence = KV bytes per token × tokens in context
+KV bytes on the GPU   = sum over all running sequences
+```
+
+Note `kv_heads`, not attention heads. Most current models use grouped-query attention ([MQA/GQA](/05-transformer-intuition/#mqa-gqa-sliding-window)), where several query heads share one key/value head. That is a direct KV-cache optimization.
+
+### Real shapes
+
+From each model's published `config.json` (Hugging Face model cards), at bf16 (2 bytes per element):
+
+| Model | layers | attention heads | KV heads | head_dim | KV per token | 8K context | 128K context |
+|---|---|---|---|---|---|---|---|
+| Llama 3.1 8B | 32 | 32 | 8 | 128 | 128 KiB | 1 GiB | 16 GiB |
+| Llama 3.3 70B | 80 | 64 | 8 | 128 | 320 KiB | 2.5 GiB | 40 GiB |
+| Qwen2.5-7B | 28 | 28 | 4 | 128 | 56 KiB | 448 MiB | 7 GiB |
+| Qwen2.5-3B | 36 | 16 | 2 | 128 | 36 KiB | 288 MiB | 4.5 GiB |
+
+Work one row by hand. Llama 3.1 8B: `2 × 32 × 8 × 128 × 2 = 131,072` bytes, 128 KiB per token. At 8,192 tokens that is `131,072 × 8,192 = 1,073,741,824` bytes, exactly 1 GiB. If the same model used full multi-head attention (32 KV heads instead of 8), it would be 512 KiB per token and 4 GiB at 8K: GQA alone buys a 4× larger batch.
+
+Compare with the weights: about 8.0B parameters, so about 16 GB in bf16. One 128K-token conversation needs 16 GiB of KV cache, as much as the model; so do sixteen users at 8K. Weights are paid once and shared; the cache is paid per user. That is why the KV cache usually limits how many requests a GPU serves at once, and why "128K context" on a model card does not mean you can afford to serve 128K to everyone.
+
+```python
+def kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per_elem=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per_elem
+
+def max_concurrent_seqs(gpu_gb, weight_gb, ctx_tokens, kv_per_tok,
+                        util=0.90, overhead_gb=4):
+    # util: fraction of GPU memory the engine may use (vLLM's default is 0.9)
+    # overhead: activations, CUDA graphs, fragmentation; a rough allowance
+    kv_budget = gpu_gb * util - weight_gb - overhead_gb
+    return kv_budget * 1e9 / (kv_per_tok * ctx_tokens)
+
+llama8b = kv_bytes_per_token(32, 8, 128)          # 131072
+print(max_concurrent_seqs(80, 16.1, 8192, llama8b))   # ~48 sequences on one 80 GB GPU
+```
+
+### What goes wrong
+
+The failure is out-of-memory or, in a good engine, something gentler: the scheduler queues new requests or **preempts** a running sequence (frees its cache, recomputes or swaps it later). Users see TTFT spike while compute sits idle. The levers: cap `max_model_len` to what the product needs, quantize the KV cache to 8 bits ([quantization](#quantization-gptq-awq-gguf-fp8)), share prefixes ([prefix caching](#prefix-prompt-caching)), add GPUs, pick a model with fewer KV heads or a compressed KV design (DeepSeek's multi-head latent attention, MLA, stores one small latent per token instead of full keys and values), or let the engine offload cold prefix blocks to CPU memory or SSD and load them back on a hit. Ollama exposes the same trade-off as `num_ctx`: the cache is reserved for that many tokens whatever your prompts' length.
+
+<Callout type="interview">
+
+When asked to "explain the KV cache", give the why (keys and values of past tokens never change, so cache them and make decode linear), the formula (`2 × layers × kv_heads × head_dim × bytes`), one number (Llama 3.1 8B: 128 KiB per token, 1 GiB per 8K sequence, 16 GiB at 128K) and the consequence (it, not the weights, caps concurrency).
+
+</Callout>
+
+## Compute- vs memory-bound
+
+A GPU has two budgets: FLOPs per second, and bytes per second moved from main memory (HBM) to the cores. An NVIDIA H100 SXM does roughly 990 TFLOP/s of dense bf16 math and roughly 3.35 TB/s of HBM bandwidth (approximate datasheet figures; the headline FLOP number is often quoted with sparsity, which doubles it). Divide:
+
+```text
+ridge point = peak FLOP/s / bandwidth = 990e12 / 3.35e12 ≈ 300 FLOPs per byte
+```
+
+That is the **arithmetic intensity** (FLOPs per byte read) a kernel needs to keep the cores busy. Below it a kernel is **memory-bound**: the cores wait on data, and faster cores would not help. Above it, **compute-bound**. This is the roofline model (Williams, Waterman and Patterson, 2009), and it explains most of inference performance.
+
+Apply it to a matrix multiply with bf16 weights. Each weight is 2 bytes and is used in one multiply-add (2 FLOPs) per token in the batch:
+
+```text
+intensity of a weight matmul ≈ (2 × tokens_in_batch) FLOPs / 2 bytes = tokens_in_batch
+```
+
+- **Prefill** of a 2,000-token prompt: intensity about 2,000, well above 300. Compute-bound.
+- **Decode** of one sequence: intensity about 1, three hundred times below the ridge. Memory-bound: step time is simply "bytes to read ÷ bandwidth".
+
+So a single-user decode step on an 8B bf16 model has a floor of `16 GB ÷ 3.35 TB/s ≈ 4.8 ms`, about 210 tokens per second at best, however many TFLOPs the chip has. Real engines land below that ceiling, but the shape holds. It is also why 4-bit weights speed up single-user decode: fewer bytes per token.
+
+```python
+def decode_step_ms(weight_bytes, kv_bytes_read, bw_bytes_per_s):
+    # memory-bound: time is dominated by moving bytes, not by math
+    return (weight_bytes + kv_bytes_read) / bw_bytes_per_s * 1000
+
+def is_compute_bound(tokens_in_batch, peak_flops=990e12, bw=3.35e12, bytes_per_w=2):
+    intensity = 2 * tokens_in_batch / bytes_per_w   # FLOPs per weight byte
+    return intensity >= peak_flops / bw
+```
+
+The way out is more work per byte read. Batch 64 users' decode steps and each weight byte feeds 64 tokens: the weight-reading part of the step costs the same as for one user, so if weights were the only bytes, throughput would rise close to 64×. That is why every serving system batches. The catch is attention: each sequence's KV cache is private, so its reads are not shared. KV reads grow with batch × context, and at long context they can exceed the weight reads, so adding users stops helping. Example 2 at the end of the chapter works this through: at 2K context, batch 64 doubles the step time and gives about 32× the throughput, not 64×.
+
+Prefill wants compute; decode wants bandwidth and capacity. That mismatch drives chunked prefill, disaggregation and accelerator choice below. The production mistake is reading 100% "GPU utilization" in `nvidia-smi` as saturation: it only says a kernel was running, and a memory-bound decode kernel shows 100% while the tensor cores idle. Track model FLOPs utilization (MFU) and memory bandwidth utilization (MBU), or tokens per second against the arithmetic ceiling.
+
+## TTFT, TPOT/ITL, throughput
+
+You cannot tune what you do not measure, and LLM latency needs its own vocabulary because "request latency" hides the two phases.
+
+- **TTFT, time to first token**: request arrival to first output token at the client. Queueing + prefill + network. What users feel as "is it responding?".
+- **ITL, inter-token latency**: the gap between consecutive streamed tokens. The decode step time, plus stalls when the engine runs someone else's prefill.
+- **TPOT, time per output token**: `(end-to-end latency − TTFT) ÷ (output tokens − 1)`, ITL averaged over one request. Some tools use the names interchangeably; say which you mean.
+- **End-to-end latency**: `TTFT + TPOT × (output tokens − 1)`.
+- **Throughput**: output tokens per second across all requests (or total tokens including input; say which), or requests per second.
+- **Goodput**: requests per second that meet the latency SLOs. High throughput with half the requests missing TTFT is not success.
+
+Report percentiles (p50, p95, p99), not only means: a p50 ITL of 20 ms with a p99 of 400 ms means some users watch the stream freeze.
+
+```python
+def stream_metrics(t_request, token_times):
+    """token_times: wall-clock arrival time of each streamed token."""
+    ttft = token_times[0] - t_request
+    gaps = [b - a for a, b in zip(token_times, token_times[1:])]
+    n = len(token_times)
+    tpot = (token_times[-1] - token_times[0]) / (n - 1) if n > 1 else 0.0
+    return {"ttft_s": ttft, "tpot_s": tpot, "itl_max_s": max(gaps, default=0.0),
+            "e2e_s": token_times[-1] - t_request, "tokens": n}
+
+def percentile(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(p / 100 * len(xs)))]
+```
+
+What good looks like depends on the product. A TPOT of 20 to 50 ms (50 down to 20 tokens per second) streams faster than people read, so chat feels fluent. In agents and pipelines nobody reads intermediate output, so end-to-end latency per step dominates. A voice agent needs TTFT in the low hundreds of milliseconds because silence on a call is obvious.
+
+The central trade-off is **latency versus throughput under batching**. Larger batches raise throughput per GPU (cheaper tokens) and raise each user's ITL and TTFT. You pick an operating point per product from a measured curve; the [Apply it](#apply-it) exercise builds one.
+
+On a hosted API you measure the same numbers from the client, with network and the provider's queue folded into TTFT. Log TTFT, TPOT and input, cached and output tokens per call; that is the minimum to debug "it got slow" and the input to [cost-per-task modelling](/11-serving-and-model-economics/#cost-per-task-modelling).
+
+## Static vs continuous batching
+
+Since decode is memory-bound, batching is the main throughput lever. How you batch matters as much as whether you do.
+
+**Static batching** collects N requests, pads them to one length, and runs them until every one has finished. Output lengths vary wildly: if one request wants 20 tokens and another 800, the first slot idles for 780 steps. And a request arriving at step 21 waits for the whole batch before its prefill even starts. Throughput is wasted and TTFT is terrible under load.
+
+**Continuous batching** (iteration-level scheduling, from Orca, Yu et al., OSDI 2022) reschedules at every decode step. Finished sequences leave immediately and free their memory; waiting requests join as soon as there is room. A revolving door, not a bus that leaves when full.
+
+```text
+static:      step 1........20.........................800
+  req A      ######## (done at 20, slot idle until 800)
+  req B      ##############################################
+  req C      (arrives at step 21, waits until 800 to start)
+
+continuous:  step 1........20 21......................
+  req A      ########
+  req C                   #prefill#####################
+  req B      ##############################################
+```
+
+```python
+def serve_loop(engine, waiting, max_batch_tokens):
+    running = []
+    while waiting or running:
+        # admit new requests while KV memory and the token budget allow
+        while waiting and engine.kv_free_blocks() >= engine.blocks_needed(waiting[0]):
+            running.append(waiting.pop(0))           # its prefill joins this step
+        batch = engine.pack(running, max_batch_tokens)  # decode tokens + prefill chunks
+        outputs = engine.step(batch)                  # one forward pass for everyone
+        for seq, tok in outputs:
+            seq.append(tok)
+            if seq.finished():
+                engine.free(seq)                      # memory back immediately
+                running.remove(seq)
+```
+
+One wrinkle: a long prefill joining the batch makes that step slow, so every running user's ITL spikes. **Chunked prefill** (Sarathi-Serve, Agrawal et al., 2024) splits long prompts into chunks and mixes one chunk into each step alongside the decodes, bounding step time. Compute-bound prefill chunks and memory-bound decodes also use both resources at once. Engines expose this as "max batched tokens per step": lower smooths ITL and raises TTFT for long prompts.
+
+Failure modes: head-of-line blocking (one 100K-token prompt stalls everyone; route long jobs to their own pool), preemption storms when admission is optimistic about output lengths, and batch-dependent numerics: a different summation order changes logits slightly, so temperature 0 can still vary with who else is in the batch ([batch invariance](/04-language-modeling-and-sampling/#determinism-seeds-batch-invariance)).
+
+## PagedAttention
+
+Continuous batching needs memory that can be handed out and reclaimed flexibly. Earlier systems gave each request one contiguous KV tensor sized for the maximum length, since output length is unknown. That wastes memory three ways: **reserved** slots never filled, **internal fragmentation** when a request stops early, and **external fragmentation** between allocations. The PagedAttention paper (Kwon et al., SOSP 2023) found that only a minority of the KV memory those systems reserved held real token state. Wasted KV memory means a smaller batch and lower throughput.
+
+PagedAttention borrows the operating system's answer: paging. Split the KV cache into fixed-size **blocks** (vLLM's default is 16 tokens). Each sequence has a **block table** mapping its logical blocks to physical blocks anywhere in a pool, allocated only when the next 16 slots are needed. The attention kernel gathers keys and values through the table instead of assuming one contiguous array. vLLM, built on this, reported 2 to 4× the throughput of FasterTransformer and Orca at the same latency; since Orca already batched continuously, much of that gain is the memory management.
+
+```text
+logical (seq A)        block table A       physical KV pool
+[tok 0-15 ]  -------->     0 -> 7    ----> [ blk 7 : A 0-15  ]
+[tok 16-31]  -------->     1 -> 2    ----> [ blk 2 : A 16-31 ]
+[tok 32-37] (partial) ->   2 -> 9    ----> [ blk 9 : A 32-37 + 10 free slots ]
+waste per sequence: at most one partially filled block
+```
+
+```python
+class BlockAllocator:
+    def __init__(self, num_blocks, block_size=16):
+        self.free = list(range(num_blocks))
+        self.block_size = block_size
+        self.ref = [0] * num_blocks              # refcounts enable sharing
+
+    def append_token(self, table, seq_len):
+        if seq_len % self.block_size == 0:       # current block full: need a new one
+            if not self.free:
+                raise MemoryError("preempt or queue")
+            b = self.free.pop(); self.ref[b] = 1; table.append(b)
+
+    def fork(self, table):                       # e.g. parallel samples, shared prefix
+        for b in table: self.ref[b] += 1
+        return list(table)                       # copy-on-write when a shared block changes
+
+    def release(self, table):
+        for b in table:
+            self.ref[b] -= 1
+            if self.ref[b] == 0: self.free.append(b)
+```
+
+The payoff is near-zero waste (at most one partial block per sequence) and, through reference counts, **sharing**: parallel samples, beam candidates, or requests with a common system prompt point at the same physical blocks and copy one only when they diverge. That is the foundation of [prefix caching](#prefix-prompt-caching).
+
+The cost is an indirection in the attention kernel and custom kernels to support it. Operationally, free blocks become the capacity signal: **KV-cache utilization** near 100% with a growing queue means you are memory-bound on capacity, and more compute will not help. Rising preemption counts mean the scheduler is over-admitting.
+
+## FlashAttention
+
+PagedAttention manages where the KV cache lives. FlashAttention (Dao et al., 2022) changes how attention is computed, targeting a different bottleneck: moving the attention matrix through HBM.
+
+Naive attention over N tokens computes the N × N score matrix `S = Q·Kᵀ`, writes it to HBM, reads it back for the softmax, writes the probabilities, and reads them again to multiply by V. At N = 32K, one head's matrix is about a billion entries. The kernel is memory-bound on an intermediate result nobody keeps.
+
+FlashAttention never materializes it. It processes Q, K and V in tiles that fit in on-chip SRAM and keeps a **running softmax**: per query row, the maximum score so far and the running sum of exponentials, rescaling the partial output when a new tile raises the maximum. The result is exact (not an approximation), memory is linear in N, and HBM traffic drops sharply.
+
+```python
+import numpy as np
+
+def attention_tiled(q, K, V, tile=128):
+    """One query row against keys/values processed in tiles (online softmax)."""
+    m, l = -np.inf, 0.0                      # running max, running denominator
+    acc = np.zeros(V.shape[1])
+    for s in range(0, K.shape[0], tile):
+        scores = K[s:s+tile] @ q / np.sqrt(q.shape[0])
+        m_new = max(m, scores.max())
+        scale = np.exp(m - m_new)            # rescale what we accumulated so far
+        p = np.exp(scores - m_new)
+        l = l * scale + p.sum()
+        acc = acc * scale + p @ V[s:s+tile]
+        m = m_new
+    return acc / l
+
+# matches softmax(K q / sqrt(d)) @ V computed the naive way, to float precision
+```
+
+Where it helps: **prefill and training**, where N × N is large. FlashAttention-2 (2023) improved parallelism, FlashAttention-3 (2024) targets Hopper GPUs and FP8. Decode is a different shape (one query against a long cache), and the related idea there is to split the long KV sequence across many thread blocks and combine the partial softmaxes with the same rescaling trick (Flash-Decoding, 2023), so a single long-context request still uses the whole GPU.
+
+It does not change the FLOP count or the KV-cache size: long context still costs quadratic prefill compute and linear decode memory. You rarely choose it directly; the engine picks an attention backend. The production issue is compatibility: a backend that does not support your head size, sliding window or GPU makes the engine fall back silently, which shows up as a TTFT regression after an upgrade. Log the backend at startup.
+
+## Quantization (GPTQ/AWQ/GGUF/fp8)
+
+Decode is bandwidth-bound and memory caps concurrency, so storing numbers in fewer bits attacks both: fewer bytes per weight read per step, and more room for KV cache. Quantization maps high-precision values to a small set of levels plus a scale. The [numeric formats](/09-fine-tuning-in-practice/#numeric-formats) section covers fp32, bf16 and fp16; here is what changes at inference.
+
+### What you can quantize
+
+- **Weights only** (W4A16, W8A16): weights stored in 4 or 8 bits, unpacked to 16-bit inside the matmul kernel. Cuts memory and speeds memory-bound decode. Prefill does not get faster from this, since it is compute-bound and still runs 16-bit math.
+- **Weights and activations** (W8A8 in int8 or fp8): the matmul itself runs in 8-bit on hardware that supports it, so compute-bound prefill also speeds up. Activations have outlier channels that make this harder; SmoothQuant (Xiao et al., 2022) moves the difficulty from activations into weights.
+- **KV cache** (fp8 or int8): halves the cache relative to bf16, so twice the tokens fit. Usually a small quality cost; check it on long-context tasks.
+
+### The methods named in interviews
+
+- **Round-to-nearest with groups**: one scale per group of, say, 128 weights; round each weight to the nearest level. The baseline.
+- **GPTQ** (Frantar et al., 2022): post-training, layer by layer. It quantizes weights one at a time and adjusts the not-yet-quantized ones to compensate, using second-order information from a small calibration set. The paper takes 175B-parameter models to 3 to 4 bits in a few GPU hours.
+- **AWQ** (Lin et al., 2023): a small fraction of weight channels matter most, and you find them from activation magnitudes, not weight magnitudes. It scales those channels up before quantizing so they lose less precision. No backpropagation, less overfitting to the calibration set.
+- **GGUF**: the llama.cpp file format (used by Ollama), not an algorithm. Its schemes are block-based: `Q8_0` stores 32 int8 weights plus one fp16 scale, `(32 + 2) × 8 / 32 = 8.5` bits per weight; `Q4_0` stores 16 bytes plus a 2-byte scale, 4.5 bits. K-quants (`Q4_K_M`, `Q5_K_M`) add super-block scales and mix precisions by layer, landing near 4.5 to 5 bits for the 4-bit variants (approximate, varies by model).
+- **FP8** (E4M3, or E5M2 where range matters): an 8-bit float with hardware support on recent NVIDIA (Hopper, Ada, Blackwell) and other accelerators. With per-channel scales it is usually close to lossless on large models and a common serving default on that hardware.
+- **FP4** (MXFP4, NVFP4): 4-bit floats in small blocks (32 or 16 values) that share a scale, with native tensor-core support on Blackwell-class GPUs. Some open-weight models now ship with their large expert weights already in MXFP4, so "4-bit" no longer always means a post-hoc integer quantization. The same rule applies: eval before you trust it.
+
+```python
+import numpy as np
+
+def quantize_group_int4(w, group=128):
+    """Symmetric 4-bit, one fp16 scale per group. Returns ints, scales."""
+    w = w.reshape(-1, group)
+    scale = np.abs(w).max(axis=1, keepdims=True) / 7.0   # int4 range used: -7..7
+    q = np.clip(np.round(w / scale), -8, 7).astype(np.int8)
+    return q, scale.astype(np.float16)
+
+def dequantize(q, scale):
+    return (q.astype(np.float32) * scale).reshape(-1)
+
+w = np.random.randn(4096 * 128).astype(np.float32)
+q, s = quantize_group_int4(w)
+err = np.abs(dequantize(q, s) - w).mean()
+bits = 4 + 16 / 128          # 4.125 bits per weight including scales
+```
+
+### The trade-off and the trap
+
+Memory arithmetic is easy: Llama 3.3 70B is about 141 GB in bf16, 71 GB in fp8 and around 40 GB at roughly 4.5 bits, which turns "two or more 80 GB GPUs" into "one, with room for cache". Quality is the hard part. 8-bit is usually within noise. 4-bit is usually close on general chat but can lose noticeably on math, code, long-context retrieval and non-English text; small models lose more than large ones, and perplexity hides task-level regressions. The trap is quantizing to fit a GPU, checking perplexity, and shipping. Run your own eval set ([evals methodology](/19-evals-methodology/)) before and after, on the slice you care about (for your projects, Hindi and Hinglish). Second trap: a 4-bit weight-only kernel can be slower than bf16 at large batch, once unpacking overhead shows. Benchmark at real concurrency.
+
+## Speculative decoding
+
+At small batch sizes decode leaves compute idle while it waits on memory. Scoring k tokens in one forward pass costs about the same as one token, because the weights are read once (prefill's trick). Speculative decoding exploits this: guess several tokens cheaply, check them all in one pass of the big model.
+
+The method (Leviathan, Kalman and Matias, 2023; Chen et al., 2023, independently):
+
+1. A cheap **draft** proposes γ tokens (say 4): a small same-family model, extra heads on the target (Medusa, Cai et al., 2024; EAGLE, Li et al., 2024), or n-gram lookup from the prompt (good when outputs copy the input, as in code edits or quoting RAG answers).
+2. The **target** runs one forward pass over all γ positions and gets its own probability for each.
+3. Accept drafts left to right; at the first rejection, sample a replacement from a corrected distribution and drop the rest. If all pass, the same pass yields one bonus token.
+
+The acceptance rule makes the output distribution **identical** to the target's. For a drafted token x with draft probability q(x) and target probability p(x): accept with probability `min(1, p(x) / q(x))`; if rejected, sample from `max(0, p − q)`, renormalized. Under greedy decoding this reduces to "keep the draft while it equals the target's argmax".
+
+```python
+import random
+
+def sample(dist):                              # dist: dict token -> probability
+    return random.choices(list(dist), weights=list(dist.values()))[0]
+
+def verify(drafts, q_probs, p_probs):
+    """drafts: gamma token ids. q_probs[i], p_probs[i]: dict token->prob at
+    position i from draft and target; p_probs has gamma+1 entries."""
+    out = []
+    for i, x in enumerate(drafts):
+        p, q = p_probs[i].get(x, 0.0), q_probs[i][x]
+        if random.random() < min(1.0, p / q):
+            out.append(x)                      # accepted
+            continue
+        resid = {t: max(0.0, p_probs[i].get(t, 0) - q_probs[i].get(t, 0))
+                 for t in p_probs[i]}
+        z = sum(resid.values())
+        out.append(sample({t: v / z for t, v in resid.items()}))
+        return out                             # stop at first rejection
+    out.append(sample(p_probs[len(drafts)]))   # all accepted: bonus token
+    return out
+```
+
+How much faster? If each draft token is accepted with probability α (independently, a simplification), the expected tokens per target pass is `(1 − α^(γ+1)) / (1 − α)`. With α = 0.8 and γ = 4: `(1 − 0.8^5) / 0.2 ≈ 3.4` tokens per pass instead of 1. With α = 0.6 it is about 2.3. Subtract the draft's own cost and the extra verification compute, and real speedups for chat-style decoding are commonly in the 1.5 to 3× range (approximate; acceptance depends heavily on the task and the draft).
+
+The trade-off: it converts spare compute into lower latency. It shines at low batch sizes, where compute is idle. At high load the GPU is busy, rejected drafts are wasted work, and throughput can drop, so engines often disable it above some batch size. The draft also costs memory. Track the **acceptance rate** per traffic type: a draft that works on English chat may accept rarely on Hindi or JSON tool calls, adding cost for no speedup.
+
+## Prefix/prompt caching
+
+Many requests share their opening tokens: a system prompt, tool definitions, few-shot examples, a document under repeated questions, an agent's growing history. Their prefill produces the same keys and values every time. **Prefix caching** keeps those KV blocks and reuses them, so a request prefills only its new suffix; TTFT and prefill compute drop roughly in proportion to the cached fraction.
+
+In a self-hosted engine it builds on paged blocks. Each full block is keyed by a hash of its tokens chained with the previous block's hash, so the key means "these 16 tokens, after exactly this prefix". A new request walks its blocks and reuses them until the first miss. SGLang's RadixAttention (Zheng et al., 2024) keeps prefixes in a radix tree, which suits branching agent workloads. Idle blocks are evicted least-recently-used first.
+
+```python
+import hashlib
+
+def block_hashes(token_ids, block=16):
+    h, out = b"", []
+    for i in range(0, len(token_ids) - len(token_ids) % block, block):
+        h = hashlib.sha256(h + str(token_ids[i:i+block]).encode()).digest()
+        out.append(h)                    # identity depends on everything before it
+    return out
+
+def cached_prefix_tokens(token_ids, cache, block=16):
+    n = 0
+    for h in block_hashes(token_ids, block):
+        if h not in cache:
+            break                        # first miss: everything after is recomputed
+        n += block
+    return n
+```
+
+That chaining explains the one rule that matters to you as an application developer: **the cache only matches an exact prefix**. Put static content first (system prompt, tool schemas, fixed examples), then semi-static (the retrieved documents for a session), then the per-request part last. A timestamp or user name near the top of the system prompt breaks the cache for everything after it. [Cache-aware layout](/27-context-engineering/#cache-aware-layout) develops this for agents.
+
+Hosted providers sell the same idea as **prompt caching**, with vendor-specific rules (approximate, check the current docs): some cache automatically above a minimum prompt length, some need an explicit breakpoint (Anthropic's `cache_control`), prefixes below a model-dependent minimum length are silently not cached, entries expire after minutes unless reused (some providers sell a longer retention), and cached input is billed at a steep discount, often around a tenth of the normal input price, sometimes with a premium to write the cache ([pricing](/11-serving-and-model-economics/#pricing-input-output-cached-thinking)). Arithmetic: a 6,000-token static prefix plus a 500-token suffix, at a 90% discount on cached reads, bills `500 + 6,000 × 0.1 = 1,100` input-token equivalents instead of 6,500, about 83% less once warm.
+
+Two traps. First, measure the **cache hit rate** (cached input tokens ÷ total input tokens) from the API's usage fields; teams assume caching works while a dynamic value in the prefix keeps it near zero. Read the field definitions carefully: in Anthropic's usage block, `input_tokens` counts only the uncached tokens, so total input is `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Treating `input_tokens` as the total understates both the hit-rate denominator and the bill. Second, a cache shared across tenants is a timing side channel: if cached prefixes return faster, an attacker can probe whether someone else sent a prompt. Gu et al. ("Auditing Prompt Caching in Language Model APIs", 2025) detected cross-user cache sharing at several API providers from timing alone. In your own deployment, scope or salt cache keys per tenant.
+
+## Serving parallelism
+
+When a model does not fit on one GPU, or one GPU cannot meet the latency target, you split the work. Training uses the same vocabulary ([parallelism intuition](/06-pretraining-and-scaling/#parallelism-intuition)), but the trade-offs at inference differ because decode is latency-sensitive and small per step.
+
+- **Data parallelism (replicas)**: a full copy per GPU or group behind a load balancer. No cross-replica communication; throughput scales linearly; per-request latency unchanged. The default whenever the model fits.
+- **Tensor parallelism (TP)**: split every weight matrix across GPUs (Megatron-LM style, Shoeybi et al., 2019), so each holds 1/TP of every layer and of the KV heads. Two all-reduces per layer, every decode step. It cuts per-token latency (each GPU reads 1/TP of the weights) but needs NVLink-class interconnect; across servers on ordinary networking it usually hurts.
+- **Pipeline parallelism (PP)**: different layers on different GPUs or nodes. Only boundary activations move, so slow links are fine, but single-request latency does not drop and many requests must be in flight to keep stages busy.
+- **Expert parallelism (EP)**: for [mixture-of-experts](/05-transformer-intuition/#mixture-of-experts), experts on different GPUs with all-to-all routing; load imbalance is the usual problem.
+- **Prefill/decode disaggregation** (DistServe, Zhong et al., 2024; Splitwise, Patel et al., 2024): separate GPU pools per phase, with the KV cache transferred between them. Prefill stops disturbing decode ITL, at the cost of moving the cache.
+
+```text
+70B in bf16 (~141 GB of weights) on 8 GPUs of 80 GB each:
+
+TP=8, 1 replica       every layer split 8 ways; lowest latency; NVLink-bound
+TP=4, 2 replicas      2 independent copies; each copy spans 4 GPUs
+TP=2 (fp8), 4 replicas  weights ~71 GB per copy; most throughput if latency is OK
+```
+
+The arithmetic for choosing: per replica, `KV budget = TP × GPU memory × utilization − weights − overhead`. More replicas with smaller TP give more total throughput, as long as each keeps enough KV room for a useful batch; larger TP gives lower latency per token. KV heads are split by TP too, so a model with 8 KV heads cannot shard them cleanly beyond TP = 8.
+
+Failure modes: a TP group across a slow link, uneven expert load in MoE, and over-sharding a model that would fit on fewer GPUs once quantized. Engine choices are in [engines](/11-serving-and-model-economics/#engines-vllm-sglang-tgi-llama-cpp-ollama).
+
+## Accelerators
+
+Everything above reduces to three numbers per device: **memory capacity** (how big a model and cache fit), **memory bandwidth** (decode speed), and **compute** (prefill speed and how large a batch saturates it). Approximate datasheet figures, to check against the vendor before relying on them:
+
+| Device | Memory | Bandwidth | Dense bf16 compute | Notes |
+|---|---|---|---|---|
+| NVIDIA A100 80GB SXM | 80 GB HBM2e | ~2.0 TB/s | ~312 TFLOP/s | no FP8; still common and cheaper |
+| NVIDIA H100 SXM | 80 GB HBM3 | ~3.35 TB/s | ~990 TFLOP/s | FP8 support; the most widely deployed serving GPU and the reference for this chapter's arithmetic |
+| NVIDIA H200 | 141 GB HBM3e | ~4.8 TB/s | same compute as H100 | more memory and bandwidth for the same compute |
+| NVIDIA B200 (Blackwell) | ~180 GB HBM3e | ~8 TB/s | ~2,200 TFLOP/s | FP8 and FP4; the current generation in new clusters (figures vary by system, check the datasheet) |
+| NVIDIA L4 | 24 GB GDDR6 | ~0.3 TB/s | ~120 TFLOP/s | low power; small models |
+| Consumer GPU (e.g. RTX 4090) | 24 GB GDDR6X | ~1 TB/s | high | local serving of 7B to 30B quantized |
+| Apple M-series (unified memory) | up to hundreds of GB on top-end parts | ~0.1 to 0.8 TB/s by chip | modest | big models fit, decode is slow |
+
+Beyond NVIDIA: Google TPUs, AMD Instinct MI300-class GPUs (large HBM, served with vLLM on ROCm), AWS Inferentia and Trainium, and designs that keep the model in on-chip SRAM across many chips (Groq, Cerebras) to escape the HBM bandwidth wall.
+
+Reading a spec sheet for inference: model bytes ÷ bandwidth is the single-stream decode ceiling; compute ÷ bandwidth is the ridge point (how big a batch before compute matters); capacity − weights is the KV budget. Compute has grown faster than bandwidth across generations, so the ridge keeps rising and batching matters more. The H200 shows the other direction: H100 compute with more bandwidth and memory, so faster decode and bigger batches, but no faster prefill.
+
+The cost formula, developed in [API vs self-hosted](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights): `$ per million output tokens = GPU $/hour ÷ (sustained tokens/s × 3,600) × 1,000,000`. At an assumed $3 per GPU-hour (an illustrative round number; check your cloud's current price page, which varies widely by provider, region and commitment) and 2,000 tokens/s that is about $0.42; at 200 tokens/s (one user, no batching) ten times that. An idle reserved GPU still costs its hourly rate.
+
+## Inference arithmetic worked examples
+
+Put it together. Every number below is either from the model `config.json` files cited earlier or arithmetic shown here; hardware figures are the approximate H100 values (80 GB, 3.35 TB/s, 990 TFLOP/s dense bf16). Real engines land below these ceilings; treat them as upper bounds and sanity checks.
+
+### Example 1: how many users fit? Llama 3.1 8B, one H100, 8K context
+
+- Weights: about 8.0B × 2 bytes ≈ 16 GB.
+- Engine budget at 90% utilization: 72 GB. Minus weights and roughly 4 GB of activations and overhead: about 52 GB for KV.
+- KV per token: 128 KiB. Per 8K sequence: 1 GiB (about 1.07 GB).
+- Concurrency: `52 GB ÷ 1.07 GB ≈ 48` sequences if every one uses its full 8K. Most do not; vLLM allocates blocks as tokens arrive, so with average contexts of 2K the same memory holds roughly four times as many.
+- With fp8 KV cache: 64 KiB per token, about 96 full-length sequences.
+
+### Example 2: decode speed and batching, same setup
+
+Each decode step reads all weights once plus every running sequence's KV cache.
+
+```text
+batch 1,  ctx 2K:  bytes = 16.1 GB + 1 × 0.27 GB  -> ~4.9 ms/step  ->  ~200 tok/s total
+batch 32, ctx 2K:  bytes = 16.1 GB + 32 × 0.27 GB  -> ~7.4 ms/step  -> ~4,300 tok/s total
+batch 64, ctx 2K:  bytes = 16.1 GB + 64 × 0.27 GB  -> ~9.9 ms/step  -> ~6,500 tok/s total
+batch 128, ctx 2K: bytes = 16.1 GB + 128 × 0.27 GB -> ~15 ms/step   -> ~8,500 tok/s total
+(0.27 GB = 2,048 tokens × 128 KiB of KV per sequence)
+```
+
+From 1 to 32 users, throughput rises about 21× while ITL goes from about 5 ms to 7 ms. Beyond that KV reads dominate: from 64 to 128 users, throughput gains about 30% while ITL rises 50%. That knee is where you set the batch limit for a latency SLO. Compute is still not the limit: at batch 128 the intensity is about 128, under the ridge of 300.
+
+### Example 3: prefill and TTFT
+
+A 2,000-token prompt on the 8B model is `2 × 8.0e9 × 2,000 ≈ 3.2e13` FLOPs; at an assumed 50% of peak, `3.2e13 ÷ (0.5 × 990e12) ≈ 65 ms`. A 32K-token RAG prompt is 16 times the linear part plus a growing attention term, on the order of a second, before queueing. That is why trimming context or caching the static prefix is the first TTFT fix.
+
+### Example 4: Llama 3.3 70B, choose a deployment
+
+- bf16 weights, about 141 GB, on TP = 4: `4 × 72 − 141 − 16 ≈ 131 GB` of KV. At 320 KiB per token, about 400K tokens, roughly 49 sequences at 8K.
+- fp8 weights, about 71 GB, on TP = 2: `2 × 72 − 71 − 8 ≈ 65 GB` of KV, about 200K tokens, roughly 24 sequences at 8K.
+- Decode floor for either: each GPU reads about 35 GB of weights per step, `35 GB ÷ 3.35 TB/s ≈ 10.5 ms`, under 100 tokens/s per stream. So two fp8 TP = 2 replicas on four GPUs match one bf16 TP = 4 copy in KV capacity but run two independent batches: more throughput, if the fp8 quality eval passes.
+
+### Example 5: your laptop
+
+Scheme Assistant's local path runs `qwen2.5:3b` through Ollama with `num_ctx` 8192. At 36 KiB per token the 8K cache is about 288 MiB at 16-bit, small next to roughly 2 GB of 4-bit weights (approximate). At around 100 GB/s of memory bandwidth, the single-stream ceiling is about `100 ÷ 2 = 50` tokens/s. On a laptop, bandwidth limits you before capacity does.
+
+```python
+def plan(params_b, bits, kv_per_tok, gpus, gpu_gb=80, bw=3.35e12, ctx=8192):
+    weights = params_b * 1e9 * bits / 8
+    kv_budget = gpus * gpu_gb * 0.9e9 - weights - gpus * 4e9
+    seqs = kv_budget / (kv_per_tok * ctx)
+    decode_floor_ms = weights / gpus / bw * 1000   # TP splits weight reads
+    return round(weights / 1e9), round(seqs), round(decode_floor_ms, 1)
+
+print(plan(8.0, 16, 131072, 1))    # (16, 48, 4.8)
+print(plan(70.6, 8, 327680, 2))    # (71, 24, 10.5)
+print(plan(70.6, 16, 327680, 4))   # (141, 49, 10.5)
+```
+
+<Callout type="tip">
+
+Before any deployment discussion, compute three numbers: weight bytes, KV bytes per token, and weight bytes ÷ bandwidth. They tell you whether it fits, how many users it holds, and the fastest a single stream can go. Everything else is tuning.
+
+</Callout>
+
+<Production>
+
+**Failure modes.** OOM or preemption storms when long-context requests arrive together: cap `max_model_len` per tier, admit conservatively, give very long prompts their own pool. Head-of-line blocking from a huge prefill (chunked prefill). Quality loss from aggressive quantization that perplexity missed: run the task eval, by language and slice, on every quantized build. Silent attention-backend fallback after an upgrade. Low speculative acceptance on some traffic, making it a net cost.
+
+**Cost.** Self-hosted cost per token is `GPU $/hour ÷ (sustained tokens/s × 3,600)`, so utilization is everything: batch 32 instead of 1 cut per-token cost about twentyfold in Example 2. Quantization can halve GPUs per replica. On APIs, cached input is billed at a large discount (check the current price page); cache-friendly layout is often the largest single saving, visible only if you track hit rate.
+
+**Latency.** TTFT is queueing plus prefill; ITL is decode, set by bytes read per step. Bigger batches buy throughput with ITL and TTFT, so pick the operating point from a measured curve against the SLO. Prefix caching, shorter context and chunked prefill fix TTFT; quantization, speculative decoding at low load, and TP fix ITL.
+
+**Observability.** Per request: TTFT, TPOT, max ITL, input, cached and output tokens, queue time, finish reason. Per deployment: output tokens/s, running and waiting requests, KV-cache utilization, preemptions, prefix hit rate, speculative acceptance, MBU/MFU. Alert on p95 TTFT and on queue depth rising while KV utilization sits near 100%.
+
+**Security.** A prefix cache shared across tenants is a timing side channel (Gu et al., 2025): scope or salt cache keys per tenant. Keep engine admin and metrics endpoints off the public network. Treat community quantized checkpoints as third-party code: trusted publishers, verified hashes, safetensors or GGUF, never unknown pickles.
+
+</Production>
+
+<Interview>
+
+<Q q="Explain the KV cache and why it is the memory bottleneck.">
+
+- Past tokens' keys and values never change under causal masking, so compute them once per layer and store them; decode then processes one new token per step.
+- Formula: `2 × layers × kv_heads × head_dim × bytes` per token, times tokens, times concurrent sequences.
+- Number: Llama 3.1 8B (32 layers, 8 KV heads, head_dim 128, bf16) is 128 KiB per token, 1 GiB per 8K sequence, 16 GiB at 128K, the size of its weights.
+- Weights are shared by all users; the cache is per user and grows with context, so it caps batch size and therefore throughput.
+- Mitigations: GQA/MQA, paged allocation, fp8 KV cache, prefix sharing, capping context, sliding-window attention.
+- **The trap:** saying the cache "stores previous outputs" or that it saves memory. It trades memory for compute.
+
+</Q>
+
+<Q q="Why is decode memory-bandwidth-bound?">
+
+- Each decode step processes one token per sequence, so every weight byte read from HBM does about one multiply-add: arithmetic intensity about 1 FLOP per byte in bf16.
+- The GPU needs around 300 FLOPs per byte to be compute-bound (H100: roughly 990 TFLOP/s ÷ 3.35 TB/s).
+- So step time ≈ bytes read ÷ bandwidth: an 8B bf16 model has a floor of about 16 GB ÷ 3.35 TB/s ≈ 4.8 ms, about 200 tokens per second for one stream.
+- Prefill is the opposite: thousands of tokens share each weight read, so it is compute-bound.
+- Fixes follow: batch users to share weight reads, quantize to read fewer bytes, speculative decoding to verify several tokens per read. KV reads stay per-sequence, so long context stays memory-bound.
+- **The trap:** "because the model is big" or "attention is quadratic". Size alone does not make it memory-bound; low intensity per byte does.
+
+</Q>
+
+<Q q="How does continuous batching improve throughput?">
+
+- Static batching runs a fixed group to completion: finished slots idle and new requests wait, hurting throughput and TTFT.
+- Continuous (iteration-level) batching, from Orca (2022), reschedules every step: finished sequences leave and free memory, waiting ones join when KV blocks are free.
+- The batch stays full, so each memory-bound weight read is shared by more tokens.
+- It needs flexible KV memory (PagedAttention) and admission control; chunked prefill keeps new prompts from spiking everyone's ITL.
+- Trade-off: more concurrency raises throughput and per-user ITL and TTFT; set the cap from a measured curve against the SLO.
+- **The trap:** describing dynamic batching of whole requests (wait N ms, then batch) as continuous batching.
+
+</Q>
+
+<Q q="How does speculative decoding speed up generation without changing outputs?">
+
+- Verifying k tokens in one target forward pass costs about the same as generating one, because decode is memory-bound.
+- A cheap drafter (small model, extra heads like Medusa or EAGLE, or n-gram lookup) proposes γ tokens; the target scores all of them in one pass.
+- Accept each draft token with probability `min(1, p/q)`; on rejection sample from the normalized `max(0, p − q)` and stop. This makes the output distribution exactly the target's (Leviathan et al., 2023; Chen et al., 2023). Greedy: keep while drafts match the argmax.
+- Expected tokens per pass: `(1 − α^(γ+1)) / (1 − α)`; α = 0.8, γ = 4 gives about 3.4.
+- Wins at low batch sizes with idle compute; at high load it wastes compute on rejected drafts, so engines turn it off. Track acceptance rate per traffic type.
+- **The trap:** "the small model writes the answer and the big model checks it", implying quality drops to the small model's.
+
+</Q>
+
+<Q q="Design an end-to-end batching system for LLM queries." reported>
+
+- **Scope and SLOs:** interactive traffic (chat: p95 TTFT under about 1 s, p95 ITL under about 50 ms) versus offline traffic (bulk jobs: maximize throughput, deadline in hours). Load: requests per second, input and output length distributions.
+- **Architecture:** gateway (auth, per-tenant limits) → router (by priority, prompt length, and prefix affinity so shared prefixes hit the same replica's cache) → per-replica scheduler and queue → engine with continuous batching, paged KV and chunked prefill → SSE streaming.
+- **Scheduler policy:** admit while free KV blocks cover the prompt plus an output estimate; interactive first; preempt the lowest priority under pressure; cap batched tokens per step for ITL; send very long prompts to their own pool.
+- **Model choices:** fp8 weights and KV after an eval; speculative decoding only in the low-load pool; TP for latency, replicas for throughput; offline jobs fill idle capacity or use a provider batch API.
+- **Evals and guardrails:** quality eval per quantized or speculative config; load tests to find the knee; timeouts; backpressure (429 with retry-after) instead of unbounded queues.
+- **Observability and cost:** TTFT, ITL, queue depth, KV utilization, preemptions, prefix hit rate, goodput; autoscale on queue depth and KV utilization. Cost per million tokens = GPU $/hour ÷ (tokens/s × 3,600) × 10⁶.
+- **Numbers:** 8B on one H100 holds about 48 full 8K sequences; batch 32 gives roughly 4,000 tokens/s at about 7 ms ITL in the ideal.
+- **The trap:** a queue that waits N ms and runs whole requests to completion, with no word on KV memory, prefill interference or SLO classes.
+
+</Q>
+
+<Q q="TTFT doubled after a release, but per-user tokens per second did not change. What do you check?">
+
+- Unchanged ITL with worse TTFT points to queueing or prefill, not decode.
+- Input tokens per request (did retrieval return more context?), prefix-cache hit rate (did a dynamic value move into the static prefix?), queue time and waiting requests, and engine settings (chunked prefill, attention backend).
+- **The trap:** blaming the model or GPU without separating queueing, prefill and decode in the metrics.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** see every curve in this chapter on your own machine. Serve a small model locally, load-test it from 1 to 64 concurrent users, plot TTFT, ITL and throughput, then turn on prefix caching and quantization and record the deltas.
+
+**Where:** Scheme Assistant (`~/scheme-assistant`). It already has a local provider path (`OllamaClient` in `src/app/core/llm.py`) and a long static system prompt, which makes the prefix-caching result meaningful. Put the script in `scripts/loadtest_llm.py`.
+
+**Model and server (offline, no paid API):** with an NVIDIA GPU, vLLM serving `Qwen/Qwen2.5-0.5B-Instruct` or `Qwen2.5-1.5B-Instruct` on localhost. Without one, llama.cpp's `llama-server` with a GGUF build and `--parallel 8`, or Ollama with `OLLAMA_NUM_PARALLEL` set. Laptop curves are smaller but the same shape.
+
+**Steps**
+
+1. Predict first: KV per token from `config.json` (Qwen2.5-0.5B: 24 layers, 2 KV heads, head_dim 64, so 12 KiB at 16-bit) and the single-stream decode ceiling from weight bytes ÷ memory bandwidth.
+2. Write an async load generator (httpx) that streams completions and records every token's arrival time, using `stream_metrics` from this chapter. Use 50 Scheme Assistant-style questions with the real system prompt, `max_tokens` 200, temperature 0.
+3. Run concurrency 1, 2, 4, 8, 16, 32 and 64 for 60 seconds each. Record p50/p95 TTFT, p50/p95 ITL, output tokens/s, and KV utilization and waiting requests from the engine's metrics endpoint.
+4. Plot throughput and p95 ITL against concurrency; mark the knee and the highest concurrency with p95 ITL under 50 ms.
+5. Enable prefix caching (vLLM `--enable-prefix-caching`; llama.cpp reuses each slot's prompt cache), rerun at 1 and 16, record TTFT and hit rate. Then put a timestamp at the top of the system prompt and watch the hit rate collapse.
+6. Quantize (fp8 or AWQ on vLLM; `Q4_K_M` versus `Q8_0` on llama.cpp), rerun at 1 and 16, and compare 30 eval answers (citation accuracy or a judge).
+
+**Definition of done:** `scripts/loadtest_results.md` with the table, two plots, your predictions beside the measured single-stream TPOT (one sentence on the gap), the prefix-cache before and after including the broken case, and the quantization speed and quality deltas. You can explain the knee in two sentences using "memory-bound" and "KV cache".
+
+</ApplyIt>
+
+<YourProject>
+
+- **Scheme Assistant is your concrete prefix-caching story.** In `src/app/core/generate.py` (around line 3035) the editor-on-failure prompt `REPAIR_SYSTEM` is commented "static text first so a provider's prompt cache can reuse it; the per-query material is all in the user message". That is exactly the prefix rule from this chapter; explain it as "a cache only matches an exact prefix, so I ordered static before dynamic".
+- **Scheme Assistant also has the local-inference knobs.** `OllamaClient` in `src/app/core/llm.py` defaults to `qwen2.5:3b` and sets `num_ctx` 8192 at temperature 0 with a JSON-schema `format` (constrained decoding). Use it to walk Example 5: Qwen2.5-3B's KV is 36 KiB per token, so 8K costs about 288 MiB, and on a laptop bandwidth, not memory, caps speed.
+- **Memory Agent uses a provider cache and counts it.** `src/answer.ts` line 95 puts `cache_control: { type: "ephemeral" }` on the static `ANSWER_SYSTEM` block, and `answer.ts` (line 156) sums `cache_read_input_tokens` next to `input_tokens`. Then look closely at `src/agent.ts` line 232: it prices the turn as `input − cacheRead × 0.9`. Anthropic's `input_tokens` already excludes cached tokens, so the right sum is `input + cacheRead × 0.1 + cacheCreation × write premium`; as written the estimate undercounts every warm turn and ignores cache-write cost (`cache_creation_input_tokens` is not recorded). Fixing that formula and adding a hit-rate metric (cacheRead ÷ all input) per turn is a strong, concrete answer to "how do you cut LLM cost, and how do you know it worked?".
+- **Chat Insights reads cache usage but never writes the cache.** `mapUsage` in `backend/src/lc/services/llm/anthropic.js` records `cache_read_input_tokens` and `cache_creation_input_tokens`, but a search of `backend/src` at the pinned commit finds no `cache_control`, so the hint-ladder system prompt is likely re-prefilled every call. That is a cheap, honest fix to name in an interview.
+- **The honest gap:** none of your repos self-hosts a model behind a batching engine or measures TTFT, ITL and throughput under load. Answer Grader and Chat Insights do not stream tokens at all; Memory Agent streams but does not record per-token timing. The Apply it above, done in Scheme Assistant, closes that gap and gives you your own numbers for the system-design question.
+
+</YourProject>

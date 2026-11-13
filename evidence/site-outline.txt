@@ -1,0 +1,450 @@
+# PART I Foundations
+01 What AI Engineering Is
+01.01 Foundation models vs classical ML
+01.02 Three-layer AI stack (app/model/infra)
+01.03 AI eng vs ML eng vs full-stack
+01.04 Probabilistic software: non-determinism as a design constraint
+01.05 Use-case taxonomy (coding, extraction, support, search, automation)
+01.06 Evaluating a use case; setting expectations
+01.07 Demo-to-production gap; milestones; maintenance
+01.08 Build vs buy at the model layer
+02 Text as Numbers: Tokenization
+02.01 Why discrete tokens
+02.02 Chars/bytes/words/subwords
+02.03 BPE step by step
+02.04 WordPiece/Unigram/SentencePiece
+02.05 Byte-level BPE and tiktoken
+02.06 Vocab-size trade-offs
+02.07 Special tokens and chat templates
+02.08 Failure modes (arithmetic, spelling, non-English cost)
+02.09 Token counting and billing
+02.10 Implementing BPE
+03 Embeddings and Vector Space
+03.01 One-hot to dense
+03.02 Distributional hypothesis and word2vec
+03.03 Cosine/dot/L2
+03.04 Contextual vs static
+03.05 Bi-encoders and Sentence-BERT
+03.06 Contrastive training
+03.07 Matryoshka embeddings
+03.08 Multimodal (CLIP-style)
+03.09 Choosing a model (MTEB, dims, cost, latency)
+03.10 Pitfalls (domain shift, anisotropy, version drift)
+04 Language Modeling and Sampling
+04.01 Next-token prediction
+04.02 Logits, softmax
+04.03 Entropy/cross-entropy/perplexity
+04.04 Greedy, temperature, top-k, top-p, min-p
+04.05 Penalties
+04.06 Beam search (and why chat rarely uses it)
+04.07 Log-probs as signal
+04.08 Stop sequences, max tokens, finish reasons
+04.09 Determinism, seeds, batch-invariance
+04.10 Hallucination as a training/sampling property
+04.11 Engineering implications of probabilistic output
+05 Transformer Intuition
+05.01 RNN limits
+05.02 Attention as soft lookup (Q/K/V)
+05.03 Scaled dot-product and multi-head
+05.04 Causal masking
+05.05 Positional encoding (RoPE)
+05.06 MLP, residual stream, layer norm
+05.07 Decoder-only vs encoder-only vs encoder-decoder
+05.08 Parameter and FLOPs accounting
+05.09 Quadratic context cost
+05.10 MQA/GQA, sliding window
+05.11 Mixture-of-Experts
+05.12 SSM and hybrids (brief)
+05.13 Interpretability intuitions
+05.14 Build a tiny GPT
+06 Pretraining, Data and Scaling
+06.01 Objective at scale
+06.02 Web data
+06.03 Filtering, dedup, quality classifiers
+06.04 Data mix
+06.05 Scaling laws (Kaplan, Chinchilla)
+06.06 GPU and compute budgets
+06.07 Parallelism intuition
+06.08 Training instability
+06.09 Base vs chat models
+06.10 Open-weight vs closed landscape
+07 Post-Training and Alignment
+07.01 Why post-train
+07.02 SFT
+07.03 Chat templates
+07.04 Reward models
+07.05 RLHF (PPO) intuition
+07.06 DPO family
+07.07 Constitutional AI / RLAIF
+07.08 RL with verifiable rewards (GRPO)
+07.09 Rejection sampling, best-of-n
+07.10 Safety training and refusals
+07.11 Sycophancy, reward hacking, over-refusal
+07.12 What post-training implies for app builders
+08 Reasoning Models and Test-Time Compute
+08.01 CoT origins
+08.02 Self-consistency and best-of-n
+08.03 Prompted vs trained reasoning (o1/R1 lineage)
+08.04 RL for reasoning
+08.05 Thinking budgets and effort levels
+08.06 Interleaved thinking with tools
+08.07 When reasoning helps vs hurts
+08.08 Prompting reasoning models
+08.09 Faithfulness of visible reasoning
+08.10 Evaluating reasoning models
+09 Fine-Tuning in Practice
+09.01 Prompt vs RAG vs fine-tune decision
+09.02 Training memory math
+09.03 Numeric formats
+09.04 Full vs PEFT
+09.05 LoRA/QLoRA
+09.06 Dataset curation
+09.07 Synthetic data
+09.08 Distillation
+09.09 Cleaning and formatting
+09.10 Hyperparameters and monitoring
+09.11 DPO in practice
+09.12 Model merging
+09.13 Fine-tune vs base evaluation
+09.14 Hosted FT APIs vs self-run
+# PART II Inference and serving economics
+10 Inference Mechanics
+10.01 Prefill vs decode
+10.02 KV cache and memory
+10.03 Compute- vs memory-bound
+10.04 TTFT, TPOT/ITL, throughput
+10.05 Static vs continuous batching
+10.06 PagedAttention
+10.07 FlashAttention
+10.08 Quantization (GPTQ/AWQ/GGUF/fp8)
+10.09 Speculative decoding
+10.10 Prefix/prompt caching
+10.11 Serving parallelism
+10.12 Accelerators
+10.13 Inference arithmetic worked examples
+11 Serving, Model Selection and Economics
+11.01 API vs self-hosted open weights
+11.02 Engines (vLLM, SGLang, TGI, llama.cpp/Ollama)
+11.03 Local and edge
+11.04 Pricing (input/output/cached/thinking)
+11.05 Cost-per-task modelling
+11.06 Model selection workflow
+11.07 Reading benchmarks critically
+11.08 Gateways and multi-provider abstraction
+11.09 Routing and cascades
+11.10 Rate limits, quotas, batch APIs
+11.11 Data residency, confidential inference
+11.12 Deprecation and migration
+# PART III Talking to models
+12 Prompting Fundamentals
+12.01 System/user/assistant anatomy
+12.02 Zero/few-shot ICL
+12.03 Clear instructions
+12.04 Providing context
+12.05 Roles
+12.06 Delimiters/XML
+12.07 Decomposition and chaining
+12.08 CoT prompting
+12.09 Prefill and steering
+12.10 Long-context position effects
+12.11 Iteration workflow
+12.12 Versioning and management
+12.13 Automatic optimization (DSPy)
+12.14 Per-model differences
+13 Structured Output
+13.01 LLM as a typed function
+13.02 JSON mode vs schema-enforced
+13.03 Constrained/grammar decoding
+13.04 Pydantic/Zod validation
+13.05 Retry and repair loops
+13.06 Extraction and classification patterns
+13.07 Schema design (enums, nullables)
+13.08 Streaming partial structures
+13.09 Structured output vs tool calling
+13.10 Evaluating structured output
+14 Multimodal and Realtime Voice
+14.01 Vision inputs (images, screenshots)
+14.02 PDF/document understanding
+14.03 STT/TTS
+14.04 Realtime voice pipelines (cascade vs speech-to-speech)
+14.05 Turn-taking, barge-in, VAD
+14.06 Image generation intuition
+14.07 Multimodal RAG
+14.08 Token costs of images and audio
+14.09 Evaluating multimodal outputs
+# PART IV Retrieval and RAG
+15 Information Retrieval Foundations
+15.01 Queries, documents, relevance
+15.02 Inverted index
+15.03 TF-IDF
+15.04 BM25
+15.05 Analyzers
+15.06 Dense retrieval (DPR)
+15.07 Late interaction (ColBERT)
+15.08 Learned sparse (SPLADE)
+15.09 Hybrid search and RRF
+15.10 Cross-encoder re-ranking
+15.11 Metrics (P@k, R@k, MRR, nDCG)
+15.12 Relevance judgments
+15.13 Query rewriting
+15.14 Metadata filtering and ACLs
+16 Vector Search and Indexing
+16.01 Exact kNN limits
+16.02 IVF, PQ
+16.03 HNSW
+16.04 Recall/latency/memory trade-offs
+16.05 Vector DB vs search engine vs pgvector
+16.06 Updates, deletes, re-embedding
+16.07 Multi-tenancy and filtering
+16.08 Binary/int8 quantization
+16.09 Capacity planning
+16.10 Benchmarking
+17 RAG Pipelines
+17.01 Why RAG
+17.02 Architecture end to end
+17.03 Ingestion and parsing
+17.04 Chunking
+17.05 Contextual enrichment
+17.06 Indexing pipeline
+17.07 Top-k tuning
+17.08 Re-ranking
+17.09 Prompt assembly and citations
+17.10 Grounding/faithfulness
+17.11 "No answer" handling
+17.12 Freshness and incremental updates
+17.13 RAG vs long context vs fine-tuning
+17.14 Optimization checklist
+18 Advanced and Agentic RAG
+18.01 Query decomposition and multi-hop
+18.02 HyDE and expansion
+18.03 Text-to-SQL and query construction
+18.04 GraphRAG
+18.05 Retrieval as a tool (agentic RAG)
+18.06 Deep-research iterative search
+18.07 Web search
+18.08 Code retrieval (grep vs embeddings)
+18.09 Tables and multimodal
+18.10 Caching retrieved context
+18.11 Permission-aware RAG
+18.12 RAG failure taxonomy
+# PART V Evaluation
+19 Evals I: Methodology and Error Analysis
+19.01 Evals as the core loop
+19.02 Model vs system evals
+19.03 Benchmarks and contamination
+19.04 Trace review
+19.05 Open/axial coding of failures
+19.06 Failure taxonomies
+19.07 Building eval sets
+19.08 Synthetic inputs
+19.09 Exact/functional/reference metrics
+19.10 Similarity metrics' limits
+19.11 Human annotation guidelines
+19.12 Criteria: capability, instruction-following, cost, latency
+19.13 Noise, statistics, sample sizes
+19.14 Eval-driven development
+20 Evals II: Judges, RAG/Agent Evals and Continuous Evaluation
+20.01 LLM-as-judge design
+20.02 Pairwise vs pointwise
+20.03 Validating judges (TPR/TNR vs humans)
+20.04 Judge biases
+20.05 Comparative/Elo
+20.06 RAG evals: retrieval vs generation
+20.07 Faithfulness checks
+20.08 Tool-call and structured evals
+20.09 Agent evals: outcome vs trajectory
+20.10 Multi-turn and simulated users
+20.11 Sandboxed environments
+20.12 Eval awareness and gaming
+20.13 Evals in CI
+20.14 Online evals and production sampling
+# PART VI Agents
+21 Tool Use / Function Calling
+21.01 Tools: text to action
+21.02 Call protocol
+21.03 Agent-computer interface design
+21.04 Names, descriptions, examples
+21.05 Granularity and consolidation
+21.06 Result size, format, errors
+21.07 Parallel calls
+21.08 Tool choice modes
+21.09 Built-in server tools
+21.10 Code execution as a meta-tool
+21.11 Tool search for large catalogs
+21.12 Idempotency, retries, side effects
+21.13 Human approval
+21.14 Testing tools
+22 The Agent Loop and Architectures
+22.01 Workflows vs agents
+22.02 The augmented LLM
+22.03 Chaining, routing, parallelization
+22.04 Orchestrator-workers; evaluator-optimizer
+22.05 ReAct loop
+22.06 Stop conditions and budgets
+22.07 State and message history
+22.08 Error recovery
+22.09 Reflection
+22.10 Harness design
+22.11 Long-running agents, checkpointing, resumability
+22.12 Frameworks vs hand-rolled
+22.13 Failure modes
+22.14 Twelve-factor principles
+23 Memory
+23.01 Why stateless models need memory
+23.02 Conversation buffer
+23.03 Summarization and compaction
+23.04 Episodic/semantic/procedural stores
+23.05 Write policies
+23.06 Retrieval and relevance
+23.07 File-system/scratchpad memory
+23.08 Hierarchical (MemGPT)
+23.09 User profiles and personalization
+23.10 Forgetting, staleness, conflicts
+23.11 Privacy
+23.12 Evaluating memory
+24 Planning and Reasoning in Agents
+24.01 Planning vs reacting
+24.02 Plan-then-execute
+24.03 Decomposition and todo lists
+24.04 Tree/graph search
+24.05 Reflexion
+24.06 Replanning
+24.07 Verification
+24.08 Planning with reasoning models
+24.09 Neuro-symbolic
+24.10 Evaluating plans
+25 Multi-Agent Systems
+25.01 When multiple agents help (and don't)
+25.02 Orchestrator/sub-agent
+25.03 Handoffs
+25.04 Parallel sub-agents and context isolation
+25.05 Communication and shared state
+25.06 Debate/critic
+25.07 Token cost
+25.08 Coordination failures
+25.09 Agent teams for long tasks
+25.10 Evaluation
+26 MCP and Agent Protocols
+26.01 The N×M integration problem
+26.02 Host/client/server architecture
+26.03 Transports (stdio, streamable HTTP)
+26.04 Tools, resources, prompts
+26.05 Sampling, roots, elicitation
+26.06 Building a server
+26.07 OAuth for remote MCP
+26.08 Context cost of many servers
+26.09 Code execution with MCP
+26.10 Packaging and distribution
+26.11 Agent Skills
+26.12 A2A
+26.13 Protocol security (tool poisoning, rug pulls, confused deputy)
+26.14 Protocol vs direct API
+27 Context Engineering
+27.01 From prompt to context engineering
+27.02 Context as a finite attention budget
+27.03 Context rot
+27.04 Anatomy of agent context
+27.05 System-prompt altitude
+27.06 Just-in-time retrieval vs preloading
+27.07 Compaction
+27.08 Structured note-taking
+27.09 Sub-agent isolation
+27.10 Tool-result trimming
+27.11 Cache-aware layout
+27.12 Measuring context quality
+28 Coding and Computer-Use Agents
+28.01 Why coding is the flagship domain
+28.02 Agent-computer interfaces
+28.03 Repo navigation
+28.04 Edit formats and patching
+28.05 Test-driven agent loops
+28.06 SWE-bench evaluation
+28.07 Computer use: screenshots and actions
+28.08 Browser agents
+28.09 OSWorld-style evaluation
+28.10 Long-running sessions
+28.11 Permission modes and auto-approval
+28.12 Version control for agent work
+# PART VII Production
+29 Guardrails and Safety
+29.01 Taxonomy (input/output, sync/async)
+29.02 Moderation classifiers
+29.03 PII detection and redaction
+29.04 Scope restriction
+29.05 Output validation and fact-checking
+29.06 Hallucination mitigation
+29.07 Refusals and fallbacks
+29.08 Guardrail latency
+29.09 Human escalation
+29.10 Policies and responsible scaling
+29.11 Bias checks
+29.12 Evaluating guardrails
+30 Observability
+30.01 Why APM isn't enough
+30.02 Traces and spans for LLM calls
+30.03 OpenTelemetry GenAI conventions
+30.04 Logging prompts, completions, tool calls
+30.05 Agent trajectory tracing
+30.06 Quality/latency/cost/error metrics
+30.07 Drift detection
+30.08 Feedback into traces
+30.09 Debugging from traces
+30.10 Incident response and postmortems
+30.11 Log privacy and retention
+30.12 The trace → eval → fix loop
+31 Cost and Latency Engineering
+31.01 Unit economics per task/user
+31.02 Token budget accounting
+31.03 Prompt caching
+31.04 Semantic and exact caching
+31.05 Routing and cascades
+31.06 Small/distilled models
+31.07 Batch APIs
+31.08 Streaming and perceived latency
+31.09 Parallel calls
+31.10 Reasoning-effort tuning
+31.11 Context trimming
+31.12 Agent budgets and runaway control
+31.13 Self-host break-even
+31.14 Dashboards and alerts
+32 Deployment and LLMOps
+32.01 Reference architecture
+32.02 Prompts and config as code
+32.03 Environments and staged rollout
+32.04 A/B tests and shadow traffic
+32.05 Orchestration
+32.06 Async jobs and queues
+32.07 Streaming over SSE/WebSockets
+32.08 Rate limiting and backpressure
+32.09 Fallbacks and failover
+32.10 Managed agent platforms and sandboxes
+32.11 Model upgrade/regression management
+32.12 Data flywheel
+33 Security: Prompt Injection and Agent Security
+33.01 Threat model
+33.02 Direct injection and jailbreaks
+33.03 Indirect injection
+33.04 System-prompt extraction
+33.05 Exfiltration channels (markdown images, links, tools)
+33.06 The lethal trifecta
+33.07 Why classifiers are insufficient
+33.08 Architectural defences (dual-LLM, CaMeL, plan-then-execute)
+33.09 Least-privilege tools and scoped credentials
+33.10 Sandboxing and containment
+33.11 Permission prompts vs autonomous modes
+33.12 MCP and tool supply chain
+33.13 Poisoning and backdoors
+33.14 OWASP LLM Top 10 and red teaming
+34 Product UX for AI and the Feedback Loop
+34.01 Designing for probabilistic output
+34.02 Expectation setting
+34.03 Chat vs embedded vs ambient vs agentic UX
+34.04 Streaming and progress UX
+34.05 Showing sources and uncertainty
+34.06 Approval UX
+34.07 Error and refusal UX
+34.08 Explicit feedback
+34.09 Implicit and conversational feedback
+34.10 Feedback pitfalls
+34.11 Trust, control, reversibility
+34.12 Product metrics vs model metrics

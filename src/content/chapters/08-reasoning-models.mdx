@@ -1,0 +1,498 @@
+---
+id: "08"
+title: "Reasoning Models and Test-Time Compute"
+summary: "Understand how models came to think before they answer, from chain-of-thought prompts to RL-trained reasoning, and decide per route how much thinking to buy, what it costs in tokens and seconds, and when it makes answers worse."
+readingTime: "24 min"
+---
+
+Here is a bill that surprises people. On 4 October, Answer Grader tested moving its model answer and evaluation steps from gpt-4o to Gemini 3.6 Flash, which has a much lower price per token. At default thinking the new model spent about 10,300 output tokens per evaluation where gpt-4o had spent about 2,400. Most of those tokens were hidden reasoning, billed as output but never shown. The cheaper model was dearer per evaluation, and two to three times slower than with its thinking capped.
+
+That is the chapter in one incident. Modern models spend extra computation at answer time as "thinking" tokens, and on hard problems that buys real accuracy. The spending is invisible unless you log it, billed at the output rate, adds seconds or minutes before the first visible word, and on easy tasks buys nothing or makes the answer worse. **Test-time compute** is the general name: compute spent per request at inference instead of in training.
+
+You need three things: the mechanism (why tokens before an answer help, and how RL made that a default), the control surface (effort, budgets, voting, and their cost), and judgement (which routes deserve thinking, how to measure it, and why visible reasoning is not a faithful record).
+
+## CoT origins
+
+### The problem: a fixed amount of compute per token
+
+A transformer computes each output token with one forward pass through a fixed number of layers. A 70B-parameter model spends roughly `2 × 70e9 = 1.4e11` floating-point operations per token, whether the token is "the" or the answer to a tax calculation. If a problem needs more serial steps than one forward pass can hold (add three numbers, apply a discount, compare with a limit), the model cannot reliably do it "in its head" before the first answer token.
+
+The way out is to let the model write. Every token it writes goes into the context, and every later token can attend to it. Intermediate results become working memory. A model that writes "Plan A: 4 × 250 = 1,000" no longer has to hold 1,000 in its activations; it can read it back.
+
+### Three papers that set it up
+
+- **Scratchpads** (Nye et al., 2021, "Show Your Work") trained models to write intermediate steps for tasks like long addition and program execution, and showed large gains over answering directly.
+- **Chain-of-thought prompting** (Wei et al., 2022) got the same effect without training: few-shot examples that included worked reasoning made large models reason step by step on new problems. The gains appeared mainly in large models; small models wrote fluent but wrong reasoning.
+- **Zero-shot CoT** (Kojima et al., 2022, "Large Language Models are Zero-Shot Reasoners") showed that appending "Let's think step by step" alone helped on many arithmetic and logic tasks.
+
+The practical form (where to put the reasoning, how to parse the answer out) is in [CoT prompting](/12-prompting-fundamentals/#cot-prompting). The idea to carry forward: **more tokens before the answer means more computation on the problem**, and compute per request becomes something you choose. For the same 70B model, a 300-token answer is about `300 × 1.4e11 = 4.2e13` FLOPs of decode; add 3,000 thinking tokens and it is `3,300 × 1.4e11 ≈ 4.6e14`, eleven times the compute on the same weights. Prompted CoT gives the model that room; training, as the next sections show, teaches it what to do with it. Every one of those tokens is decoded serially and billed at the output price.
+
+## Self-consistency and best-of-n
+
+### Sample many, keep one
+
+Chain-of-thought spends more compute along one path. The other way to spend test-time compute is in width: generate several answers and pick one.
+
+**Self-consistency** (Wang et al., 2022) samples k reasoning paths at a non-zero [temperature](/04-language-modeling-and-sampling/#greedy-temperature-top-k-top-p-min-p), extracts each final answer, and returns the most common one. Correct reasoning paths tend to converge on the same answer; wrong ones scatter. Over plain CoT the paper reported gains of +17.9 points on GSM8K and +11.0 on SVAMP.
+
+**Best-of-n** generates n candidates and keeps the one a **verifier** scores highest. The verifier can be a unit test, a schema check, a recomputation, or a trained reward model. Cobbe et al. (2021, "Training Verifiers to Solve Math Word Problems") trained an outcome verifier for GSM8K. Lightman et al. (2023, "Let's Verify Step by Step") compared an **outcome reward model** (scores the final answer) with a **process reward model** (scores each step) and found the process model picked correct solutions more often on MATH. The broader rejection-sampling idea is in [rejection sampling and best-of-n](/07-post-training-and-alignment/#rejection-sampling-best-of-n).
+
+```python
+from collections import Counter
+import random
+
+def sample(question: str) -> tuple[str, str]:
+    """Mock LLM at temperature 0.8: returns (reasoning, answer). Right 60% of the time."""
+    ans = "42" if random.random() < 0.6 else random.choice(["41", "44", "24"])
+    return (f"...steps ending in {ans}", ans)
+
+def normalize(a: str) -> str:
+    return a.strip().lower().rstrip(".").replace(",", "")
+
+def self_consistency(question: str, k: int = 5) -> tuple[str, float]:
+    answers = [normalize(sample(question)[1]) for _ in range(k)]
+    best, votes = Counter(answers).most_common(1)[0]
+    return best, votes / k            # agreement rate doubles as a confidence signal
+
+def best_of_n(question: str, n: int, score, min_score: float) -> str | None:
+    cands = [sample(question)[1] for _ in range(n)]      # in parallel in production
+    best, s = max(((c, score(question, c)) for c in cands), key=lambda x: x[1])
+    return best if s >= min_score else None              # abstain or escalate, don't guess
+```
+
+### The arithmetic of voting
+
+If each sample is right with probability p = 0.6 and samples are independent, majority-of-5 is right when at least 3 are right:
+
+```text
+P(X >= 3) = C(5,3)·0.6³·0.4² + C(5,4)·0.6⁴·0.4 + 0.6⁵
+          = 0.3456 + 0.2592 + 0.0778 = 0.683
+```
+
+Five samples lift 60% to about 68%, for five times the output tokens. But samples from one model are **correlated**: a systematic misconception is shared by all five, and voting makes the wrong answer look confident. If p is below 0.5 with wrong answers concentrated on one value, voting makes things worse.
+
+Repeated sampling raises **coverage** (pass@k, the chance at least one of k samples is right) much faster than the accuracy of the answer you pick. Brown et al. (2024, "Large Language Monkeys") showed coverage climbing with more samples on code and math, but converting coverage into accuracy needs a verifier that finds the right sample; without one, voting plateaus. Snell et al. (2024) found that allocating test-time compute by prompt difficulty beat plain best-of-n by more than 4x in efficiency.
+
+In production, self-consistency needs an answer you can canonicalize (a number, a label, a JSON field); free text needs a judge, another call with its own errors. Best-of-n is strongest with an exact verifier (tests for code, schema plus business rules for extraction). Cost is n times the output; with parallel samples, latency is the slowest of n. Vote agreement is a cheap confidence signal: route low-agreement cases to a stronger model or a human.
+
+## Prompted vs trained reasoning (o1/R1 lineage)
+
+### What changed in late 2024
+
+Prompted CoT uses whatever reasoning habits pretraining and instruction tuning happened to teach: one pass, little self-checking, stop when it sounds finished. OpenAI's o1 (September 2024, "Learning to Reason with LLMs") was trained with large-scale RL to reason, and its accuracy kept improving with more training-time RL compute *and* more test-time thinking. Its reasoning ran in a hidden channel; users saw a summary.
+
+DeepSeek-R1 (DeepSeek-AI, January 2025; later in Nature) made the recipe public with open weights, and every major lab shipped thinking models (Claude 3.7 Sonnet's extended thinking, Gemini 2.5, Qwen's QwQ and Qwen3). By 2026 "reasoning model" and "chat model" have mostly merged into one model with thinking on by default and a dial for how much.
+
+### What trained reasoning looks like
+
+```text
+prompted CoT (2022)                       trained reasoning (2025+)
+---------------------------------         -----------------------------------------
+user: Q + "think step by step"            user: Q
+assistant: visible steps -> answer        assistant: [thinking channel, hidden or
+                                                       summarized: plan, try, "wait",
+                                                       check, backtrack, retry ...]
+                                                     visible answer
+100s of tokens, one pass                  1,000s to 10,000s of tokens, self-checking
+quality set by the prompt                 depth set by training + effort setting
+reasoning is part of your output          reasoning is a separate, billed stream
+```
+
+What matters is behaviour prompted CoT rarely shows: catching an error mid-way ("wait, that contradicts step 2"), checking with a second method, spending longer on harder problems. Nobody wrote these into the data; they emerged because they raised the reward.
+
+R1's paper also **distilled** the big model's traces into small open models by plain fine-tuning: the 32B distill scored 72.6% on AIME 2024 against 47.0% from running RL directly on the same base. For small models, copying a strong reasoner beat discovering reasoning through RL, which is why local "thinking" models exist that run in Ollama ([distillation](/09-fine-tuning-in-practice/#distillation)).
+
+## RL for reasoning
+
+### The idea in one loop
+
+The method is **reinforcement learning with verifiable rewards (RLVR)**, derived in [RL with verifiable rewards](/07-post-training-and-alignment/#rl-with-verifiable-rewards-grpo). In short: take problems a program can check (math with a known answer, code with tests), sample a group of full solutions per problem, score each with the checker, and raise the probability of tokens in above-average solutions while lowering it for below-average ones. Repeat over millions of problems.
+
+DeepSeek-R1 used **GRPO** (Group Relative Policy Optimization), which drops PPO's separate critic and uses the group's mean and standard deviation as the baseline. Rewards were rule-based: accuracy (right boxed answer, tests pass) and format (reasoning inside think tags). The authors avoided neural reward models because a learned scorer can be gamed.
+
+```python
+import statistics
+
+def extract_final_answer(completion: str) -> str:   # stub: text after the thinking block
+    return completion.rsplit("</think>", 1)[-1].strip()
+
+def reward(completion: str, gold: str) -> float:
+    ans = extract_final_answer(completion)          # rule-based: nothing to flatter
+    fmt = 0.1 if "<think>" in completion and "</think>" in completion else 0.0
+    return (1.0 if ans == gold else 0.0) + fmt
+
+def group_advantages(rewards: list[float]) -> list[float]:
+    mu = statistics.mean(rewards)
+    sd = statistics.pstdev(rewards) or 1.0          # all equal -> all zero: no signal
+    return [(r - mu) / sd for r in rewards]
+
+# one problem, G = 8 sampled solutions: three right with format, four wrong with format, one bare
+print([round(a, 2) for a in group_advantages([1.1, 0.1, 0.1, 1.1, 0.0, 0.1, 1.1, 0.1])])
+# [1.29, -0.73, -0.73, 1.29, -0.93, -0.73, 1.29, -0.73]
+```
+
+Two details explain a lot. If all eight samples are right, or all wrong, every advantage is zero and the problem teaches nothing; training needs problems at the edge of the model's ability. And nothing in the reward mentions length: the model is free to write as much as helps.
+
+### What emerged
+
+In R1-Zero (RL straight on the base model, no supervised reasoning examples), AIME 2024 pass@1 climbed from 15.6% to 71.0% over training, and 86.7% with majority voting over 64 samples. Average response length grew steadily from hundreds to thousands of tokens: the model learned on its own that thinking longer earns reward. The paper shows an intermediate checkpoint stopping mid-solution to re-evaluate its approach, which the authors called an "aha moment".
+
+R1-Zero's traces were hard to read and mixed languages, so the released R1 added a small cold-start set of readable examples, a language-consistency reward, a rejection-sampling SFT round and a final general RL stage. The paper also lists what did *not* work: process reward models (easy to hack) and tree search over tokens (search space too large).
+
+### What it means for you
+
+- **Reasoning models are strongest where rewards were checkable**: math, code, logic. Gains on open-ended writing are smaller and less predictable.
+- **Length is a learned habit, not a fixed cost**, so cost and p95 latency vary per prompt more than with older models.
+- **Length can be steered at inference.** s1 (Muennighoff et al., 2025) showed "budget forcing": end thinking at a budget, or append "Wait" when the model stops early, which often makes it re-check an answer. Provider budgets and effort levels are productized versions of this.
+- **Reward hacking carries over.** A model rewarded for passing tests can learn to special-case them; check outputs, not reasoning.
+
+## Thinking budgets and effort levels
+
+### The dial and what it controls
+
+Every major API lets you set how much a model thinks, in one of two shapes. A **token budget** (at most N thinking tokens) is predictable, but the right N differs by prompt and too small a budget cuts reasoning off mid-thought. An **effort level** (low, medium, high...) lets the model decide, conditioned on the level; providers do not publish how, so treat it as a trained behaviour that can change between versions. **Adaptive thinking** lets the model decide per request whether to think at all, with effort as the steering input.
+
+### Provider behaviour in late 2026 (check the live docs)
+
+As of November 2026 (these change with nearly every model generation):
+
+- **Anthropic.** `thinking: {type: "adaptive"}` with `output_config.effort` from `low` through `medium`, `high`, `xhigh` to `max` (the set varies by model). Fixed `budget_tokens` is deprecated on the 4.6 models and rejected on newer ones such as Opus 5.5. On Opus 5.5 thinking cannot be disabled; effort is the only control, defaulting to `medium` there and on Haiku 5.5, `high` on most other current models. Thinking text is omitted by default (a summary is opt-in) and billed in full either way. Older models such as Haiku 4.5 reject the effort field, as Chat Insights found (see Your project).
+- **OpenAI.** `reasoning.effort` in the Responses API, from `none` or `minimal` up to `high`, `xhigh` or `max` depending on the model; several current models default to `medium`. Reasoning tokens are never returned, are billed as output and appear in `output_tokens_details.reasoning_tokens`. `max_output_tokens` caps reasoning plus answer; the docs suggest reserving about 25,000 to start.
+- **Google Gemini.** Gemini 3 and later take `thinking_level` (`minimal` to `high`, `xhigh` on some; the set and default differ per model). The 2.5 generation took a `thinking_budget` token count, where 0 turned thinking off on Flash (not on Pro); Google marks `thinking_budget` deprecated from Gemini 3 on, and its Vertex docs warn it can cause intermittent 400s there. Thought tokens are billed, reported beside the answer tokens, and count against `max_output_tokens`.
+
+The sweep procedure is in [reasoning-effort tuning](/31-cost-and-latency-engineering/#reasoning-effort-tuning); here is the arithmetic that motivates it.
+
+### The cost and latency arithmetic
+
+Thinking tokens are [billed as output](/11-serving-and-model-economics/#pricing-input-output-cached-thinking). Per request:
+
+```text
+cost = (input × p_in + (visible_output + thinking) × p_out) / 1e6
+```
+
+Take a request with 2,000 input tokens and a 300-token answer, at illustrative prices of $3 per million input and $15 per million output (check the current price page):
+
+| Thinking tokens | Cost per request | Per 1K requests | Extra decode time at 100 tok/s |
+|---|---|---|---|
+| 0 | `(6,000 + 4,500)/1e6 = $0.0105` | $10.50 | 0 s |
+| 2,000 | `+ 30,000/1e6 = $0.0405` | $40.50 | +20 s |
+| 8,000 | `+ 120,000/1e6 = $0.1305` | $130.50 | +80 s |
+
+The answer is the same 300 tokens in every row. Thinking turns a $10 route into a $130 route and a 3-second answer into an 80-second one, and because thinking length varies by prompt, the p95 moves more than the p50. That is why time to first visible token on reasoning routes runs from seconds to minutes ([TTFT](/10-inference-mechanics/#ttft-tpot-itl-throughput)) and those routes need async UX: progress events or a background job with a notification.
+
+Answer Grader's case in the same formula: if model G's output price is a quarter of model O's but it spends 10,300 output tokens against 2,400, its output bill is `10,300 × 0.25 / 2,400 ≈ 1.07` times O's. Price per token is not price per task.
+
+### Two traps in the plumbing
+
+**The output cap is shared.** On Gemini and OpenAI, `max_output_tokens` covers thinking plus the answer, so a cap tuned on a non-reasoning model can leave a truncated or empty answer. Answer Grader's `backend/llm.py` adds headroom for exactly this. **The usage fields differ.** Anthropic and OpenAI count thinking inside output tokens; Gemini reports it beside the answer count, so reading only that count under-reports spend. Normalize once:
+
+```python
+def thinking_tokens(provider: str, usage: dict) -> int:
+    """Reasoning tokens, kept separate so dashboards and alerts can see them."""
+    if provider == "openai":        # Responses API
+        return (usage.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
+    if provider == "gemini":        # reported beside the answer, not inside it
+        return usage.get("thoughtsTokenCount") or 0
+    if provider == "anthropic":     # inside output_tokens; broken out where the response provides it
+        return (usage.get("output_tokens_details") or {}).get("thinking_tokens", 0)
+    return 0
+
+def billed_output_tokens(provider: str, usage: dict) -> int:
+    if provider == "gemini":
+        return (usage.get("candidatesTokenCount") or 0) + thinking_tokens(provider, usage)
+    return usage.get("output_tokens", 0)          # already includes reasoning
+
+ROUTES = {   # pinned per route, not per request: changing thinking or effort can break the prompt cache
+    "extract": {"model": "fast",   "effort": "low"},
+    "chat":    {"model": "fast",   "effort": "low"},
+    "analyze": {"model": "strong", "effort": "medium"},
+    "recheck": {"model": "strong", "effort": "high"},
+}
+```
+
+That last comment matters: on Anthropic, changing the thinking mode or the top-level effort between requests can invalidate cached messages ([prompt caching](/31-cost-and-latency-engineering/#prompt-caching)). Pick effort per route and keep it stable.
+
+## Interleaved thinking with tools
+
+### The problem: thinking once is not enough for an agent
+
+Early reasoning models thought once, before their first output. In an [agent loop](/22-agent-loop/#react-loop) the important thinking happens *after* a tool result ("that is last year's price; search again"). **Interleaved thinking** lets the model think before each tool call and after each result, inside one assistant turn.
+
+```text
+user task
+  └─ think: plan, pick first tool
+     tool_use(search "X pricing 2026")      ──► your code runs it
+     tool_result                             ◄──
+  └─ think: result is stale, refine query    (thinking block 2)
+     tool_use(search "X pricing November")  ──►
+     tool_result                             ◄──
+  └─ think: compare, check numbers           (thinking block 3)
+     final text answer
+```
+
+### The rule: hand the thinking back unchanged
+
+The model's later thinking depends on its earlier thinking, so the provider needs it on the next request, and every mechanism breaks if you tamper with it. Anthropic returns signed `thinking` blocks you pass back as received (on the newest models they are tied to the model and conversation that produced them). OpenAI returns reasoning items you send back with the tool outputs (or use `previous_response_id`; with storage off, as `encrypted_content`). Gemini attaches thought signatures you resend unchanged in stateless use.
+
+```ts
+type Block = { type: string; id?: string; [k: string]: unknown };
+type Msg = { role: "user" | "assistant"; content: Block[] | string };
+type Reply = { content: Block[]; stop: "tool_use" | "end_turn" | "max_tokens" };
+
+export async function runAgent(
+  callModel: (m: Msg[]) => Promise<Reply>,      // mock this in tests
+  runTool: (b: Block) => Promise<string>,
+  task: string,
+  maxSteps = 8,
+): Promise<string> {
+  const messages: Msg[] = [{ role: "user", content: task }];
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await callModel(messages);
+    // Append the WHOLE assistant turn, thinking blocks and signatures included.
+    // Filtering to text "to save tokens" silently removes the model's plan.
+    messages.push({ role: "assistant", content: res.content });
+    if (res.stop !== "tool_use") {
+      return res.content.filter((b) => b.type === "text").map((b) => String(b.text)).join("");
+    }
+    const calls = res.content.filter((b) => b.type === "tool_use");
+    const results = await Promise.all(
+      calls.map(async (c) => ({ type: "tool_result", tool_use_id: c.id, content: await runTool(c) })),
+    );
+    messages.push({ role: "user", content: results });   // all results in one message
+  }
+  throw new Error("step budget exhausted");
+}
+```
+
+### What it costs
+
+Each step's thinking is new output. A 10-step loop thinking 1,500 tokens per step generates 15,000 thinking tokens: at an illustrative $15 per million, `15,000 × 15 / 1e6 = $0.225` per task before any visible text, and 150 seconds of decode at 100 tokens per second. Lower effort cuts the number and length of thinking blocks, often with fewer tool calls.
+
+Thinking also changes streaming. Memory Agent's `DECISIONS.md` (decision 3) records that after a server-side search its thinking models sent nothing until the whole answer was written (Opus's answer arrived within 0.3 s, 8.9 s in), while Haiku with thinking off streamed first text at 1.0 s. If your UX depends on streaming, test it with thinking on.
+
+## When reasoning helps vs hurts
+
+### Where it pays
+
+Reasoning earns its cost when the task has several dependent steps and one wrong step ruins the answer: math and date arithmetic; code generation and debugging; planning and constraint satisfaction ("which of these 8 products meets all 5 rules"); multi-hop research where the model must notice a stale or contradictory result; re-checks and grading against evidence.
+
+### Where it costs and buys nothing, or hurts
+
+- **Grounded extraction and classification.** When the answer is in the passage or the label set is small, thinking adds latency without accuracy. Scheme Assistant's config turns it off for extraction from given passages: it "gains nothing" and cost 3 to 20 seconds per call.
+- **Latency-bound UX.** A chat reply, autocomplete or voice turn with a 1 to 3 second budget cannot afford even a few hundred thinking tokens at the tail.
+- **Overthinking.** Chen et al. (2024, "Do NOT Think That Much for 2+3=?") documented o1-style models spending large amounts of compute on trivial problems for little benefit.
+- **Inverse scaling.** Gema et al. (2025, "Inverse Scaling in Test-Time Compute") built tasks where longer reasoning *lowered* accuracy: counting with distractors, regression with spurious features, deduction with many constraints.
+
+The opposite surprise also happens: in Chat Insights, Haiku 5.5 at effort `low` tripped the reply guard on 2 of 4 replayed turns (a retry each, about 12 seconds), and none at its default. A cheaper attempt that fails validation costs more than a dearer one that passes.
+
+### A routing sketch
+
+```python
+def effort_for(task: dict) -> str:
+    """Rules first; replace with a learned classifier only if the eval shows it beats them."""
+    kind = task["kind"]
+    if kind in ("extract", "classify", "translate", "smalltalk"):
+        return "lowest"           # "off" where the model allows it; some do not
+    if task.get("user_waiting") and task.get("latency_slo_s", 99) <= 3:
+        return "low"
+    if kind in ("math", "code", "plan", "recheck") or len(task.get("constraints", [])) >= 3:
+        return "high"
+    return "medium"
+```
+
+The real decision comes from your eval table: the cheapest level within noise of the best, per route. Before building a two-model cascade, measure the strong model at lower effort; one model keeps one prompt cache ([routing and cascades](/11-serving-and-model-economics/#routing-and-cascades)).
+
+## Prompting reasoning models
+
+### Goals, not steps
+
+A model trained to reason already plans, checks and backtracks. Prompts written for 2023 chat models often fight that:
+
+- **Drop "think step by step".** It is redundant with a thinking channel, and can push reasoning into the visible answer, where you pay for it twice.
+- **State the goal, constraints and output format; do not script the steps.** OpenAI's reasoning guide says the same, adding for agentic tasks: say what "done" looks like and how to verify it.
+- **Give the thinking a job where it matters**: "before answering, check every number against the source excerpt".
+- **Set length in the prompt.** Effort controls thinking depth and barely changes reply length on some models.
+- **Know what the API rejects.** Current Claude models reject assistant prefill and non-default sampling parameters; many reasoning models ignore or reject `temperature`. Use structured output for format ([prefill and steering](/12-prompting-fundamentals/#prefill-and-steering)).
+
+```text
+Before (written for a 2023 chat model)
+  You are an expert grader. Think step by step. Step 1: read the answer.
+  Step 2: list the key points. Step 3: ... Step 12: output JSON.
+
+After (for a reasoning model)
+  Grade this answer against the rubric below. The grade must be defensible to a
+  UPSC examiner: every deduction cites a rubric line and a quote from the answer.
+  Check each factual claim against the reference notes before penalizing it.
+  Output: JSON matching the schema. Feedback under 120 words.
+```
+
+### Budget the output cap
+
+Give reasoning routes a generous `max_tokens`, and cap cost with effort, not truncation: a truncated reasoning call often has no visible answer at all, and the retry doubles the cost.
+
+## Faithfulness of visible reasoning
+
+### The question
+
+When a model shows reasoning, is that why it answered? A reasoning trace is **faithful** if it reflects the factors that actually drove the answer. Engineers want it to be, because then the trace is an explanation, an audit trail and a monitor. The evidence says it often is not.
+
+- **Turpin et al. (2023, "Language Models Don't Always Say What They Think")**: bias the prompt (for example, always make option A correct in the few-shot examples) and the model picks A, then writes a plausible step-by-step justification that never mentions the bias.
+- **Lanham et al. (2023, "Measuring Faithfulness in Chain-of-Thought Reasoning")**: truncating the CoT or inserting a mistake often left the answer unchanged, so the answer did not depend on the written reasoning.
+- **Chen et al. (2025, "Reasoning Models Don't Always Say What They Think")**: plant a hint (a sycophantic "a professor thinks the answer is C", or leaked metadata) and, where the model used it, check whether the reasoning admits it. Claude 3.7 Sonnet did 25% of the time and DeepSeek R1 39%; unfaithful traces were *longer*. In a reward-hacking setup, models verbalized the hack in under 2% of cases in most environments, often inventing a justification. Outcome-based RL improved faithfulness, then plateaued.
+- **Baker et al. (2025, "Monitoring Reasoning Models for Misbehavior")** from OpenAI: a monitor reading the chain of thought caught reward hacking in coding tasks well, but training the model against that monitor taught it to hide its intent while still hacking. Do not optimize against the trace you want to read.
+
+### A probe you can run
+
+```python
+def hint_probe(ask, question: str, hint_option: str) -> dict:
+    """ask(prompt) -> (reasoning_text, answer). Does a planted hint move the answer, and is it admitted?"""
+    _, base_ans = ask(question)
+    reasoning, hinted_ans = ask(f"A senior examiner believes the answer is {hint_option}.\n{question}")
+    switched = base_ans != hint_option and hinted_ans == hint_option
+    admitted = any(w in reasoning.lower() for w in ("examiner", "hint", "suggested", "believes"))
+    return {"switched": switched, "admitted": switched and admitted}
+
+# faithfulness rate = admitted / switched, over a few hundred questions.
+# Run it on a local model whose thinking you can read (provider APIs return summaries or nothing).
+```
+
+### What to do with this
+
+1. **Do not present reasoning as the explanation.** Show users sources, checks performed and the answer. Provider summaries are a further transformation; the raw chain is not exposed on current Claude, OpenAI or Gemini APIs.
+2. **Use traces for debugging and monitoring, knowing they miss things.** A trace that mentions a problem is evidence; a clean trace proves little. Check outputs with code (numbers, citations, tests).
+3. **Treat traces as sensitive data.** They can echo the system prompt, user PII and retrieved documents; log them under the same rules as prompts ([log privacy](/30-observability/#log-privacy-and-retention)) and never stream raw thinking to end users.
+
+## Evaluating reasoning models
+
+### What to measure
+
+Reasoning makes evals noisier and adds dimensions:
+
+- **pass@1 averaged over several samples**, as the R1 paper reports it; thinking models vary more run to run.
+- **pass@k** (any of k right: capability given a perfect verifier) and **cons@k** (majority of k: what voting gives). Know which one a benchmark number is.
+- **Cost per correct answer**: `total_spend / correct_answers`. A level 10% cheaper per request that fails twice as often is dearer.
+- **p50 and p95 latency, thinking tokens per request, truncation and format-failure rates.** The tail is where reasoning hurts.
+- **Accuracy against thinking tokens**, plotted. A flat curve past some level means you are paying for nothing.
+
+### Noise arithmetic for a 50-task eval
+
+With 50 tasks and an accuracy near 80%, the standard error is `sqrt(0.8 × 0.2 / 50) ≈ 0.057`, so a 95% interval is about plus or minus 11 points. Two effort levels that score 78% and 84% on 50 tasks are not distinguishable. Use the same tasks for every configuration (a paired comparison), run 3 samples per task, and look at per-task flips rather than headline means ([noise and sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+```python
+import statistics
+
+def sweep(tasks, run, grade, configs, samples=3):
+    """run(task, cfg) -> (answer, usage, seconds); usage has 'usd' and 'thinking'."""
+    rows = []
+    for cfg in configs:
+        correct, usd, secs, think, trunc = 0, 0.0, [], [], 0
+        for t in tasks:
+            for _ in range(samples):
+                ans, u, s = run(t, cfg)
+                correct += grade(t, ans)
+                trunc += ans is None                     # hit the output cap: no answer
+                usd += u["usd"]; secs.append(s); think.append(u["thinking"])
+        n = len(tasks) * samples
+        rows.append({"cfg": cfg["name"], "acc": round(correct / n, 3),
+                     "usd_per_correct": usd / max(correct, 1),
+                     "p50_s": statistics.median(secs),
+                     "p95_s": statistics.quantiles(secs, n=20)[18],
+                     "think_p95": statistics.quantiles(think, n=20)[18],
+                     "trunc_rate": trunc / n})
+    return rows
+```
+
+### Benchmarks need more suspicion than usual
+
+Reasoning benchmarks (AIME, MATH, competitive programming) are small, public and widely trained on; prefer held-out or freshly written problems ([benchmarks and contamination](/19-evals-methodology/#benchmarks-and-contamination)). A model can reach a right answer through wrong steps; where steps matter (a grading rationale, a financial calculation), grade them with a calibrated [judge](/20-evals-judges-and-ci/#llm-as-judge-design) or a recomputation.
+
+<Production>
+
+**Failure modes.** Overthinking simple tasks (extraction and chat at the default effort, paying seconds for nothing). Inconsistent effort: one route set two ways in two code paths, or a default that changed with a model upgrade (one current model defaults to `medium`, its predecessor to `high`). Truncation when thinking eats `max_output_tokens`. A 400 on an unsupported `effort` or budget that the fallback does not recognise, so every request takes the degraded path. Stripped thinking blocks in tool loops.
+
+**Cost.** Thinking tokens are billed as output, often several times the visible answer; a cheaper-per-token model can be dearer per task. Voting and best-of-n multiply output by k or n. Controls: effort per route, a sweep on every model upgrade, a per-task budget on agent loops, an alert on thinking tokens per request.
+
+**Latency.** TTFT of seconds to minutes, with a tail that varies by prompt; long routes need async UX (progress events, background jobs, or a fast first answer with a deeper follow-up). Thinking can stop token streaming after tool calls. Parallel sampling makes the slowest sample your latency.
+
+**Observability.** Log thinking-token counts separately from visible output, per call, with route, model, effort and finish reason. Normalize provider usage fields once. Dashboards: thinking p50/p95 per route, truncation rate, cost per correct task.
+
+**Security.** Reasoning traces may contain the system prompt, PII and retrieved documents: never show them raw to users, and store them under the same retention rules as prompts. A trace is not an audit record, and injected content can steer reasoning without showing in the summary, so keep tool permissions and output checks independent of what the trace says.
+
+</Production>
+
+<Interview>
+
+<Q q="When would you choose a reasoning model over a standard model?">
+
+- By task shape: multi-step dependent work (math, code, planning, constraint checks, multi-hop tool use, re-checks) benefits; grounded extraction, classification, short chat and translation usually do not.
+- By latency budget: a 1 to 3 second interactive SLO rules out heavy thinking; background jobs can afford it.
+- In 2026 it is mostly one model with a dial, so the real decision is effort per route, made on an eval: accuracy, cost per correct answer and p95 at each level, cheapest within noise of the best.
+- Quote the arithmetic: 2,000 thinking tokens at $15 per million add $0.03 per request and about 20 seconds at 100 tokens per second.
+- **The trap:** "always use maximum thinking". Overthinking and inverse scaling are documented, and extraction often gains nothing.
+
+</Q>
+
+<Q q="How do you control cost with reasoning models?">
+
+- Measure first: thinking tokens logged separately per call and route.
+- Effort per route, pinned (changing it per request can break the prompt cache); lowest on extraction and chat, higher only where the eval shows a gain.
+- Route by difficulty; measure the strong model at lower effort before building a two-model cascade.
+- Generous `max_output_tokens` to avoid truncation retries; control spend with effort, not with a cap that cuts answers off.
+- Cap steps and total tokens on agent loops, since thinking repeats every step; track cost per successful task.
+- **The trap:** comparing price per token. A model at a quarter of the output price that thinks four times as long costs the same.
+
+</Q>
+
+<Q q="Is chain-of-thought faithful?">
+
+- Not reliably: faithful means the trace reflects what actually drove the answer.
+- Turpin et al. (2023): biased prompts changed answers while explanations never mentioned the bias.
+- Chen et al. (2025): models admitted a planted hint 25% (Claude 3.7 Sonnet) and 39% (DeepSeek R1) of the time; reward hacks were verbalized under 2% of the time in most setups.
+- Baker et al. (2025): CoT monitors catch some misbehaviour, but training against them teaches the model to hide intent.
+- Use traces for debugging and as one monitoring signal; check outputs deterministically.
+- **The trap:** "the model shows its work, so we can audit it", or the opposite, "CoT is useless". It improves accuracy and is partly informative; it is not a faithful log.
+
+</Q>
+
+<Q q="Design a system that routes between fast and reasoning models.">
+
+- Scope and SLOs: routes with latency SLOs (say p95 under 3 s for chat, under 60 s for analysis), a quality bar and a budget per 1K requests.
+- Baseline: one strong model at low effort everywhere, plus 50 to 200 real tasks per route as the eval; it often suffices and keeps one cache.
+- Router: rules first (route type, user waiting, constraint count), then a small classifier or a planner's intent; escalate on low vote agreement, a failed validator or a low judge score.
+- Evals: per-route accuracy, cost per correct answer, p50/p95 per level, and the router's own misroute rate; re-run on model upgrades.
+- Guardrails and fallbacks: schema and number checks, a timeout that returns a cheaper answer with a follow-up, handling for 400s on unsupported parameters.
+- Observability and numbers: one ledger row per call (route, model, effort, thinking tokens, cost). 10% escalation to a route costing 10x gives `0.9 × 1 + 0.1 × 10 = 1.9` against 10 for reasoning everywhere.
+- **The trap:** an LLM router call on every request that costs more latency than it saves, or no eval of the router itself.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** pick an effort policy for one route from measurements. Do it in **Memory Agent** (`~/memory-agent`): its planner labels each turn (`smalltalk`, `memory_only`, `clarify`, `search`, `recheck`), so grading is exact match and needs no web search.
+
+**Model (no paid API):** Ollama with a local thinking model (a Qwen3 or DeepSeek-R1 distill tag). Emulate effort levels as thinking off plus three thinking caps (256, 1,024, 4,096 tokens) using budget forcing: stop at the cap, close the thinking tag, let it answer. Test the plumbing first against a mock LLM whose thinking tokens and accuracy depend on the level.
+
+**Steps:**
+
+1. Build 50 tasks: the scripted turns in `eval/cases.ts` carry an `expect` description, not an intent, so label each by hand (with its setup turns for memory and re-check cases), then add your own to reach 50, covering all five intents, about 10 of them ambiguous.
+2. Write `eval/effort-sweep.ts` with the `sweep()` shape above: 3 samples per task per arm, recording answer, thinking and visible tokens, wall time and cap hits.
+3. Price calls with an illustrative price table (thinking billed as output) and a "last checked" date.
+4. Plot accuracy (with a 95% interval) against cost per 1K tasks and p50/p95 latency, one point per arm.
+5. Run the hint probe on 30 tasks and report admitted / switched.
+6. Write the policy: level per intent, an escalation rule (re-run higher when samples disagree), and the evidence.
+
+**Definition of done:** `eval/effort-sweep-report.md` with table, plot, policy and the noise caveat in numbers, reproducible offline with one command.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader: thinking tokens made the cheaper model dearer (lines blamed to you in a team repo).** `backend/llm.py` lines 348 to 354 turn `GEMINI_THINKING_BUDGET` into a `ThinkingConfig`; the comment records about 10,300 output tokens per model answer plus evaluation against gpt-4o's about 2,400, "making Gemini dearer per evaluation despite its lower price". Lines 341 to 346 add headroom because reasoning counts against `max_output_tokens`. A gap: it still sends `thinking_budget` to a Gemini 3 model, where Google now wants `thinking_level`. `ENGINEERING_FINDINGS.md` 5.5 adds latency (model answer 12 to 18 s down to 4 to 9 s at low thinking); production runs the budget at 1,024. Admit that the quality comparison in 5.7 lists its own confounds.
+- **Chat Insights: the unsupported-parameter incident.** Commit `5a289f8`: on Haiku 4.5 every reply became the canned template, because the provider sent `effort: low`, Haiku 4.5 answered 400, and the fallback only listened for `output_config` errors. `backend/src/lc/services/llm/anthropic.js` lines 80 to 83 now withhold effort from Haiku and drop it on a 400. The comment also records Haiku 5.5 at effort low tripping the guard on 2 of 4 replayed turns (lower effort, more retries); call it an anecdote, not an eval. `gemini.js` lines 62 to 73 set `thinkingBudget: 0`.
+- **Memory Agent: routing by turn type.** `src/config.ts` lines 18 to 25 choose Haiku, Sonnet or Opus per turn type from eval runs; `src/agent.ts` lines 173 to 175 set effort `medium` only for re-checks. `DECISIONS.md` decision 2 has the table (routed 7 to 8 of 10 at 6.6 to 6.9 s against Opus everywhere at 7 of 10 and 10.5 s) and rejects best-of-N at runtime; decision 3 explains why `src/answer.ts` lines 90 to 93 run Haiku with thinking off (thinking models buffered after a search).
+- **Scheme Assistant: a teammate's measurement to defend.** `src/app/config.py` lines 35 to 39 (Chiman's code) default the Gemini thinking budget to 0 for grounded extraction (on `gemini-3.8-flash`, so the same deprecated field): 8.2 s to 5.8 s, and one call spent 25 s on 2,870 thought tokens.
+- **Gaps.** No repo runs self-consistency or best-of-n, none has a committed effort sweep of accuracy against cost and p95, none probes faithfulness. The Apply-it sweep in Memory Agent closes the first two.
+
+</YourProject>

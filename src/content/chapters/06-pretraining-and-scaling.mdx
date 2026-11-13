@@ -1,0 +1,293 @@
+---
+id: "06"
+title: "Pretraining, Data and Scaling"
+summary: "Know where a model's knowledge comes from and what it cost: the pretraining objective, how web data is filtered and deduplicated, training compute as 6·N·D, Kaplan versus Chinchilla, and why that explains knowledge cutoffs, strong small models and misleading benchmark scores."
+readingTime: "16 min"
+---
+
+You will never pretrain a frontier model. Llama 3 405B took about 3.8 × 10^25 FLOPs on up to 16,384 H100 GPUs. So why a chapter on it?
+
+Because many odd things you see in production trace back to pretraining. The model is confidently wrong about this year's figures: its facts were fixed when its data was collected. A 3B model beats much bigger models from two years ago: it saw far more tokens per parameter than older scaling advice suggested. A model scores 90% on a public benchmark and 60% on your eval: it may have seen the benchmark. And "can we fine-tune our documents into it?" has an answer only once you know how knowledge gets in at all.
+
+This chapter is literacy. Leave able to do the compute arithmetic on a napkin, name the data pipeline stages, explain Kaplan versus Chinchilla in two sentences, and turn them into product decisions.
+
+## Objective at scale
+
+Pretraining is the next-token game from [chapter 04](/04-language-modeling-and-sampling/#next-token-prediction), played trillions of times. At every position of every document the model predicts a distribution over the next token, and the loss is the [cross-entropy](/04-language-modeling-and-sampling/#entropy-cross-entropy-perplexity) of the token that actually came next.
+
+```python
+for step, batch in enumerate(token_stream):      # batch: [B, T+1] token ids
+    inputs, targets = batch[:, :-1], batch[:, 1:]
+    logits = model(inputs)                        # [B, T, vocab]
+    loss = cross_entropy(logits, targets)         # mean over B*T positions
+    loss.backward()
+    clip_grad_norm(model, 1.0)                    # see "Training instability"
+    optimizer.step(lr=schedule(step)); optimizer.zero_grad()
+```
+
+No labels to buy: every token is a training example, which is why the method scales to the whole web. To predict the next token of a court order or a Python file, the model has to absorb facts, grammar and code structure. All of that is a side effect of lowering one number. Two consequences for you:
+
+- **It rewards plausibility, not truth.** A fact seen once is barely learned, but some token must still come next: the root of [hallucination](/04-language-modeling-and-sampling/#hallucination-as-a-training-sampling-property).
+- **Knowledge freezes at the data cutoff.** The weights are a lossy picture of the corpus on the day it was collected. The last months before the cutoff are thin, because the web has not finished writing about them.
+
+## Web data
+
+Most of every pretraining corpus comes from **Common Crawl**, a non-profit that publishes regular snapshots of billions of web pages as raw HTML (WARC) and crude extracted text (WET). Serious pipelines re-extract text from the HTML, because menus and cookie banners in WET hurt quality. Labs add higher-value sources: code repositories, Wikipedia, books, arXiv and PubMed papers, maths pages found by classifiers, and multilingual web text.
+
+The scale: FineWeb (Penedo et al. 2024), an open dataset, holds about 15 trillion tokens from 96 Common Crawl snapshots. Llama 3 trained on 15.6T tokens, Qwen2.5 on 18T.
+
+Three properties reach your product:
+
+- **Freshness lags.** The cutoff is the last crawl used, and coverage of the final months is thin.
+- **Language skew.** English dominates. Hindi gets a small share of tokens, so knowledge and fluency are thinner, on top of the [token cost](/02-tokenization/#failure-modes-arithmetic-spelling-non-english-cost) of non-Latin scripts.
+- **Provenance is murky.** Crawled text carries copyright, personal data and planted content; licences, robots.txt opt-outs and lawsuits shape what labs use and disclose.
+
+## Filtering, dedup, quality classifiers
+
+Raw crawl is mostly junk: spam, SEO pages, templates, machine-generated text. Every lab runs a pipeline roughly like this:
+
+```text
+WARC → text extraction → URL blocklists (adult, PII-heavy)
+     → language ID (fastText) → heuristic filters
+     → dedup: URL → exact hash → MinHash near-dup → repeated lines
+     → model-based quality score (keep top X%)
+     → decontaminate against benchmarks (n-gram overlap) → tokenize
+```
+
+**Heuristic filters** are cheap rules. The Gopher paper (Rae et al. 2021) published a well-known set: keep documents of 50 to 100,000 words with a mean word length of 3 to 10 characters; drop those with too many `#` or ellipsis symbols, over 90% of lines starting with a bullet or over 30% ending in an ellipsis, under 80% of words containing a letter, too few common English stop words, or heavy repeated lines and n-grams. C4 (Raffel et al. 2020) added the familiar "keep only lines ending in terminal punctuation" rule. A small model's [perplexity](/04-language-modeling-and-sampling/#entropy-cross-entropy-perplexity) also flags garbled OCR and keyword spam.
+
+**Deduplication** matters more than it looks. Lee et al. (2021, "Deduplicating Training Data Makes Language Models Better") found many near-duplicates in common datasets; removing them cut verbatim memorisation and let models train as well in fewer steps. Exact copies fall to a hash. Near-duplicates (same article, different header) need **MinHash**:
+
+```python
+import hashlib
+
+def shingles(text: str, k: int = 5) -> set[str]:
+    w = text.lower().split()
+    return {" ".join(w[i:i + k]) for i in range(max(1, len(w) - k + 1))}
+
+def minhash(sh: set[str], num_perm: int = 128) -> list[int]:
+    # one salted hash per "permutation"; keep the minimum over all shingles
+    return [min(int(hashlib.blake2b(f"{seed}:{s}".encode(), digest_size=8).hexdigest(), 16)
+                for s in sh) for seed in range(num_perm)]
+
+def est_jaccard(a: list[int], b: list[int]) -> float:
+    return sum(x == y for x, y in zip(a, b)) / len(a)
+```
+
+Two documents share a minimum under a random hash with probability equal to their Jaccard similarity, so the fraction of matching slots estimates it. To avoid comparing all pairs, **LSH banding** splits the 128 values into, say, 16 bands of 8; documents equal on any band become candidates. Llama 3 used URL, global MinHash and line-level dedup, the last removing lines seen more than 6 times in each bucket of 30M documents.
+
+**Quality classifiers** go past rules: have a strong LLM label a sample for "educational, well-written?", train a small fast classifier on those labels, score everything. FineWeb-Edu kept about 1.3T tokens of FineWeb's 15T this way and trained better models on knowledge and reasoning benchmarks. The trade-off: a classifier encodes someone's taste, and aggressive filtering drops dialects and minority languages with the spam.
+
+<Callout type="tip">
+
+Your RAG ingestion and fine-tuning sets need the same pipeline at small scale. Duplicated chunks crowd top-k with copies of one passage; duplicated fine-tuning rows teach one example many times.
+
+</Callout>
+
+## Data mix
+
+The **data mix** is the sampling weight of each source during training, and it shapes capability as much as size. Llama 3's final mix was roughly 50% general knowledge, 25% maths and reasoning, 17% code and 8% multilingual. Labs pick weights by training small proxy models on candidate mixes, or learn them (DoReMi, Xie et al. 2023). **Annealing** upsamples the best data while the learning rate decays at the end of training; Llama 3 also used short annealing runs to judge whether a small new dataset was worth adding.
+
+**Synthetic data** is now in most mixes: rewritten pages, generated textbooks, model-written solutions checked by a verifier. Phi-1 ("Textbooks Are All You Need", Gunasekar et al. 2023) showed a small code model trained on filtered "textbook-quality" web code plus generated textbooks and exercises punching well above its size. The limits: it inherits the teacher's errors, narrows diversity, and recursive training on model output loses the distribution's tails (Shumailov et al. 2024). It works best where a checker exists, such as code that runs or maths with a known answer. Your version is in [synthetic data](/09-fine-tuning-in-practice/#synthetic-data).
+
+## Scaling laws (Kaplan, Chinchilla)
+
+**Scaling laws** are the empirical finding that pretraining loss falls as a smooth power law in parameters N, tokens D and compute C, across many orders of magnitude. Fit on cheap small runs, predict a run 1,000× bigger. A common form:
+
+```text
+L(N, D) = E + A / N^α + B / D^β
+E = irreducible loss of text; A/N^α = too few params; B/D^β = too few tokens
+```
+
+With C ≈ 6·N·D, the question is how to split a fixed C between model size and tokens.
+
+**Kaplan et al. 2020** (OpenAI) said mostly parameters: optimal N grows roughly as C^0.73. Hence GPT-3: 175B parameters on about 300B tokens. **Hoffmann et al. 2022** (DeepMind, "Chinchilla") tuned learning-rate schedules to each run's length and found N and D should grow equally, about 20 tokens per parameter. Chinchilla, 70B on 1.4T tokens, used the same compute as 280B Gopher (300B tokens), beat it on most tasks and is 4× cheaper to serve. Why the two disagree took two more years to settle: Kaplan counted only non-embedding parameters ([as in chapter 05](/05-transformer-intuition/#parameter-and-flops-accounting)) and fit mostly small models, which bends the exponent upward (Pearce and Song 2024); a fixed warmup too long for small models and untuned optimiser settings did the rest (Porian et al. 2024). Hoffmann's own explanation, the learning-rate schedule, turned out to matter less.
+
+Check against Llama 3's budget:
+
+```text
+C = 6·N·D, D = 20·N  →  C = 120·N²  →  N = sqrt(3.8e25 / 120) ≈ 560B on 11T tokens
+Meta's own fit on its data:  402B on 16.55T tokens (~41 tokens/param)
+Meta shipped:                405B on 15.6T tokens  (~39 tokens/param)
+```
+
+"20" belongs to one dataset and setup, not physics. Meta also found the curve flat near the optimum, so modest departures cost little.
+
+### Why modern models train far past Chinchilla
+
+Chinchilla minimises training compute. Serving costs about 2·N FLOPs per token ([FLOPs accounting](/05-transformer-intuition/#parameter-and-flops-accounting)) for the model's whole life, so if you will serve trillions of tokens, a smaller model trained longer is cheaper overall (Sardana et al. 2023, "Beyond Chinchilla-Optimal").
+
+| Model | N | D (published) | Tokens per param |
+|---|---|---|---|
+| GPT-3 (2020) | 175B | ~300B | ~1.7 |
+| Chinchilla (2022) | 70B | 1.4T | 20 |
+| Llama 3 405B (2024) | 405B | 15.6T | ~39 |
+| Llama 3.1 8B (2024) | 8.03B | ~15T | ~1,900 |
+| Qwen2.5-3B (2024) | 3.09B | 18T | ~5,800 |
+
+That column is why small models are good now; distillation in post-training adds more ([distillation](/09-fine-tuning-in-practice/#distillation)). The ceiling remains: 3B parameters store fewer rare facts, so a 3B model is fine at extraction over given context and weak on long-tail knowledge.
+
+Scaling laws predict loss, not skills or your task. Apparent sudden "emergent" abilities are partly an artefact of all-or-nothing metrics (Schaeffer et al. 2023). And benchmark scores carry **contamination**: test items leak into crawls, so a high score can be memory. See [benchmarks and contamination](/19-evals-methodology/#benchmarks-and-contamination) and [reading benchmarks critically](/11-serving-and-model-economics/#reading-benchmarks-critically).
+
+## GPU and compute budgets
+
+The formula to carry: **training FLOPs ≈ 6 · N · D**: about 2N per token forward, twice that backward, as in [chapter 05](/05-transformer-intuition/#parameter-and-flops-accounting). Worked for Llama 3 405B, whose N and D are published:
+
+```text
+C = 6 × 405e9 × 15.6e12 = 3.79e25 FLOPs          (paper: 3.8 × 10^25)
+H100 dense bf16 peak ≈ 989 TFLOP/s; at 40% MFU → ≈ 3.96e14 useful FLOP/s
+3.79e25 / 3.96e14 ≈ 9.6e10 GPU-seconds ≈ 26.6M GPU-hours
+On 16,384 GPUs ≈ 1,620 hours ≈ 68 days of pure compute
+Model card: 30.84M H100-hours (failures, restarts and overhead included)
+```
+
+**MFU** (model FLOPs utilisation) is the share of peak hardware FLOPs spent on the model's own maths; Llama 3 reported 38 to 43%. The rest is communication, memory stalls and idle pipeline stages. At an illustrative $2 per H100-hour (rented prices vary several-fold; check current ones), 30.84M GPU-hours is about $62M for the final run, before ablations, data work and people. The formula is the point: cost ≈ GPU-hours × price per GPU-hour.
+
+The same formula at your scale, fine-tuning an 8B model on 10M tokens of your documents:
+
+```text
+C = 6 × 8e9 × 1e7 = 4.8e17 FLOPs → / 3.96e14 ≈ 1,200 s ≈ 20 GPU-minutes
+```
+
+Cheap compute is not cheap knowledge. Those tokens are 1e7 / 1.5e13 ≈ 7 × 10^-7 of the 15T the model was pretrained on: under one token in a million. Fine-tuning reliably teaches format, style and task behaviour; it does not reliably install facts the model will recall correctly, and it can cause forgetting. So "add our knowledge" usually means retrieval ([prompt vs RAG vs fine-tune](/09-fine-tuning-in-practice/#prompt-vs-rag-vs-fine-tune-decision)).
+
+## Parallelism intuition
+
+Training needs about 16 bytes per parameter with mixed-precision Adam ([training memory math](/09-fine-tuning-in-practice/#training-memory-math)): 405e9 × 16 ≈ 6.5 TB, against 80 GB per H100. And 68 days on 16K GPUs is about 3,000 years on one. So the work is split:
+
+```text
+Data parallel (DP)      full model per group, different batches, gradients all-reduced
+FSDP / ZeRO             DP with weights, grads, optimizer state sharded, gathered just in time
+Tensor parallel (TP)    each matmul split across GPUs in a node (talks every layer)
+Pipeline parallel (PP)  layers split into stages across nodes; micro-batches flow through
+Context parallel (CP)   one long sequence split across GPUs
+```
+
+Llama 3 used "4D parallelism" (TP, CP, PP, DP, with FSDP). The rule behind the order: the chattiest split (TP) gets the fastest links inside a node, the least chatty (DP) spans racks. MoE adds expert parallelism ([MoE](/05-transformer-intuition/#mixture-of-experts)). You meet TP again when serving a 70B model across GPUs ([serving parallelism](/10-inference-mechanics/#serving-parallelism)).
+
+## Training instability
+
+**Numerical instability.** The loss jumps (a **loss spike**) and recovers or diverges. Causes include bad batches, attention logits growing without bound, and learning rates too high for the scale. Defences: learning-rate warmup, gradient-norm clipping, normalising queries and keys (QK-norm), an auxiliary z-loss that keeps logits small (PaLM, Chowdhery et al. 2022), and, when a spike will not recover, rolling back to a checkpoint and skipping the offending batches, as the PaLM team did. DeepSeek-V3 (2024) thought it worth reporting that its run had no irrecoverable spikes and no rollbacks.
+
+**Hardware failure.** In one 54-day period of Llama 3 pretraining, Meta logged 466 job interruptions; 419 were unexpected, and about 78% of those were attributed to confirmed or suspected hardware issues. The answer is engineering: frequent checkpoints, fast restarts, automatic detection of bad nodes.
+
+You will see small versions when fine-tuning: a loss that goes to NaN after a learning-rate change, or a spot instance that dies mid-epoch with no checkpoint.
+
+## Base vs chat models
+
+Pretraining produces a **base model**: a document continuer. Ask "Q: What is the capital of France?" and it may continue with more quiz questions. Post-training turns it into a **chat** or **instruct** model ([chapter 07](/07-post-training-and-alignment/#why-post-train)). You prompt a base model by writing the start of the document you want finished:
+
+```text
+UPSC Mains 2024, GS Paper III. Model answers by subject experts.
+
+Q4. Discuss the role of MSMEs in employment generation. (150 words)
+Answer:
+```
+
+When a base model is right:
+
+- **Fine-tuning start point** when you want to own format and behaviour without inheriting a chat template and refusal style.
+- **Scoring text.** Base-model log-probs are a cleaner "how typical is this" signal for filtering and anomaly detection; post-training bends a chat model's distribution toward its own style.
+- **Diverse generation** for synthetic data seeds, and **pure completion** (autocomplete, code infill).
+
+For instructions, tools, JSON and conversation, use the instruct model. Few hosted APIs expose base models; open-weight families usually publish both (Qwen2.5-3B and Qwen2.5-3B-Instruct).
+
+## Open-weight vs closed landscape
+
+**Closed** models (OpenAI, Anthropic, Google) are API-only: frontier capability and managed serving, but no control of versions, data location or weights, and sizes and data are undisclosed.
+
+**Open-weight** models (Llama, Qwen, DeepSeek, Mistral, Gemma) publish weights, which is not the same as open source:
+
+- **Licences differ.** Llama uses Meta's community licence with use restrictions. Most Qwen2.5 sizes are Apache 2.0, but Qwen2.5-3B uses the more restrictive "Qwen Research" licence. Check the exact size you deploy.
+- **Data is usually secret.** Fully open projects such as AI2's OLMo release data and code too, which you need to check contamination.
+- **Disclosure varies.** Llama 3 and DeepSeek-V3 (671B total, 37B active per token, 14.8T tokens, 2.788M H800 GPU-hours) published enough for this chapter's arithmetic.
+
+For you the choice is operational: residency, cost at your volume, latency, fine-tunability and acceptable quality. The arithmetic is in [API vs self-hosted](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights) and [local and edge](/11-serving-and-model-economics/#local-and-edge).
+
+<Production>
+
+**Failure modes.** Facts stop at the cutoff and the model does not know today's date: it "corrects" newer figures back to memorised ones or calls the current fiscal year "future". Fixes, most reliable last: date and cutoff in the prompt, retrieval for anything that changes, a verified fact table that overrides the model. Contamination is the second failure: a leaderboard pick underperforms on your data, and only your held-out eval decides.
+
+**Cost.** Frontier pretraining is tens of millions of dollars per final run, out of scope for app teams. Your levers: the smallest model that passes your eval, fine-tuning for behaviour, retrieval for knowledge. Use 6·N·D to sanity-check any training quote.
+
+**Latency.** Pretraining fixed N, and N sets per-token compute (2·N) and the bytes read per decoded token. An over-trained small model serves faster than a Chinchilla-optimal big one of similar quality.
+
+**Observability.** Log the exact model id with every call and keep each model's stated cutoff. A provider swap changes what the system "knows"; tie spikes in "outdated" complaints to it.
+
+**Security.** Poisoning needs few documents: Souly et al. (2025, Anthropic with the UK AI Security Institute and the Alan Turing Institute) planted a simple backdoor with about 250 documents in models from 600M to 13B parameters ([poisoning and backdoors](/33-security-prompt-injection/#poisoning-and-backdoors)). Models can regurgitate memorised training text, including personal data (Carlini et al. 2021). Record provenance and licence for every source in your own fine-tuning and RAG corpora.
+
+</Production>
+
+<Interview>
+
+<Q q="What do scaling laws tell you?">
+
+- Loss falls as a smooth power law in N, D and C, so labs fit small runs and predict big ones before paying.
+- C ≈ 6·N·D; the question is how to split it. Kaplan 2020: mostly parameters (N ∝ C^0.73). Chinchilla 2022: equally, about 20 tokens per parameter; 70B on 1.4T beat 280B Gopher at equal compute.
+- The ratio is data-dependent: Meta's Llama 3 fit gave about 40.
+- Chinchilla ignores inference, which costs 2·N per token forever, so production over-trains small models: Llama 3.1 8B about 1,900 tokens per parameter, Qwen2.5-3B about 5,800.
+- They predict loss, not specific abilities or your task.
+- **The trap:** "bigger is always better" or "abilities emerge at size X", missing the inference-cost argument and the metric-artefact evidence.
+
+</Q>
+
+<Q q="Base vs instruct model: when would you use a base model?">
+
+- Base continues documents; instruct is post-trained for instructions, templates, tools and refusals.
+- Base as a fine-tuning start when you want to own format and behaviour.
+- Base for scoring text (log-probs as a typicality signal), diverse synthetic seeds, and pure completion such as code infill.
+- Prompt it as a document prefix, not an instruction.
+- Anything user-facing, tool-using or JSON-producing: instruct.
+- **The trap:** "base models are uncensored, so better", or not knowing few hosted APIs offer them.
+
+</Q>
+
+<Q q="Why does knowledge cutoff matter for your product design?">
+
+- Weights hold the corpus as of the last crawl, recent months are thin, and the model does not know today's date.
+- In fast-moving domains (tax limits, schemes, prices) it confidently "corrects" newer facts to older ones.
+- Design: inject today's date and the model's cutoff; retrieve current sources; keep a verified fact table that overrides memory; show "as of" dates.
+- Track cutoff per model id; an upgrade changes what the system knows.
+- Freshness is a retrieval problem: fine-tuning teaches behaviour more reliably than facts.
+- **The trap:** "we'll fine-tune monthly to stay current": costly, unreliable for recall, stale between runs.
+
+</Q>
+
+<Q q="Estimate the training compute and GPU time for a 70B model on 15T tokens.">
+
+- C = 6 × 70e9 × 15e12 = 6.3e24 FLOPs.
+- H100 at about 1e15 bf16 peak and 40% MFU: about 4e14 useful FLOP/s.
+- 6.3e24 / 4e14 ≈ 1.6e10 GPU-seconds ≈ 4.4M GPU-hours (Meta's card reports 7.0M for Llama 3.1 70B, overhead included).
+- On 8,192 GPUs: about 530 hours, roughly 22 days of pure compute.
+- Name what it ignores: long-context attention, recomputation, failures, ablations.
+- **The trap:** using 2·N·D (forgetting the backward pass) or assuming 100% utilisation.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Build a small pretraining-style data pipeline, offline and with no model, in Answer Grader (`~/answer-grader`) over `data/pyq/pyq.jsonl` plus any scraped page text you have. Reuse it in chapter 09 (cleaning a fine-tuning set) and chapter 17 (deduplicating chunks).
+
+1. `scripts/dedup_filter.py` loads `(id, text)` pairs from JSONL.
+2. Heuristic filters: under 20 words, over 30% non-alphanumeric characters, or over 30% repeated lines. Log drops per rule.
+3. Exact dedup on normalised text (lowercase, collapsed whitespace, no punctuation).
+4. Near-dup: 5-word shingles, 128-value MinHash (your own, as above; `datasketch` only to cross-check), LSH with 16 bands of 8, confirm pairs at estimated Jaccard ≥ 0.8.
+5. Write `dup_clusters.jsonl` listing each cluster and the kept member, for human audit.
+6. Run the same near-dup search between your eval inputs (`tests/retrieval_eval_queries.json`) and any text used as prompt examples or references; print overlaps.
+7. Plant 10 near-duplicates (copy a question, change a few words).
+
+**Done when:** one command runs on the corpus in under a minute on a laptop, catches at least 9 of 10 planted duplicates, prints counts per stage, and reports any eval-versus-prompt overlap.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Cutoff, handled in your code.** Answer Grader `backend/llm.py` lines 244 to 269 (yours): a `KNOWLEDGE_CUTOFF` table per model id (`gemini-3.6-flash` March 2026, `gpt-4o-mini` October 2023) and `dates_block()`, which puts today's IST date, the Indian fiscal year and the model's cutoff into the prompt and says a newer fact is not an error. The comment records why: Gemini called a student's FY27 figure "chronologically incorrect" and models "corrected" 2025 MSME limits to 2020 ones. The evaluator, model-answer writer and claim verifier call it.
+- **The gap you logged.** `ENGINEERING_FINDINGS.md` item 6.17: the vision step does not get `dates_block()` and transcribed a student's "2026" as "2024"; the fix is proposed, not applied at the pin. It shows cutoff handling must reach every step that reads facts, OCR included.
+- **Small local models.** Scheme Assistant's local path is a teammate's code (Chiman's `src/app/config.py` and `OllamaClient` in `src/app/core/llm.py`), defaulting to Ollama `qwen2.5:3b`. The team tracker says 7B did not fit the 4 GB dev GPU, that the 3B model mis-wrote a Hindi number (which led to a number-fidelity check), and records the 2 October 2026 switch to hosted Gemini. Use it to explain over-trained small models: good at following a schema over given passages, weak on precise detail. Call it our pipeline, not yours.
+- **Contamination risk.** `data/pyq/pyq.jsonl` (your import: 1,066 UPSC Mains questions, 2013 to 2025, from a public coaching site) holds questions with model answers all over the web. Quality measured on PYQs may be recall and will look better than on new questions. The retrieval eval uses real student questions (`tests/retrieval_eval_queries.json`), which is better, but nothing checks eval-versus-prompt overlap.
+- **Gap.** No repo trains a model or has a dedup or quality-filter pipeline; the Apply-it script is the first.
+
+</YourProject>

@@ -1,0 +1,479 @@
+---
+id: "09"
+title: "Fine-Tuning in Practice"
+summary: "Decide with a procedure, not a slogan, whether a failure needs a better prompt, retrieval or new weights; then do the GPU memory arithmetic, build and clean the dataset, train a LoRA or QLoRA adapter, and prove it beats the base model before it ships."
+readingTime: "25 min"
+---
+
+Sooner or later someone says "we should fine-tune". Sometimes they are right. More often the model was missing facts (retrieval's job), or the prompt was never tested against an eval set. Fine-tuning is your most expensive lever: data work, training compute, a hosting decision, and a retraining cycle every time the base model moves. It is also the only lever that changes what the model is, rather than what it is told.
+
+[Chapter 07](/07-post-training-and-alignment/#sft) explains what SFT, RLHF and DPO do to a model in theory. This chapter applies them to a 0.5B to 8B open model on hardware you can rent or borrow: when to do it at all, how much memory it takes, how to build the data, how to prove it worked, and where to run it in November 2026. Hyperparameter "defaults" here are common starting points, not laws; prices are illustrative; the only numbers stated as fact are definitions and arithmetic you can redo.
+
+## Prompt vs RAG vs fine-tune decision
+
+"RAG for knowledge, fine-tuning for behaviour" is right, but you cannot run a slogan. Run this procedure. It starts from an observed failure, not from a technique you want to try.
+
+1. **Is there an eval set?** If not, build one ([building eval sets](/19-evals-methodology/#building-eval-sets)). Fine-tuning without an eval is the most expensive way to guess.
+2. **Label each failure.** Is the model missing information (scheme rules, last week's circular, this user's order), or does it have it and still behave wrongly (format, tone, ignored rule, wrong label)?
+3. **Missing information goes to retrieval or context.** Facts change, need citations and need per-user access control; weights give you none of those ([RAG vs long context vs fine-tuning](/17-rag-pipelines/#rag-vs-long-context-vs-fine-tuning)). Training facts in can backfire: Gekhman et al. (2024) found that fine-tuning examples with knowledge the model lacked were learned slowly and, once learned, increased hallucination.
+4. **Wrong behaviour goes to the prompt first**: clearer instructions, few-shot examples, a schema with [constrained decoding](/13-structured-output/#constrained-grammar-decoding), decomposition. Iterate against the eval.
+5. **Fine-tune only if, after step 4, you can name the reason**: the prompt has plateaued below the bar on behaviour you can show in examples; or the prompt works but is too costly or slow at your volume and a smaller trained model would do (distillation); or you must self-host and the affordable open model is not good enough when prompted.
+6. **And the preconditions hold**: the task is stable for months, you can get enough good examples (a [learning curve](#dataset-curation) tells you how many), and someone owns retraining.
+
+The cost case is arithmetic. A 3,000-token few-shot prompt replaced by a 300-token one saves `N × 2,700 × p / 1e6` dollars a month for N calls at p dollars per million input tokens: 1,350 dollars at 1M calls and an illustrative p = 0.5. Set that against training, any premium for serving a custom model, hosting, and the engineer-days to retrain on every base-model change. [Prompt caching](/10-inference-mechanics/#prefix-prompt-caching) often shrinks the saving enough to kill the case.
+
+```python
+def choose_lever(f: dict) -> str:
+    """f holds observations from your eval, not opinions."""
+    if not f["has_eval_set"]:
+        return "build the eval set first"
+    if f["failure"] == "missing_or_changing_knowledge":
+        return "RAG / context: weights will not hold reliable, citable facts"
+    if not f["prompt_iterated_against_eval"]:
+        return "prompt: instructions, few-shot, schema, decomposition"
+    reasons = [r for r in ("prompt_plateau", "cost_or_latency_at_volume", "must_self_host") if f.get(r)]
+    ready = f["task_stable"] and f["enough_examples"] and f["retrain_owner"]
+    return "fine-tune: " + ", ".join(reasons) if reasons and ready else "stay with prompt + RAG"
+```
+
+The levers combine: the most common production pattern is RAG for the facts plus a fine-tuned, often smaller, generator that follows the RAG prompt, cites and abstains well.
+
+## Training memory math
+
+Serving an 8B model in bf16 needs about 16 GB of weights. Fully fine-tuning it needs about eight times that, because training keeps several numbers per trainable parameter. For mixed-precision Adam (the accounting in the ZeRO paper, Rajbhandari et al. 2019):
+
+| Per trainable parameter | Format | Bytes |
+|---|---|---|
+| Weights for forward and backward | bf16 | 2 |
+| Gradients | bf16 | 2 |
+| Master weights | fp32 | 4 |
+| Adam momentum and variance | fp32 | 4 + 4 |
+| **Total** | | **16** |
+
+Then **activations**, saved in the forward pass for the backward pass. They scale with batch × sequence × hidden size × layers and do not shrink when fewer parameters train.
+
+For Llama 3.1 8B (8.03B parameters, 32 layers, hidden 4,096, MLP 14,336, vocabulary 128,256):
+
+- **Full fine-tuning:** 8.03B × 16 ≈ 128 GB before activations: at least two 80 GB GPUs with sharded optimizer states ([parallelism](/06-pretraining-and-scaling/#parallelism-intuition)), more in practice.
+- **Activations, one 2,048-token sequence**, with gradient checkpointing (Chen et al. 2016: keep each layer's input, recompute the rest in backward): `layers × seq × hidden × 2 bytes` ≈ 0.5 GB, plus one layer's full activations during recompute.
+- **The logits spike:** `seq × vocab` ≈ 263M values, about 1 GB in fp32 for the loss, and its gradient can briefly double that. Big vocabularies make the loss layer a real cost.
+
+```python
+def train_mem_gb(params_b, trainable_b, base_bytes, batch=1, seq=2048,
+                 layers=32, hidden=4096, vocab=128_256):
+    weights = params_b * base_bytes                 # whole model, trained or frozen
+    states = trainable_b * (2 + 4 + 4 + 4)          # grads + fp32 master + Adam m and v
+    acts = layers * batch * seq * hidden * 2 / 1e9  # with gradient checkpointing
+    logits = batch * seq * vocab * 4 / 1e9          # fp32 logits for the loss
+    return round(weights + states + acts + logits, 1)
+
+print(train_mem_gb(8.03, 8.03, 2))     # full fine-tune: ~130 GB
+print(train_mem_gb(8.03, 0.042, 2))    # LoRA r=16 on a bf16 base: ~18 GB
+print(train_mem_gb(8.03, 0.042, 0.71)) # QLoRA: NF4 body, bf16 embeddings: ~8 GB
+```
+
+The QLoRA 0.71 bytes is an average: about 7B parameters at 4.127 bits (NF4 plus scales, below) and about 1.05B in the embedding and output head, which libraries usually keep in bf16. Add 1 to 2 GB for the CUDA context and fragmentation, then measure: `torch.cuda.max_memory_allocated()` after a few steps is the truth. Rules of thumb: full fine-tuning about 16 bytes per parameter, LoRA about 2, QLoRA about 0.5 to 0.7, each plus activations.
+
+## Numeric formats
+
+A float splits its bits between exponent (range) and mantissa (precision).
+
+| Format | Sign / exponent / mantissa | Use |
+|---|---|---|
+| fp32 | 1 / 8 / 23 | Master weights, optimizer states |
+| fp16 | 1 / 5 / 10 | Max 65,504; small gradients underflow |
+| bf16 | 1 / 8 / 7 | fp32's range, about 2 to 3 significant digits |
+| fp8 | 1 / 4 / 3 (E4M3) or 1 / 5 / 2 (E5M2) | Large-scale training and serving on recent GPUs |
+| int8, int4, NF4 | integer levels plus a scale | Serving; frozen bases |
+
+```python
+import torch
+w = torch.tensor(1.0, dtype=torch.bfloat16)
+print(w + 1e-4)                                  # 1.0: update lost (bf16 step near 1.0 is 2**-7)
+print(torch.tensor(1e-8, dtype=torch.float16))   # 0.0: fp16 underflow
+print(torch.tensor(1e-8, dtype=torch.bfloat16))  # ~1e-8: bf16 keeps fp32's range
+```
+
+The first is why master weights are fp32: tiny updates must accumulate where they are not rounded away. The second is why fp16 training needs loss scaling (Micikevicius et al. 2017) and bf16 is the default where supported (not on the free Colab T4, which needs fp16).
+
+**NF4** (Dettmers et al. 2023) puts its 16 levels at quantiles of a normal distribution, because pretrained weights are roughly normal; each block of 64 weights shares a scale.
+
+**Training quantization is not serving quantization.** QLoRA stores the frozen base in NF4 and dequantizes to bf16 inside each matmul; the base never changes, so the adapter learns around a fixed rounding error. Serving quantization (GPTQ, AWQ, GGUF, fp8) is applied to finished weights ([quantization](/10-inference-mechanics/#quantization-gptq-awq-gguf-fp8)). The trap is between them: an adapter trained against NF4 weights, served on a bf16 base or a GGUF `Q4_K_M` file with different rounding. Usually fine, sometimes not, so eval in the exact serving configuration.
+
+## Full vs PEFT
+
+**Full fine-tuning** updates every weight: the highest ceiling for large shifts (a new language, continued pretraining on a domain), about 16 bytes per parameter, a 16 GB checkpoint per task for an 8B model, and the most forgetting.
+
+**Parameter-efficient fine-tuning (PEFT)** freezes the base and trains a few new or selected parameters: adapters (Houlsby et al. 2019, bottleneck layers that add inference latency), prefix and prompt tuning (Li and Liang 2021; Lester et al. 2021, learned soft-prompt vectors), LoRA (Hu et al. 2021) and IA3 (Liu et al. 2022, learned scaling vectors). LoRA won in practice: it fits any linear layer, adds no latency once merged, and gets close to full fine-tuning on narrow tasks. A rank-16 LoRA on every linear layer of an 8B model is about 42M parameters, 84 MB in bf16, against 16 GB for a full copy.
+
+The trade-off is measured. Biderman et al. (2024), "LoRA Learns Less and Forgets Less", found that on code and math with large training budgets, LoRA at typical ranks clearly underperformed full fine-tuning in-domain but kept more of the base model's ability outside it; full fine-tuning learned much higher-rank weight changes. So: for narrow behaviour (a classifier, a format, a tool-call schema) LoRA is the default; big knowledge-heavy shifts justify full fine-tuning or a much higher rank.
+
+## LoRA/QLoRA
+
+### LoRA
+
+A linear layer computes `h = W x`, W of shape d_out × d_in. LoRA (Hu et al. 2021) bets the change fine-tuning needs has low rank: `ΔW = B A`, B of shape d_out × r, A of shape r × d_in, r much smaller than d. The forward pass is `h = W x + (α / r) B A x`. A starts random and B at zero, so step 0 is exactly the base. Only A and B get gradients and optimizer states.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+class LoRALinear:
+    def __init__(self, W, r=16, alpha=32):
+        self.W = W                                              # frozen, (d_out, d_in)
+        d_out, d_in = W.shape
+        self.A = rng.normal(0, 1 / np.sqrt(d_in), (r, d_in))    # trainable
+        self.B = np.zeros((d_out, r))                           # trainable, starts at 0
+        self.scale = alpha / r
+
+    def forward(self, x):                                       # x: (batch, d_in)
+        return x @ self.W.T + self.scale * (x @ self.A.T) @ self.B.T   # thin path first
+
+    def merged(self):                                           # for serving: one matmul again
+        return self.W + self.scale * self.B @ self.A
+
+W = rng.normal(size=(4096, 4096))
+layer, x = LoRALinear(W), rng.normal(size=(2, 4096))
+assert np.allclose(layer.forward(x), x @ W.T)                   # identical to the base at step 0
+layer.B = rng.normal(0, 0.01, layer.B.shape)                    # pretend we trained
+assert np.allclose(layer.forward(x), x @ layer.merged().T)      # merge is exact
+print(layer.A.size + layer.B.size, "trainable vs", W.size)      # 131,072 vs 16,777,216
+```
+
+Per matrix LoRA trains `r × (d_in + d_out)` instead of `d_in × d_out`. For every linear layer of Llama 3.1 8B at r = 16 (grouped-query attention makes k and v output 1,024):
+
+| Matrix | in → out | r × (in + out) |
+|---|---|---|
+| q, o | 4,096 → 4,096 | 131,072 each |
+| k, v | 4,096 → 1,024 | 81,920 each |
+| gate, up, down | 4,096 ↔ 14,336 | 294,912 each |
+| **Per layer** | | **1,310,720** |
+
+Times 32 layers: 41.9M trainable parameters, about 0.52% of 8.03B.
+
+**Why so little memory.** The 14 bytes of gradient, master copy and Adam state now cover 42M parameters, not 8B: about 0.6 GB instead of 112 GB. The frozen weights (2 bytes each) and activations are unchanged, so LoRA on a bf16 8B base still needs about 18 GB. The LoRA paper reports, for GPT-3 175B, 10,000 times fewer trainable parameters and 3 times less GPU memory than full fine-tuning with Adam.
+
+**Knobs.** Rank r (8 to 64 is usual), α (often r or 2r), dropout, target modules. The original paper adapted only the query and value matrices; the QLoRA paper found all linear layers were needed to match full fine-tuning. Later variants: rsLoRA (Kalajdzievski 2023) scales by α/√r so high ranks are not damped; DoRA (Liu et al. 2024) learns magnitude and direction separately.
+
+### QLoRA
+
+QLoRA (Dettmers et al. 2023) shrinks the remaining big term, the frozen weights:
+
+1. **NF4 storage** of the base, dequantized to bf16 per matmul; gradients flow through into bf16 adapters.
+2. **Double quantization.** An fp32 scale per 64 weights is 32/64 = 0.5 bits per parameter; quantizing the scales to 8 bits in blocks of 256 gives 8/64 + 32/(64 × 256) ≈ 0.127 bits.
+3. **Paged optimizers.** Optimizer states live in NVIDIA unified memory and spill to CPU RAM during spikes.
+
+The headline is a 65B model fine-tuned on one 48 GB GPU. For 8B the arithmetic gives roughly 8 to 10 GB with short sequences, which fits a free 16 GB T4. The cost is speed: dequantizing every step is slower than LoRA on a bf16 base, so use QLoRA when memory is the constraint. To ship merged, merge into the bf16 base (not the 4-bit one), quantize for serving if needed, and re-run the eval.
+
+## Dataset curation
+
+Data decides the outcome more than any hyperparameter. LIMA (Zhou et al. 2023) got good chat behaviour from 1,000 carefully curated examples: evidence that curation beats volume for behaviour, not a number for your task.
+
+**Sources, best first:** real production inputs with reviewed or corrected outputs (the [data flywheel](/32-deployment-and-llmops/#data-flywheel)); human-written answers for hard cases; teacher outputs ([distillation](#distillation)); synthetic inputs.
+
+- **Coverage.** Every slice you serve: languages, lengths, edge cases, the abstentions you want. Over-sample hard cases.
+- **Consistent labels.** Written guidelines; double-label a sample and measure agreement. Human disagreement caps what the model can learn.
+- **Targets you want.** The model learns everything in the assistant turn, hedges and mistakes included.
+- **Leak-proof splits.** Split by time, user or source document, not random rows; remove near-duplicates across splits; keep a test set nobody tunes against.
+- **Versioning.** Record base revision, data hash, config and eval report with every adapter.
+
+**How many examples: measure it.** Train the same config on 12.5%, 25%, 50% and 100% of the data and plot the test metric against log examples. Still climbing: more data helps, and the slope per doubling says how much. Flat since 25%: fix label quality or the task definition instead.
+
+```python
+import math, random
+
+def learning_curve(rows, train_fn, eval_fn, fractions=(0.125, 0.25, 0.5, 1.0), seed=0):
+    rows = rows[:]
+    random.Random(seed).shuffle(rows)
+    points = []
+    for f in fractions:
+        n = int(len(rows) * f)
+        points.append((n, eval_fn(train_fn(rows[:n]))))  # same hyperparameters, frozen test set
+    (n1, m1), (n2, m2) = points[-2:]
+    return points, (m2 - m1) / math.log2(n2 / n1)        # gain per doubling; ~0: fix quality
+```
+
+Each point is noisy; on a small test set use two seeds or intervals ([sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+## Synthetic data
+
+When real data is thin, a strong model can generate inputs, outputs or both. Self-Instruct (Wang et al. 2022) grew an instruction set from a small seed this way; Evol-Instruct (Xu et al. 2023, WizardLM) rewrote seeds into harder variants.
+
+```text
+real seeds ──► variants along named axes ──► label (teacher + verifier) ──► filter
+               (language, typos, length,                                    │
+                ambiguity, mixed intents)          audit a sample ◄── dedupe, diversity check
+```
+
+- **Name the axes and filter hard.** "Generate 500 more" yields near-copies; "rewrite in Hinglish with two typos" yields coverage. Then schema checks, exact verifiers or a validated judge, and near-duplicate removal.
+- **Test on real data.** Synthetic inputs widen coverage ([synthetic inputs](/19-evals-methodology/#synthetic-inputs)), but the promotion gate uses real, human-labelled examples, and generation is never seeded from test items.
+- **Watch for collapse.** Shumailov et al. (2024, Nature) showed recursive training on generated data loses the distribution's tails. One round of teacher data is not that loop, but watch for the same symptom: blander outputs, vanishing rare cases.
+- **Read the terms.** Several API providers restrict using outputs to build competing models.
+
+## Distillation
+
+Distillation trains a small **student** to imitate a large **teacher**. Hinton, Vinyals and Dean (2015) trained on the teacher's softened class probabilities, which carry more information than a hard label. Kim and Rush (2016) introduced sequence-level distillation: train on the teacher's generated outputs. An API teacher usually gives you only text, so application distillation is sequence-level SFT; with an open teacher you can add a KL term toward its logits. Distilling step-by-step (Hsieh et al. 2023) also trains on the teacher's rationales and needed less data in their experiments; for a classifier, keep rationales as a training-only target so serving emits just the label.
+
+```text
+ real inputs (PII scrubbed, deduped, stratified)
+        │
+ teacher: best prompt, k samples ──► unanimous ──► silver labels (train)
+        │ disagreements
+ human review ──► gold labels (test only)
+        │
+ student: small open model + LoRA, loss on label tokens
+        │
+ eval on gold: student vs teacher vs prompted base ──► promote?
+        │
+ serve: student first; low confidence ──► teacher (cascade)
+```
+
+**Cost per 1,000 calls, illustrative prices.** Teacher API at 600 input and 5 output tokens, 2 and 8 dollars per million: `600 × 2 / 1e6 + 5 × 8 / 1e6` = 0.00124 dollars a call, 1.24 per 1,000. Student on a GPU at 0.60 dollars an hour, load-tested at 50 classifications a second: 180,000 an hour, about 0.0033 dollars per 1,000 at full utilization. But the GPU has a floor of 0.60 × 24 × 30 ≈ 432 dollars a month, so break-even is `432 / 0.00124` ≈ 350,000 calls a month; below that, a per-token hosted model is cheaper ([cost-per-task modelling](/11-serving-and-model-economics/#cost-per-task-modelling)).
+
+**The cascade.** Use the student's label-token probability as confidence, route low-confidence inputs to the teacher, and tune the threshold on gold. Expected cost is `c_student + f × c_teacher` for fallback rate f ([routing and cascades](/11-serving-and-model-economics/#routing-and-cascades)).
+
+## Cleaning and formatting
+
+Examples must be rendered with the **exact chat template the model was trained with** (theory in [chat templates](/07-post-training-and-alignment/#chat-templates), tokens in [special tokens](/02-tokenization/#special-tokens-and-chat-templates)). Store role and content messages in JSONL; render with the tokenizer's `apply_chat_template`; never concatenate strings by hand.
+
+```json
+{"messages": [
+  {"role": "system", "content": "Label the text typed in the question box: QUESTION, INSTRUCTION or MIXED."},
+  {"role": "user", "content": "Evaluate this answer based on UPSC Mains criteria. Give marks out of 10."},
+  {"role": "assistant", "content": "INSTRUCTION"}
+]}
+```
+
+**Loss masking.** Compute loss only on assistant tokens (label -100 elsewhere; most libraries have a completion-only option). Otherwise the model learns to write your system prompt, and a one-word target is drowned by prompt tokens.
+
+```python
+import json, unicodedata
+LABELS = {"QUESTION", "INSTRUCTION", "MIXED"}
+
+def validate(path, tok, max_len=512):
+    seen, bad = set(), []
+    for i, line in enumerate(open(path, encoding="utf-8")):
+        msgs = json.loads(line)["messages"]
+        for m in msgs:                                    # one Unicode form (Devanagari nukta!)
+            m["content"] = unicodedata.normalize("NFC", m["content"]).strip()
+        if msgs[-1]["role"] != "assistant" or msgs[-1]["content"] not in LABELS:
+            bad.append((i, "bad final turn or label")); continue
+        ids = tok.apply_chat_template(msgs, tokenize=True, return_dict=True)["input_ids"]
+        n = len(ids)                                      # transformers 5 returns a dict by default
+        if n > max_len:                                   # truncation would cut the target off
+            bad.append((i, f"{n} tokens")); continue
+        key = msgs[-2]["content"].casefold()
+        if key in seen:
+            bad.append((i, "duplicate input")); continue
+        seen.add(key)
+    return bad
+```
+
+Three more checks. Render one example and read it: the end-of-turn token must be inside the target, or the model never learns to stop. Train with the exact system prompt you serve with. Scrub PII before anything reaches the training file ([PII redaction](/29-guardrails-and-safety/#pii-detection-and-redaction)), because models can memorise and repeat training strings.
+
+## Hyperparameters and monitoring
+
+The settings that matter, roughly in order of how often they break a run:
+
+- **Learning rate**, the most sensitive (Biderman et al. found LoRA highly sensitive to it). Common starting points: about 1e-4 to 2e-4 for LoRA, about 1e-5 for full fine-tuning. Sweep three values across a factor of ten.
+- **Epochs**: one to three for most SFT. More passes over small data is how you get memorisation.
+- **Effective batch** = per-device batch × gradient accumulation × GPUs; accumulation trades time for memory.
+- **Schedule**: a few percent warmup, then cosine or linear decay. **Packing** short examples speeds training if attention cannot cross example boundaries.
+
+Step arithmetic: 4,000 examples, effective batch 16, 2 epochs = `4,000 / 16 × 2` = 500 steps; 3% warmup is 15 steps; evaluating every 50 gives 10 eval points.
+
+**Watch** training and validation loss, gradient norm (spikes mean a too-high learning rate or a broken example), and the task metric on held-out data, which can stay flat while loss falls.
+
+**Overfitting**: training loss heads to zero while validation loss bottoms out and climbs; keep the best-validation checkpoint. The subtler form, **overfitting to format**, is a model that emits the training format even when asked for something else.
+
+**Catastrophic forgetting** (McCloskey and Cohen 1989): training for task B degrades task A. You see it only if you look, so run a small general regression set (instruction following, sibling tasks, refusals, your other language) before and after. Mitigations, cheapest first: LoRA, lower learning rate, fewer epochs, replaying general instruction data, or interpolating back toward the base ([model merging](#model-merging)).
+
+## DPO in practice
+
+Theory is in [the DPO family](/07-post-training-and-alignment/#dpo-family). Reach for DPO (Rafailov et al. 2023) when SFT has taught what a good answer looks like but the remaining failures are about which of two plausible answers is better: tone, concision, refusing versus over-refusing. It trains on (prompt, chosen, rejected) triples with no reward model and no RL loop.
+
+1. **SFT first.** The SFT model is DPO's starting point and its frozen reference.
+2. **Collect pairs** by sampling two to four answers per prompt from the SFT model itself (generally preferred over pairs from another model) and ranking them with humans, rules, or a validated judge.
+3. **Train** with β, the pull toward the reference (0.1 is a common default), and a lower learning rate than SFT.
+4. **With LoRA the reference is free**: merge the SFT adapter, train a new DPO adapter, and the reference is the same model with that adapter switched off.
+
+```python
+import math
+
+def dpo_loss(lp_w, lp_l, ref_w, ref_l, beta=0.1):
+    """Summed log-probs of chosen (w) and rejected (l) under policy (lp) and reference (ref)."""
+    margin = beta * ((lp_w - ref_w) - (lp_l - ref_l))
+    return math.log1p(math.exp(-margin)), margin     # -log(sigmoid(margin)), implicit reward gap
+```
+
+**Monitor** the reward margin (should grow) and the chosen answers' log-probability (should not collapse: DPO can push both chosen and rejected down while widening the gap). Watch **length**: if chosen answers are systematically longer, DPO learns "longer is better", so length-match pairs or compare length distributions before and after.
+
+## Model merging
+
+Merging combines weights of models with the same architecture and base, with no further training:
+
+- **LoRA into its base** (`W + (α/r) B A`), to serve one ordinary model.
+- **Interpolation back toward the base**, `θ = (1 - λ) θ_base + λ θ_ft`. WiSE-FT (Wortsman et al. 2022) showed this can keep much of a fine-tune's gain while recovering robustness; sweep λ against the task and forgetting evals.
+- **Averaging** fine-tunes of one base trained with different hyperparameters (model soups, Wortsman et al. 2022).
+- **Task arithmetic** (Ilharco et al. 2023): add task vectors `θ_ft - θ_base` to combine skills. TIES-Merging (Yadav et al. 2023) trims small deltas and resolves sign conflicts; DARE (Yu et al. 2023) drops deltas at random and rescales the rest; SLERP interpolates along an arc. Tools such as mergekit implement these.
+
+```python
+def merge_task_vectors(base, finetunes, weights):
+    """base, finetunes: dicts of name -> array with matching shapes."""
+    return {name: w0 + sum(lam * (ft[name] - w0) for ft, lam in zip(finetunes, weights))
+            for name, w0 in base.items()}
+```
+
+The result is a new model: run the full eval. Different bases or tokenizers cannot be merged.
+
+## Fine-tune vs base evaluation
+
+"Beats the base model zero-shot" is a straw man. Compare on the same test set against:
+
+1. **The same base with your best prompt.** Did training beat prompting?
+2. **The teacher or frontier model with its best prompt.** How much of the ceiling, at what cost?
+3. **The current production system.**
+4. **A rules baseline**, if one exists: fast, free, explainable.
+
+Measure the task metric per slice, a general regression set (forgetting), format validity, p50 and p95 latency, and cost per 1,000 calls, on a test set split by time or source that never touched training, tuning or synthetic-data seeds ([contamination](/19-evals-methodology/#benchmarks-and-contamination)). Compare **paired**, item by item: a two-point aggregate gain can hide thirty newly broken cases.
+
+```python
+import random
+
+def paired_report(base_ok, ft_ok, n_boot=10_000, seed=0):
+    """base_ok, ft_ok: 0/1 per test item, same order."""
+    n, rng = len(base_ok), random.Random(seed)
+    fixed = sum(1 for b, f in zip(base_ok, ft_ok) if not b and f)
+    broken = sum(1 for b, f in zip(base_ok, ft_ok) if b and not f)
+    diffs = [f - b for b, f in zip(base_ok, ft_ok)]
+    boots = sorted(sum(rng.choice(diffs) for _ in range(n)) / n for _ in range(n_boot))
+    ci = (boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot)])
+    return {"delta": sum(diffs) / n, "ci95": ci, "fixed": fixed, "broken": broken}
+```
+
+**The promotion gate.** Ship only if the adapter beats comparisons 1 and 3 with an interval excluding zero, regresses no important slice beyond a threshold set in advance, and keeps the general set within noise. Put it in CI ([evals in CI](/20-evals-judges-and-ci/#evals-in-ci)) and re-run it when the base family updates: a newer base with a good prompt may beat your old fine-tune ([model upgrades](/32-deployment-and-llmops/#model-upgrade-regression-management)).
+
+## Hosted FT APIs vs self-run
+
+### What exists, as of November 2026
+
+This market moved a lot in 2026; check each provider's docs before relying on a line below.
+
+- **OpenAI** is winding down fine-tuning. Its guide says the platform is closed to new users; its deprecations page says active existing customers can create jobs until 6 January 2027, and fine-tunes run until their base model shuts down (`gpt-4.1-nano` and its fine-tunes on 23 October 2026, the GPT-4o and GPT-4.1 families on 14 January 2027).
+- **Google Vertex AI** offers supervised tuning for Gemini (its list includes 2.5 Pro, Flash and Flash-Lite and newer Flash and Flash-Lite models) and documents reinforcement-learning tuning.
+- **Amazon Bedrock** offers supervised fine-tuning, distillation, and reinforcement fine-tuning: launched December 2025 for Amazon Nova 2 Lite, extended in February 2026 to open-weight Qwen3 32B and gpt-oss-20b.
+- **Anthropic**: the Claude API offers no fine-tuning (its docs say to contact Anthropic). The one public route, Claude 3 Haiku on Bedrock, stopped taking new jobs when the model went legacy and reached end of life in September 2026.
+- **Open-weight training services**: Together AI, Fireworks, Hugging Face, and Thinking Machines' Tinker (a LoRA training API, generally available since 12 December 2025). You can usually download what you trained.
+- **Self-run**: TRL with PEFT and bitsandbytes, Unsloth, Axolotl, MLX-LM on Apple Silicon.
+
+The OpenAI wind-down is the lesson in one event: a fine-tune of a closed model lives and dies with that base model and the provider's product decisions, never leaves its platform, and sends your data across your boundary. An adapter on open weights is a file you own and can serve anywhere.
+
+### Serving what you trained
+
+Merged, a LoRA is an ordinary model at full speed on any engine. Unmerged, one base serves many adapters: S-LoRA (Sheng et al. 2023) keeps adapters in host memory, pages active ones onto the GPU beside the KV cache, and batches requests for different adapters together; Punica (Chen et al. 2023) built kernels for the same multi-tenant batching. vLLM serves several LoRAs on one base, selected per request by model name (`--enable-lora`, adapters registered with `--lora-modules name=path`, `--max-lora-rank` set to your largest rank), and Ollama attaches one with an `ADAPTER` line in a Modelfile. For 20 per-customer variants of an 8B model: 20 full fine-tunes is 320 GB of weights; 20 LoRAs is 16 GB + 20 × 84 MB ≈ 17.7 GB. Unmerged adapters add some per-token compute; measure at your concurrency.
+
+<Production>
+
+**Failure modes.**
+- Catastrophic forgetting of abilities you never tested; overfitting to format, so the model turns rigid when inputs drift.
+- The stale fine-tune: the base family improves every few months while your adapter pins an old base. Re-run the gate against "new base plus prompt" on each release.
+- Train/serve skew in template, system prompt or quantization, and silent truncation that trained on prompts with no answer.
+
+**Cost.**
+- The training run is usually cheap: 4,000 examples × 400 tokens × 2 epochs = 3.2M tokens, about 27 minutes at a measured 2,000 tokens a second. Labelling, evals and retraining labour cost more.
+- Self-hosting has a monthly GPU floor, so compute break-even volume first; multi-LoRA spreads one base across many adapters. Hosted custom models may carry an inference premium.
+
+**Latency.** A smaller tuned model cuts time to first token and per-token time, and a dropped few-shot prompt cuts prefill. A cascade costs `t_student + f × t_teacher` on average; keep f on a dashboard.
+
+**Observability.** Version dataset hash, base revision, config and eval report with each adapter; log the adapter id on every trace; treat confidence and cascade-rate shifts as drift; eval before every promotion.
+
+**Security.**
+- Memorisation: models can reproduce training strings (Carlini et al. 2021). Scrub PII, and never serve tenant A's adapter to tenant B.
+- Fine-tuning can erode safety behaviour even on benign data (Qi et al. 2023); re-run the refusal set.
+- A flywheel fed by users can be poisoned; sample and review before data enters training. Check the base model's licence.
+
+</Production>
+
+<Interview>
+
+<Q q="When does fine-tuning beat RAG, and when doesn't it?">
+
+- Start from the failure: missing or changing knowledge versus wrong behaviour.
+- Fine-tuning wins for behaviour (format, tone, label boundaries, tool-call schema) and for making a small model do a large model's narrow job (cost, latency, self-hosting).
+- RAG wins for facts: freshness, citations, per-user access control, no retraining. Facts trained in can raise hallucination (Gekhman et al. 2024).
+- Prompt first in both cases; fine-tune when the prompt plateaus on an eval or costs too much at volume (`N × saved_tokens × price`).
+- Strong systems combine them: RAG for facts, a tuned generator that cites and abstains.
+- **The trap:** "fine-tune it on our documents so it knows them." It will sound like your documents and still invent the specifics.
+
+</Q>
+
+<Q q="Explain LoRA. Why does it use so little memory?">
+
+- Freeze W; learn `ΔW = B A`, B (d × r), A (r × k), small r; forward `W x + (α/r) B A x`; B starts at zero so training starts from the base.
+- Per matrix, d × k trainable becomes r × (d + k): 16.8M to 131K for 4,096 × 4,096 at r = 16; about 42M (0.5%) for all linear layers of an 8B model.
+- Gradients, fp32 master weights and Adam states (about 14 bytes per parameter) exist only for those 42M: about 0.6 GB instead of 112 GB.
+- It does not cut frozen weights or activations; QLoRA and gradient checkpointing handle those.
+- Merge for zero added latency, or keep adapters separate and swap per request.
+- Trade-off: on large knowledge-heavy training LoRA learns less but forgets less (Biderman et al. 2024).
+- **The trap:** saying LoRA "compresses the model" or cuts activation memory.
+
+</Q>
+
+<Q q="How much GPU memory do you need to fine-tune a 7B model with QLoRA?">
+
+- Weights: about 7B × 4.127 bits ≈ 3.6 GB in NF4 with double quantization, plus about 2 GB if a Llama-3-sized embedding and head stay in bf16.
+- Adapters: about 40M parameters × (2 + 14) bytes ≈ 0.65 GB.
+- Activations with checkpointing: `layers × seq × hidden × 2` ≈ 0.5 GB per 2K-token sequence, plus about 1 GB of fp32 logits with a 128K vocabulary.
+- Plus 1 to 2 GB overhead: roughly 8 to 10 GB. A 16 GB T4 works at batch 1 with gradient accumulation; 24 GB is comfortable. Confirm with `max_memory_allocated`.
+- Contrast: LoRA on bf16 about 18 GB; full fine-tuning about 16 × 7B ≈ 112 GB plus activations.
+- **The trap:** quoting only the 4-bit weights and forgetting activations, logits and optimizer state.
+
+</Q>
+
+<Q q="Design a distillation pipeline from a frontier model to a small model for classification.">
+
+- **Scope and SLOs:** labels, volume, accuracy target relative to the teacher, p95 latency, cost per 1,000 calls, residency.
+- **Data:** real inputs from logs, PII scrubbed, deduplicated, stratified; a human-labelled gold set split by time, test only.
+- **Labelling:** teacher with its best prompt, k samples; unanimous labels become silver training data; disagreements go to humans. Check the provider's terms.
+- **Student:** small open model, LoRA, loss on label tokens; a learning curve decides whether more data pays.
+- **Evals:** student vs teacher vs prompted base vs rules baseline on gold, per slice, paired, with a bootstrap interval.
+- **Serving:** student first; label-token probability as confidence; below a tuned threshold, cascade to the teacher.
+- **Observability and cost:** adapter id on traces, cascade-rate and confidence-drift dashboards; break-even = GPU monthly floor ÷ teacher cost per call.
+- **The trap:** evaluating on teacher labels, which measures agreement with the teacher's mistakes.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Distill one narrow Answer Grader task (`~/answer-grader`) into a LoRA on a small open model, offline, and decide honestly whether it should replace the rules doing the job today. Work in a new folder such as `scripts/ft_question_guard/`.
+
+**Task.** Students sometimes type an instruction into the question box. `backend/question_guard.py` catches this with a regex, and `tests/test_question_guard.py` lists hard cases (real questions starting with "Evaluate" or "Analyse" must survive). Your model labels typed text `QUESTION`, `INSTRUCTION` or `MIXED`.
+
+**Models, no paid API.** Teacher: the largest instruct model you can run in Ollama, standing in for the frontier model. Student: a 0.5B to 1.5B instruct model from Hugging Face (for example Qwen2.5-0.5B-Instruct), trained with MLX-LM's LoRA command on Apple Silicon or PEFT and TRL on a free Colab T4 (fp16).
+
+1. **Gold set, test only:** 150 to 200 inputs labelled by you (the test strings, real questions from the repo's question corpus, instructions and mixed cases you write, Hinglish variants), with written label definitions.
+2. **Training inputs:** 1,500 to 3,000 teacher-generated variants along named axes; dedupe against gold.
+3. **Teacher labels:** three samples per input at non-zero temperature; keep unanimous ones; review a sample of disagreements.
+4. **Clean** with this chapter's validator; read three rendered examples.
+5. **Baselines on gold:** the regex (`is_instruction`, with `INSTRUCTION` and `MIXED` as true), the student base with a few-shot prompt, the teacher.
+6. **Train:** LoRA r = 16, two epochs, completion-only loss; also 25% and 50% runs for a learning curve.
+7. **Evaluate:** accuracy, macro-F1, false-positive rate on real questions (the expensive error), fixed and broken counts versus the prompted base with a bootstrap interval, p50 and p95 latency, and cost per 1,000 calls by formula (local wall-clock × an illustrative GPU-hour price; the teacher priced as if it were an API, computed not called). Run twenty general prompts before and after for forgetting.
+
+**Done when** you have a four-row table (regex, prompted base, teacher, LoRA student) with those metrics, the learning-curve plot, the adapter saved with its data hash and config, and a paragraph choosing: ship the student, keep the regex, or cascade (regex first, student on the rest). "Keep the regex" is a legitimate result.
+
+Alternative in Scheme Assistant (`~/scheme-assistant`): small talk versus scheme questions in Hindi and Hinglish, with the rule-based `src/app/core/smalltalk.py` (a teammate's code) as the baseline.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Say the gap plainly.** None of your repos fine-tunes an LLM: no LoRA, PEFT or training jobs. Say so, then show you know when you would, with the decision procedure and the exercise above.
+- **Answer Grader `backend/question_guard.py`** (yours) is step 4 of the procedure in real life: a behaviour failure (a typed instruction became the question the pipeline built on) fixed by a cheap rule, with `tests/test_question_guard.py` pinning the false positives. It is the baseline any tuned classifier must beat.
+- **Answer Grader `backend/annotation.py`** (yours) has the default chat model (GPT-4o unless `backend/llm.py` is configured otherwise) draft annotations "for human review": the front half of a distillation pipeline, teacher labels plus a human gate. Be ready to say what you would hold out as gold.
+- **Answer Grader `backend/calibration.py`** (yours) fixed inflated rubric scores by mapping them onto anchors from 143 real marksheets instead of retraining the evaluator: the "cheaper lever first" story.
+- **Certificate Assistant `app/backend/learning.py`** (yours): `fit()` is a ridge-regularised logistic regression shrunk toward the EM weights, so a few hundred officer labels cannot swing the model. Same idea as LoRA's low rank or DPO's reference model: learn from little data without forgetting the prior. `app/backend/evaluate.py` scores held-out lineages by slice.
+- **Scheme Assistant `src/app/core/providers.py`** (mostly a teammate's code) chooses Gemini or Ollama: where a fine-tuned local model would plug in for residency. Call it "our pipeline".
+
+</YourProject>

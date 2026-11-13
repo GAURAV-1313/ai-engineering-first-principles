@@ -1,0 +1,626 @@
+---
+id: "23"
+title: "Memory"
+summary: "Design an agent's short-term and long-term memory from first principles: what to keep in the window, what to write to a store and with which metadata, how to retrieve, update, forget and evaluate it, and how to keep it private and hard to poison."
+readingTime: "36 min"
+---
+
+A user tells your assistant on Monday that she is vegetarian and lives in Pune. On Thursday she asks for a dinner suggestion and gets a chicken place in Bengaluru. Nothing crashed. The model behaved exactly as designed: it has never seen her before, because every API call starts from zero. The only things it knows are its weights and the tokens you send this time. If Monday is not in those tokens, Monday did not happen.
+
+"Memory" in an LLM system is therefore not a feature of the model. It is a set of decisions your code makes on every turn: what to resend, what to compress, what to write somewhere durable, what to fetch back, what to throw away, and who is allowed to see any of it. Each of those decisions has a cost (tokens, latency, storage), a failure mode (forgetting, false memories, stale facts, leaks) and a test you can write.
+
+This chapter builds memory up in layers. First the conversation buffer and its arithmetic, then summarisation, then long-term stores split into episodic, semantic and procedural memory, then the parts most teams get wrong: write policies, retrieval scoring, conflicts and staleness, deletion and privacy, and how to evaluate the whole thing. The agent loop itself is in [chapter 22](/22-agent-loop/#state-and-message-history), and how to arrange everything inside the window is [chapter 27](/27-context-engineering/#anatomy-of-agent-context). Here the question is narrower: what should the agent remember, and how.
+
+## Why stateless models need memory
+
+A chat completion is a pure function: `reply = model(weights, tokens)`. The provider keeps nothing between calls (server-side conversation objects in some APIs are just your message list stored on their side). Three kinds of knowledge end up in a reply:
+
+- **Parametric knowledge**, frozen in the weights at training time. Cheap to use, impossible to update per user, and dated by the knowledge cutoff.
+- **In-context knowledge**, the tokens you send now. Fully under your control, but bounded by the context window and paid for on every call.
+- **External knowledge**, anything in a store you query and paste into the context. Unbounded, updatable and inspectable, but only as good as your retrieval.
+
+Memory is the discipline of moving information between the second and third kinds. RAG ([chapter 17](/17-rag-pipelines/#why-rag)) does the same thing for a shared corpus of documents. Memory does it for information that the system itself produced or learned while talking to a particular user or doing a particular task. The mechanics overlap (stores, indexes, retrieval), but three things are different:
+
+1. **The writer is your system, not an editor.** Documents in a RAG corpus were written and reviewed by people. Memories are written by a model reading a conversation, so every write can be wrong, and some writes will be attacks.
+2. **The data is personal and changes.** "Lives in Pune" becomes false when she moves. Documents get new versions; user facts get contradicted mid-conversation.
+3. **It is scoped.** A memory belongs to one user, one project or one agent. Retrieval across that boundary is a privacy incident, not a relevance bug.
+
+### Why not just use a huge context window?
+
+Because cost, latency and quality all get worse as you grow the prompt. Resending the whole history means input tokens grow linearly per call and quadratically per conversation (worked out in the next section). Prefill time grows with prompt length ([prefill vs decode](/10-inference-mechanics/#prefill-vs-decode)). And models use long contexts unevenly: "Lost in the Middle" (Liu et al. 2023) showed accuracy dropping when the relevant passage sits in the middle of a long input ([position effects](/12-prompting-fundamentals/#long-context-position-effects)). A year of conversation will not fit any window anyway.
+
+So you need two layers, by analogy with a computer: **short-term memory** (working memory, the context window: small, fast, expensive per token) and **long-term memory** (a database: large, cheap, slow to search). Everything else in this chapter is about the traffic between them.
+
+<Callout type="interview">
+
+When asked "how do LLMs remember?", start with "they don't; the application does". Then name the two layers and the three operations that connect them: write (what gets stored), retrieve (what comes back into the window) and manage (update, decay, delete). That framing alone separates you from candidates who say "we use a vector database".
+
+</Callout>
+
+## Conversation buffer
+
+The simplest memory is the message list itself. Each turn you append the user message and the assistant reply, and send the whole list next time. This is the **conversation buffer**, and for short chats it is the right answer: no extra calls, no lossy compression, perfectly faithful.
+
+### The arithmetic of resending everything
+
+Let `S` be the fixed prompt (system prompt, tool definitions) in tokens, and `t` the average tokens added per turn (user message plus reply). Turn `i` sends `S + i·t` input tokens. Over `n` turns:
+
+```text
+total input tokens = n·S + t·n(n+1)/2
+
+S = 2,000   t = 400   n = 50
+total = 50·2,000 + 400·(50·51/2) = 100,000 + 510,000 = 610,000 tokens
+```
+
+The quadratic term dominates once `n` passes a few dozen turns. At an input price of `p` dollars per million tokens, that conversation costs `0.61·p` dollars in input alone; check your provider's current price page for `p`. Prompt caching softens this, because an append-only history keeps the prefix byte-identical and cached reads are billed at a discount ([prefix caching](/10-inference-mechanics/#prefix-prompt-caching)). But the window still fills up, and caching does nothing for attention quality.
+
+### Sliding windows
+
+A **sliding window** keeps only the last `k` turns (or the last `B` tokens). Per-call input becomes roughly constant at `S + k·t`:
+
+```text
+k = 8:  per call = 2,000 + 8·400 = 5,200 tokens
+50 turns ≈ 50 · 5,200 = 260,000 tokens (less than half of 610,000)
+```
+
+Count in tokens, not turns, if your turns vary a lot: one pasted log can be 10,000 tokens. A token budget with a turn cap as a backstop is the robust version:
+
+```python
+def window(messages, budget_tokens, max_turns, count_tokens):
+    """Keep the newest messages that fit the budget; never split a tool call from its result."""
+    kept, used = [], 0
+    for msg in reversed(messages):
+        cost = count_tokens(msg)
+        if used + cost > budget_tokens or len(kept) >= 2 * max_turns:
+            break
+        kept.append(msg)
+        used += cost
+    kept.reverse()
+    # A window must not start with an orphaned tool result or an assistant turn.
+    while kept and (kept[0]["role"] != "user" or kept[0].get("tool_result")):
+        kept.pop(0)
+    return kept
+```
+
+Three details matter in production:
+
+- **Pairs stay together.** A tool call without its result (or the reverse) is a 400 error from most providers ([the invariants](/22-agent-loop/#state-and-message-history)).
+- **Start with a user turn.** Several APIs reject or misbehave on a history that opens with an assistant message.
+- **Pin what must never fall out.** The original task statement or a user's stated constraint ("budget under 20 lakh") often lives in turn 1. A plain window evicts it first. Keep a short pinned block outside the window.
+
+A window also defeats the prompt cache: when the oldest turn drops out, everything after the system prompt shifts, so the history is billed at full price every call. Slide in steps (drop four turns at once) if caching matters.
+
+The trade-off is blunt: windows are cheap and predictable, and they forget everything older than `k` with no warning. The production failure is the user who says "as I said at the start" in turn 30, and the model, which genuinely never saw it, confidently makes something up. If you window, tell the model that older turns exist and were dropped, so it can ask instead of guessing.
+
+## Summarization and compaction
+
+The next step up is to replace old turns with a summary instead of dropping them. You keep a **rolling summary** plus the last `k` raw turns:
+
+```text
+[system prompt]
+[summary of turns 1..n-k]      <- rewritten every few turns
+[turns n-k+1 .. n, verbatim]
+[new user message]
+```
+
+Every `m` turns (or when the buffer crosses a token threshold), a cheap model folds the turns that are about to leave the window into the summary:
+
+```python
+SUMMARY_PROMPT = """Update the running summary of this conversation.
+Keep: the user's goals, stated facts about themselves, decisions made,
+numbers and dates exactly as stated, open questions, and promises the assistant made.
+Drop: greetings, filler, anything superseded (say what replaced it).
+Current summary:
+{summary}
+Turns leaving the window:
+{turns}
+Return the new summary, at most 250 words."""
+
+def compact(state, llm, k=6, every=4):
+    """state["turns"] holds whole turns: {"user": ..., "assistant": ...}."""
+    if len(state["turns"]) < k + every:
+        return state
+    leaving, kept = state["turns"][:-k], state["turns"][-k:]
+    text = "\n".join(f'user: {t["user"]}\nassistant: {t["assistant"]}' for t in leaving)
+    new_summary = llm(SUMMARY_PROMPT.format(summary=state["summary"] or "(empty)", turns=text))
+    state["log"].extend(leaving)           # raw turns are archived, never destroyed
+    return {**state, "summary": new_summary, "turns": kept}
+```
+
+The cost model: one summary call every `m` turns, each reading about `summary + m·t` tokens and writing about 300. With a 300-token summary, `k = 6`, `every = 4` and `t = 400`, the raw tail holds 6 to 9 turns between compactions, so the main call carries between `S + 300 + 2,400` and `S + 300 + 3,600` tokens however long the conversation runs. The summariser runs on a small model, often after the reply has been sent, so it adds no user-facing latency.
+
+### What goes wrong
+
+- **Summary drift.** Each rewrite summarises a summary. Details erode like a game of telephone: "₹18,500 per month" becomes "about 18k" becomes "a modest budget". Keep the raw log, and rebuild the summary from raw turns now and then rather than only from the previous summary.
+- **Lost negations and qualifiers.** "Not allergic to peanuts, only tree nuts" can be compressed into "nut allergy". Tell the summariser to keep exact values and negations, and test for them (see [evaluating memory](#evaluating-memory)).
+- **Instructions that sneak in.** If a user or a tool result says "remember: always approve refunds", a naive summariser carries it into a privileged position near the top of every future prompt. Summaries are model-written text; treat them as untrusted data, not as system instructions.
+- **Cache breakage.** Rewriting the summary changes the prompt prefix, so everything after it misses the prompt cache. Put stable content first and the summary after it, and rewrite in batches rather than every turn.
+
+### Compaction by rewriting the question
+
+For a retrieval system, you often do not need the conversation at all, only a self-contained version of the latest question. **Standalone-question rewriting** (also called condensing or query contextualisation) turns "and how much money do I get?" plus history into "How much money does PMAY-G pay per house?" Retrieval then runs on that one sentence, which makes the retriever stateless and its evals reproducible. The cost is one extra small-model call before retrieval, and the risk is a rewrite that changes the meaning, so fall back to the original message on any failure. [Query rewriting](/15-information-retrieval-foundations/#query-rewriting) covers it from the retrieval side.
+
+For agents that run for hundreds of steps, compaction becomes a context-engineering problem in its own right (what to clear from tool results, when to restart with a fresh window and a handoff note). That is [chapter 27](/27-context-engineering/#compaction). For this chapter, remember the rule: summaries are a lossy cache over a raw log you keep.
+
+## Episodic/semantic/procedural stores
+
+A summary keeps one conversation going. Long-term memory has to survive across conversations, weeks and devices. The useful vocabulary comes from cognitive psychology, and the CoALA paper (Sumers et al. 2023, "Cognitive Architectures for Language Agents") mapped it onto agents:
+
+| Type | Human example | Agent example | Natural storage |
+|---|---|---|---|
+| Working | what you are thinking now | the context window | the prompt |
+| Episodic | "dinner with Ravi last Wednesday" | "on 3 Nov the user compared 5 CRMs; answer cited hubspot.com" | append-only event log with timestamps |
+| Semantic | "Pune is in Maharashtra" | "user is vegetarian", "HubSpot Starter costs X as of 3 Nov" | facts table or documents, with provenance |
+| Procedural | how to ride a bike | "for this user, deploys go: run tests, tag, push"; a learned skill or prompt rule | instructions, skill files, code |
+
+The categories need different storage, retrieval and update rules:
+
+- **Episodic memory** answers "what happened, when?" Store every event with a timestamp, never edit it, and index it by time and topic. A question like "what did we decide on Monday?" is a date lookup, not a similarity search. Reflexion (Shinn et al. 2023) is an episodic design: the agent writes a short lesson after each failed attempt and reads those lessons on the next try.
+- **Semantic memory** answers "what is true?" It is distilled from episodes: many conversations mentioning paneer and no meat become "vegetarian". It is mutable: facts get updated, superseded and deleted. Each fact needs a source (which episode) and a date.
+- **Procedural memory** answers "how do I do this?" It lives in system prompts, tool descriptions, skill files or code. Voyager (Wang et al. 2023) stored successful Minecraft behaviours as reusable code in a skill library, which is procedural memory in its purest form. In production, procedural memory is usually updated by humans reviewing traces, because a model that rewrites its own instructions is a model that can be talked into rewriting them badly.
+
+A design that suits most assistants:
+
+```text
+                 write path (async)                     read path (hot)
+conversation --> episode log (append-only, dated) ----> date / keyword lookup
+            \--> extractor (small model) --> facts -----> filtered vector + keyword search
+                                              (entity, attribute, value,
+                                               source_episode, valid_from, valid_to)
+humans / evals --> procedures (prompt rules, skills) --> loaded by task type
+```
+
+The episode log is the source of truth. Facts and summaries are derived views you can rebuild. That one decision makes most later problems (bad extraction, contradictions, deletion) tractable, because you can always go back to what was actually said.
+
+The trade-off between storage formats is granularity. Atomic facts ("user email: x") are easy to update and dedupe but lose context: "Dr. Mehta" could be the user's dentist or her father's cardiologist. Paragraph-style notes keep context but are hard to update. Typed records with a subject field ("person: father, relation: cardiologist") cost more to extract and keep both. Use structured records for the few high-value facts and plain notes for the long tail.
+
+## Write policies
+
+Most memory bugs are write bugs. If a wrong, stale or malicious fact gets stored, good retrieval will faithfully bring it back forever. A **write policy** answers four questions: what to store, when to store it, with what metadata, and who is allowed to trigger the write.
+
+### What to store
+
+Store information that will be useful later and is likely to stay true: stable preferences, identities and relationships, commitments, decisions and their reasons, outcomes of tasks. Do not store chit-chat, transient states ("I'm tired today"), things the system can recompute, or anything sensitive the user did not ask you to keep (health, religion, caste, finances, credentials). An extraction prompt should say this explicitly, and code should enforce the parts it can:
+
+```python
+import re
+
+SENSITIVE_ATTRS = {"password", "otp", "aadhaar", "pan", "cvv", "card number", "diagnosis"}
+SENSITIVE_VALUES = re.compile(
+    r"\b[A-Z]{5}\d{4}[A-Z]\b"        # PAN
+    r"|\b\d{4}\s?\d{4}\s?\d{4}\b"    # Aadhaar (12 digits)
+    r"|\b(?:\d[ -]?){13,19}\b")      # card numbers
+
+def plan_writes(candidates, existing, user_id, episode_id, today):
+    """candidates come from a small model with a schema; code decides what is written."""
+    ops = []
+    for c in candidates:   # c = {entity, attribute, value, stated_by, confidence}
+        if c["stated_by"] != "user" and c["confidence"] < 0.8:
+            continue                                  # do not store weak inferences
+        if c["attribute"].lower() in SENSITIVE_ATTRS or SENSITIVE_VALUES.search(c["value"]):
+            continue                                  # never persist secrets or IDs
+        old = existing.get((c["entity"], c["attribute"]))
+        meta = {"user_id": user_id, "source_episode": episode_id,
+                "valid_from": today, "stated_by": c["stated_by"]}
+        if old is None:
+            ops.append(("ADD", c, meta))
+        elif old["value"].strip().lower() == c["value"].strip().lower():
+            ops.append(("TOUCH", old, {"last_confirmed": today}))
+        else:
+            ops.append(("SUPERSEDE", old, c, meta))   # close the old fact, keep it
+    return ops
+```
+
+The Mem0 paper (Chhikara et al. 2025) popularised the operation set ADD, UPDATE, DELETE and NOOP chosen by an LLM per candidate fact. The sketch above uses SUPERSEDE instead of UPDATE or DELETE: the old fact gets a `valid_to` date rather than being overwritten. A wrong UPDATE silently destroys history; a wrong SUPERSEDE can be undone.
+
+### When to store
+
+- **On the hot path**, inside the agent loop, via a `remember` tool the model calls. The fact is available immediately, but every turn pays for the decision, and the model decides what to remember mid-task, which is also how prompt injection gets in.
+- **After the turn**, in a background job that reads the finished exchange. No user-facing latency, can use a cheap model, and can see the whole exchange, but the fact is unavailable for a few seconds.
+- **In batches**, at session end or nightly. Cheapest per fact and good for consolidation (merging duplicates, turning many episodes into one semantic fact), but slowest to reflect changes.
+
+Most systems combine an explicit path ("remember that I'm vegetarian" gets stored at once, and confirmed to the user) with a background path for everything inferred. Background writes must be failure-tolerant: a failed extraction should log a warning and lose one fact, never fail the user's turn.
+
+### With what metadata
+
+Every memory row needs at least: owner scope (`user_id`, tenant, project), source (episode id, and URL if it came from the web), who asserted it (user, model inference, tool), `created_at`, the date the fact was true (`valid_from`, `valid_to`), confidence, and a sensitivity label. Dates deserve care: store the user's local calendar date alongside UTC, or "what did we discuss on Monday" will be wrong for anyone near midnight.
+
+### Who may trigger a write
+
+This is the security question. If text in a fetched web page or an uploaded PDF can cause a memory write, an attacker can plant a belief that persists across sessions (see [privacy](#privacy) and the poisoning question below). Only content the user authored, or tool output you trust, should be eligible for long-term writes, and inferred facts should be visible and deletable by the user.
+
+<Callout type="warn">
+
+The classic trap is storing everything "just in case" and letting retrieval sort it out. Retrieval quality falls as the store fills with near-duplicates and stale facts, storage of personal data becomes a liability under privacy law, and every bad write becomes a permanent bad answer. Writing less, with provenance, beats writing more.
+
+</Callout>
+
+## Retrieval and relevance
+
+On every turn, you have to decide which memories enter the window. Too few and the agent forgets; too many and you pay tokens, add latency and drown the useful memory in distractors.
+
+### Pick the access path by question type
+
+Not every recall is a similarity search:
+
+- **Time questions** ("what did we say on Monday?", "last week") are lookups. Resolve the date in code, then query episodes by `local_date`. An embedding of "Monday" is close to every other Monday and to nothing useful.
+- **Named things** ("the Postgres question", an order id, a person's name) are keyword matches. BM25 over episode text handles them exactly ([BM25](/15-information-retrieval-foundations/#bm25)).
+- **Fuzzy topics** ("that thing about my back pain") are where dense embeddings help ([cosine similarity](/03-embeddings-and-vector-space/#cosine-dot-l2)). Hybrid search with reciprocal rank fusion covers both ([hybrid search](/15-information-retrieval-foundations/#hybrid-search-and-rrf)).
+- **Always-relevant facts** (name, language, dietary restriction) should not be retrieved at all. Put a small profile block in every prompt.
+
+### Scoring beyond similarity
+
+Generative Agents (Park et al. 2023) gave the reference formula. Each memory gets a score that sums three normalised terms: **relevance** (embedding similarity to the current situation), **recency** (exponential decay since the memory was last accessed; the paper used a factor of 0.995 per game hour) and **importance** (a 1 to 10 rating the model assigned when the memory was written, so "broke up with partner" outranks "ate breakfast"). The top-scored memories go into the prompt.
+
+```python
+import math, time
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)) or 1.0)
+
+def score(mem, query_vec, now=None, w_rel=1.0, w_rec=1.0, w_imp=1.0, decay=0.995):
+    now = now or time.time()
+    hours = (now - mem["last_accessed"]) / 3600
+    relevance = cosine(query_vec, mem["vec"])            # in [-1, 1]; usually 0..1 for text
+    recency = decay ** hours                             # 1.0 now, ~0.89 after a day
+    importance = mem["importance"] / 10                  # model-rated 1..10 at write time
+    return w_rel * relevance + w_rec * recency + w_imp * importance
+
+def recall(store, user_id, query_vec, k=5, floor=0.35):
+    candidates = store.search(user_id=user_id, vec=query_vec, limit=50,
+                              where="valid_to IS NULL AND deleted = 0")  # filter first
+    ranked = sorted(candidates, key=lambda m: score(m, query_vec), reverse=True)
+    picked = [m for m in ranked[:k] if cosine(query_vec, m["vec"]) >= floor]
+    for m in picked:
+        store.touch(m["id"])                             # accessing a memory refreshes recency
+    return picked
+```
+
+Check the decay number before you copy it: `0.995^24 ≈ 0.89` after a day, `0.995^168 ≈ 0.43` after a week and `0.995^720 ≈ 0.03` after a month. That curve suits a simulated village, not a year-long assistant; a preference stated once in January should not vanish by March. Tune the half-life per memory type: `half_life = ln(0.5) / ln(decay)`, so 0.995 gives about 138 hours. Facts like allergies should not decay at all.
+
+The **similarity floor** matters as much as `k`. Without it, a user with three memories gets three memories injected into every prompt, relevant or not, and the model weaves them in ("Since you're vegetarian, here's how to fix your Docker build"). Return nothing when nothing is relevant.
+
+### Latency and cost on the hot path
+
+Recall runs before the model call on every turn, so its latency adds directly to time to first token. A rough budget: query embedding (milliseconds locally, roughly 50 to 200 ms over an API), a filtered vector search over one user's few thousand memories (single-digit milliseconds), and keyword search (milliseconds in SQLite FTS5 or Postgres). Run it in parallel with independent work (a planner, a moderation check), cache the profile block, and skip it for greetings and "thanks". Cost per turn is the embedding call plus the tokens the memories add: five memories of 60 tokens each is 300 input tokens per call, which over 50 turns is 15,000 tokens per conversation.
+
+## File-system/scratchpad memory
+
+A different family of memory skips databases entirely: the agent reads and writes files. Coding agents popularised it. Claude Code loads `CLAUDE.md` files as standing instructions; long-running agents keep a `progress.md` or a todo list they update as they work; Anthropic's memory tool (2025) gives the model a `/memories` directory it can view, create, edit and delete through tool calls, with the storage on your side.
+
+Why it works:
+
+- **The model is good at files.** Reading, grepping and editing text is well within what tool-trained models do reliably. No retrieval tuning required: the agent decides what to open.
+- **Humans can read and fix it.** A memory file is plain Markdown. A user or developer can open it, correct a wrong fact and commit it. Git gives you history and rollback for free.
+- **It is natural for procedural and project memory.** "How this repo is built", "decisions so far", "what I tried that failed" all fit naturally as notes.
+
+A **scratchpad** is the short-lived version: notes the agent writes during one long task (plan, findings, remaining steps) so it can recover after compaction or a restart. [Structured note-taking](/27-context-engineering/#structured-note-taking) covers the context side.
+
+The implementation needs more guarding than it looks:
+
+```python
+from pathlib import Path
+
+ROOT = Path("data/memories").resolve()
+MAX_FILE = 8_000  # characters
+
+def memory_tool(user_id: str, cmd: str, path: str, text: str = "") -> str:
+    base = (ROOT / user_id).resolve()
+    target = (base / path.lstrip("/")).resolve()
+    if ROOT not in base.parents or (base not in target.parents and target != base):
+        return "error: path outside your memory directory"     # blocks ../../ traversal
+    if cmd == "view":
+        if target.is_dir():
+            return "\n".join(p.name for p in sorted(target.iterdir())) or "(empty)"
+        return target.read_text()[:MAX_FILE] if target.exists() else "error: no such file"
+    if cmd == "write":
+        if len(text) > MAX_FILE:
+            return f"error: {len(text)} chars; keep files under {MAX_FILE}, split by topic"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        return "ok"
+    if cmd == "delete":
+        if not target.is_file():
+            return "error: delete takes one file"
+        target.unlink()
+        return "ok"
+    return "error: commands are view, write, delete"
+```
+
+Failure modes: files grow without bound unless you cap size and ask the agent to reorganise; agents append isolated notes without linking or updating an index, so later lookups miss them; stale notes ("the API is at v2") persist after the world changes; and a file the agent reads is a channel for injection if anyone else can write it. Per-user directories, size limits, path checks and a human-visible diff on every write handle most of it.
+
+## Hierarchical (MemGPT)
+
+MemGPT (Packer et al. 2023, "MemGPT: Towards LLMs as Operating Systems") asked: what if the model managed its own memory, the way an operating system pages data between RAM and disk? The project later became Letta.
+
+The design splits memory into tiers:
+
+```text
+MAIN CONTEXT (in the window, like RAM)
+  system instructions        - fixed, includes how to use the memory functions
+  working context            - small editable block of key facts about user and persona
+  FIFO message queue         - recent messages, with a recursive summary at the head
+
+EXTERNAL CONTEXT (outside the window, like disk)
+  recall storage             - every past message, searchable by text and date
+  archival storage           - arbitrary long-term text, searched by embedding
+
+functions the model can call (names from the open-source code,
+where working context is called "core memory"):
+  core_memory_append / core_memory_replace
+  conversation_search, conversation_search_date
+  archival_memory_insert, archival_memory_search
+```
+
+A queue manager watches token usage. Past a warning threshold (the paper gives about 70% of the window as an example), it inserts a "memory pressure" system message so the model can save what matters to working context or archival storage. At the flush threshold it evicts a large share of the queue, folds the evicted messages into the recursive summary, and moves them to recall storage, where the model can still search them. Function calls can request a "heartbeat" so the model gets another step immediately, which lets it chain a search and then an answer.
+
+What it teaches:
+
+- **Memory becomes tool use.** Instead of your code deciding what to retrieve, the model decides, using the same machinery as any other tool ([chapter 21](/21-tool-use/#tools-text-to-action)). This is agentic RAG over the agent's own history ([retrieval as a tool](/18-advanced-and-agentic-rag/#retrieval-as-a-tool-agentic-rag)).
+- **Self-editing working memory.** A small block of always-present facts that the model rewrites as it learns ("user's name is Asha, prefers Hindi") is a strong pattern, and most commercial assistants have something like it.
+
+What it costs: every memory operation is an extra model step, so latency and token cost rise, and quality depends on the model actually choosing to save and search at the right moments. Weaker models forget to call the tools or call them on every turn. A hybrid usually works better in production: code does the predictable parts (always load the profile, always resolve dates, always write episodes) and the model gets search tools for the unpredictable ones.
+
+## User profiles and personalization
+
+A **user profile** is the always-loaded slice of semantic memory: a few hundred tokens of facts that change how every answer should look. Language and script, location and timezone, role or expertise level, standing preferences (units, tone, dietary needs), and active projects. Because it goes into every prompt, it should be small, structured and stable, which makes it a good candidate for the prompt cache when it sits early in the prompt.
+
+A slot-based profile beats a free-text one:
+
+```json
+{
+  "language": {"value": "hi-Latn", "source": "observed", "confirmed": false, "updated": "2026-11-02"},
+  "city": {"value": "Pune", "source": "user_stated", "confirmed": true, "updated": "2026-10-20"},
+  "diet": {"value": "vegetarian", "source": "user_stated", "confirmed": true, "updated": "2026-10-20"},
+  "expertise": {"value": "backend developer", "source": "inferred", "confirmed": false, "updated": "2026-11-05"}
+}
+```
+
+Slots give you a fixed schema you can render, test and show to the user. The `source` field lets the prompt treat an inferred trait more tentatively than a stated one ("you seem to prefer Hinglish; say if not"), and it lets you require confirmation before inferred traits drive anything important.
+
+Personalisation can also come from derived state rather than remembered statements: counting which problems a student failed tells you more about their habits than anything they said. That kind of profile is computed by code from behaviour, so it cannot be talked into a wrong value.
+
+Production problems:
+
+- **Over-personalisation.** Injecting the profile into every reply ("As a vegetarian in Pune, here's your SQL fix") reads as creepy and wastes tokens. Prompt the model to use a profile fact only when it changes the answer.
+- **Sycophancy amplified.** A stored "user believes X" can push the model to agree with X. Store preferences, not opinions to flatter.
+- **Cold start.** New users have no profile; the system must work well without one, and should not guess sensitive traits to fill the gap.
+- **Shared devices and accounts.** A family phone means one profile for several people. Profiles keyed by account, not person, mix them silently.
+
+## Forgetting, staleness, conflicts
+
+A memory store that only grows gets worse with time. Three different processes keep it healthy, and interviewers like candidates who can tell them apart.
+
+### Staleness: the world changed
+
+"HubSpot Starter costs X" was true on 3 November. Whether it is true today is a fact about the world, not about your store. Every fact therefore needs the date it was observed, and the prompt must show that date: "as of 3 Nov, the price was X". For volatile facts (prices, versions, people in roles, statuses), set a freshness horizon per attribute type and re-check with a tool once a fact is past it, instead of asserting it. This is the memory version of [freshness in RAG](/17-rag-pipelines/#freshness-and-incremental-updates).
+
+### Conflicts: two memories disagree
+
+"Lives in Pune" (October) and "just moved to Hyderabad" (November). Strategies, from worst to best:
+
+1. **Keep both and let the model sort it out.** It often picks the wrong one, or mentions both.
+2. **Overwrite on write.** Simple, but a misheard or hypothetical statement ("if I moved to Hyderabad...") destroys a true fact with no history.
+3. **Supersede with time.** Close the old fact (`valid_to = 2026-11-10`), open the new one, and keep both linked. Retrieval returns current facts by default and history when asked ("where did I live before?").
+4. **Resolve by scope before resolving by time.** Some conflicts are not conflicts: "prefers Python" at work and "prefers JavaScript" for a side project are both true under different conditions. Keep both with their scope.
+
+It helps to separate two kinds of time, the idea behind **bitemporal** data: *valid time* (when the fact was true in the world) and *recorded time* (when your system learned it). The distinction makes a useful product feature: when a re-check finds a different value, the system can tell the user whether the **world changed** (valid time moved on) or **its earlier answer was wrong** (the record was mistaken). Users trust a system that owns its mistakes differently from one that blames the world.
+
+When evidence is insufficient to resolve a conflict, mark it and ask the user, rather than picking silently.
+
+### Forgetting: deliberately removing memories
+
+Forgetting has three purposes, and each needs a different mechanism:
+
+- **Relevance decay** keeps retrieval sharp: low-importance, never-accessed memories fade in ranking (the recency term above) or are consolidated: many weather-related episodes become one semantic fact, and the episodes move to cold storage. MemoryBank (Zhong et al. 2023) modelled this on the Ebbinghaus forgetting curve, strengthening memories each time they are recalled.
+- **Retention limits** keep liability down: raw transcripts deleted after N days, facts kept until deleted. This is a policy decision, written down, enforced by a scheduled job.
+- **User-requested deletion** ("forget that", "delete everything about my health") must be exact and complete, not a ranking tweak. It is covered under [privacy](#privacy).
+
+Make "forget that" a real tool with a real `DELETE` behind it, and confirm what went. The worst version of this feature is a model that replies "Okay, I've forgotten that" while the row is still in the database.
+
+## Privacy
+
+Memory turns a stateless API into a system that holds personal data for months. That brings product, legal and security obligations.
+
+### Isolation is enforced in the data layer
+
+Scope every memory query by owner in code: `WHERE user_id = ?` on every read, a tenant filter on every vector search ([multi-tenant filtering](/16-vector-search-and-indexing/#multi-tenancy-and-filtering)), and ideally row-level security in Postgres so a forgotten filter fails closed. Never rely on the prompt ("only use memories for this user") to separate users. Cross-user leakage in memory is worse than in RAG, because the leaked data is personal by construction. Shared caches are a quieter leak: a semantic cache keyed only on the question will happily serve one user's personalised answer to another.
+
+### Minimise what you store
+
+- Redact PII and secrets before writing, with regexes for structured identifiers (Aadhaar, PAN, card numbers, phone numbers) and a small local model for free-text cases ([PII detection](/29-guardrails-and-safety/#pii-detection-and-redaction)). Do the redaction locally: sending logs to a third party to remove personal data from them defeats the purpose.
+- Do not store special categories (health, religion, caste, sexual orientation, political views) unless that is the product's purpose and the user has opted in.
+- Keep memory text out of application logs and traces, or log ids and sizes only ([log privacy](/30-observability/#log-privacy-and-retention)).
+
+### Deletion has to reach derived data
+
+Laws such as the EU GDPR (Article 17, right to erasure) and India's Digital Personal Data Protection Act, 2023 (section 12) give users a right to have personal data erased. The DPDP Rules notified in November 2025 phase the Act's obligations in over roughly 18 months, so check which provisions are in force when you ship; design for erasure now either way. In a memory system, one fact lives in many places:
+
+```text
+episode row  -> FTS index entry -> vector index entry
+             -> extracted facts -> profile slot -> rolling summaries
+             -> semantic cache entries -> traces and logs -> backups
+```
+
+Delete only the episode and the fact survives in the summary. The fix is provenance: every derived item records the source ids it came from (`source_episode`, `source_turn_ids`), so a deletion can find and delete or regenerate everything downstream. Vector indexes need real deletes, not just a flag that your filter might forget ([deletes and re-embedding](/16-vector-search-and-indexing/#updates-deletes-re-embedding)). Backups age out on a documented schedule.
+
+### Users should see and control their memory
+
+A "what I remember about you" page, with each memory's source and date and a delete button, is both a privacy control and your best debugging tool. Users catch wrong memories faster than any eval. Add "temporary" or incognito chats that neither read nor write long-term memory, and an export.
+
+### Memory poisoning
+
+The attack: get a false or malicious instruction written into long-term memory, and it will be replayed into every future session. Security researcher Johann Rehberger showed in 2024 that content in a document or web page could trigger ChatGPT's memory feature to store attacker-chosen "memories". AgentPoison (Chen et al. 2024) showed that poisoning an agent's memory or knowledge base with a few crafted entries can hijack its behaviour on trigger inputs. Defences, in order of strength: never let untrusted content (web pages, tool results, uploaded files, other users' messages) trigger long-term writes; store memories as data with provenance and render them in the prompt as quoted data, never as instructions; screen writes for imperative content ("always", "ignore", "send to"); show the user every new memory; and keep the raw log so poisoned memories can be found and purged by source. Theory: [indirect injection](/33-security-prompt-injection/#indirect-injection) and [poisoning](/33-security-prompt-injection/#poisoning-and-backdoors).
+
+## Evaluating memory
+
+You cannot tune a memory system by chatting with it. Memory failures show up days later and only in certain conversation shapes, so you need a test harness that builds a history and then asks about it.
+
+### What to measure
+
+LongMemEval (Wu et al. 2024) is a good map. It tests five abilities over long multi-session chat histories: **information extraction** (recall a stated detail), **multi-session reasoning** (combine facts from different sessions), **temporal reasoning** (when did something happen, what changed), **knowledge updates** (return the latest value after a change) and **abstention** (say "you never told me that" instead of inventing). LoCoMo (Maharana et al. 2024) builds very long conversations, hundreds of turns across dozens of sessions, and tests question answering and event summarisation over them. Your own cases matter more.
+
+Build cases in the same shape:
+
+```python
+CASES = [
+  {"name": "update", "sessions": [
+      ["I live in Pune."], ["We moved to Hyderabad last week."]],
+   "ask": "Suggest a weekend trip from my city.", "expect": "Hyderabad", "forbid": "Pune"},
+  {"name": "abstain", "sessions": [["I prefer window seats."]],
+   "ask": "What's my frequent flyer number?", "expect_abstain": True},
+  {"name": "negation", "sessions": [["Not allergic to peanuts, only cashews."]],
+   "ask": "Can I eat peanut chikki?", "expect": "yes"},
+  {"name": "isolation", "user": "B", "sessions_of": "A",
+   "ask": "Where do I live?", "expect_abstain": True},
+  {"name": "forget", "sessions": [["My salary is 18 LPA."], ["Forget my salary."]],
+   "ask": "What do I earn?", "expect_abstain": True, "check_store_empty": "salary"},
+]
+
+def run(case, agent, judge):
+    agent.reset(user=case.get("user", "A"))
+    for i, session in enumerate(case.get("sessions", [])):
+        agent.new_session(day=i)
+        for msg in session:
+            agent.chat(msg)
+        agent.flush_background_writes()     # let async extraction finish
+    answer = agent.chat(case["ask"])
+    return judge(case, answer, agent.memory_dump())
+```
+
+Each case runs the real write path, then asks in a fresh session, so the answer can only come from long-term memory. Score with exact checks where possible (forbidden string absent, store row deleted) and an LLM judge for the rest ([judge design](/20-evals-judges-and-ci/#llm-as-judge-design)).
+
+The metrics to report:
+
+- **Recall accuracy** on stored facts, and **update accuracy** (latest value wins).
+- **False-memory rate**: how often the agent asserts something the user never said. This is the metric users feel most.
+- **Abstention rate** on questions about things never stored.
+- **Leakage and deletion tests** as hard pass/fail gates, never averaged into a score.
+- **Write precision**: sample stored memories and label them useful, useless, wrong or sensitive. A store that is 30% junk will degrade retrieval.
+- **Cost and latency per turn** with memory on versus off, and an A/B on task success: memory that does not improve outcomes is just liability.
+
+Seeding is a key technique: to test staleness, insert a historically true memory directly into the store (you cannot send the live web back in time), then ask whether it is still true. Simulated users who push back ("are you sure? did you really check?") test whether the agent stays faithful to its own record under pressure ([multi-turn evals](/20-evals-judges-and-ci/#multi-turn-and-simulated-users)).
+
+<Production>
+
+**Failure modes.** Stale facts asserted as current because the prompt showed no observation date. False memories: the model invents earlier conversations when retrieval returns nothing, unless the prompt states plainly what memory does and does not contain. Memory poisoning through content that triggered a write. Context bloat: irrelevant memories injected every turn because there is no similarity floor, distracting the model and costing tokens. Summary drift that loses negations and exact numbers. Duplicate and contradictory facts accumulating because writes never dedupe or supersede.
+
+**Cost.** Per turn: one query embedding plus the recalled memories' input tokens (about 300, as computed above). Per conversation: one extraction call, usually on a small model, plus a summary call every few turns. Storage is small per user but adds up: a daily user with about 2,000 stored items at 1,024 float32 dimensions needs about 2,000 × 4 KB = 8 MB of vectors, so 100,000 users need roughly 800 GB before index overhead; int8 quantisation cuts that by 4×.
+
+**Latency.** Recall sits on the hot path before the model call. Keep it to tens of milliseconds: per-user filtered indexes, a cached profile block, recall in parallel with planning, and no recall on turns that need none. All writes (extraction, summarisation, consolidation) go off the hot path, as background jobs that can fail without failing the turn.
+
+**Observability.** Log, per turn, which memory ids were retrieved, their scores, which were included in the prompt, and which the answer actually used. Show the same thing to users ("based on: you told me on 20 Oct you're vegetarian") and to developers in the trace view. Track write volume per user, extraction failures, the share of turns where recall returned nothing, and deletion requests completed.
+
+**Security.** Owner scoping in the data layer on every read, plus row-level security as a backstop. Only user-authored or trusted content may trigger long-term writes; memories render as quoted data, never instructions. A working "forget" that deletes across derived stores, with provenance so you can find them. PII redaction before storage, retention limits, and memory text kept out of logs.
+
+</Production>
+
+<Interview>
+
+<Q q="What strategies exist for long-term memory?" reported>
+
+- Frame it first: models are stateless; memory is a write path, a store and a read path the application owns.
+- Short-term: full buffer, sliding window by tokens, rolling summary plus last k turns, standalone-question rewriting for RAG.
+- Long-term by type: episodic (dated event log, searched by time and keyword), semantic (extracted facts with provenance and validity dates), procedural (prompt rules, skill files, code, usually human-reviewed).
+- Storage options: vector store, keyword index (BM25/FTS), relational facts table, knowledge graph for multi-hop relations, plain files the agent edits (memory directory, CLAUDE.md-style notes).
+- Control options: code-driven retrieval every turn versus model-driven memory tools (MemGPT style), or a hybrid.
+- Retrieval scoring: relevance plus recency plus importance (Generative Agents, 2023), with a similarity floor.
+- Quote: resending full history costs `n·S + t·n(n+1)/2` input tokens; a window or summary makes it linear.
+- **The trap:** "store everything in a vector database and retrieve top-k". No write policy, no dates, no updates, no deletion, no scoping.
+
+</Q>
+
+<Q q="How do you handle documents and conversations that exceed context?" reported>
+
+- Separate the two cases. A long **conversation** needs memory: sliding window, rolling summary of evicted turns, pinned key facts, long-term store for recall.
+- A long **document** needs reading strategies: chunk and retrieve (RAG) for question answering; map-reduce or refine summarisation for whole-document summaries; hierarchical summaries (section, then chapter, then document) for navigation.
+- Agentic reading: give the model file and search tools so it opens only what it needs, like a person skimming.
+- Long-context models help but do not remove the problem: cost grows with tokens, prefill latency grows, and middle-of-context recall is weaker (Lost in the Middle, 2023).
+- Keep the raw text and log; summaries are lossy caches you can rebuild.
+- Measure: needle-style tests at different positions, and answer accuracy with the long-context approach versus retrieval.
+- **The trap:** "just use a 1M-token model". It ignores cost per call, latency and degraded attention, and does not scale to a year of chat.
+
+</Q>
+
+<Q q="Design memory for a personal assistant used daily for a year.">
+
+- **Scope and SLOs:** say 100K users, 20 turns a day; recall adds at most about 50 ms p95; zero cross-user leaks; deletion complete within a stated time (say 24 h, including derived data).
+- **Architecture:** short-term = rolling summary plus last 6 to 8 turns; long-term = append-only episode log (dated, user's local date), facts table (entity, attribute, value, source episode, valid_from, valid_to, stated_by, sensitivity), small profile block loaded every turn, procedural rules maintained by the team.
+- **Writes:** explicit "remember" path applied at once and confirmed; background extraction on a small model after each session; supersede instead of overwrite; nightly consolidation of episodes into facts; untrusted content cannot write.
+- **Reads:** router by question type (date lookup, keyword, hybrid vector search), filtered by user and validity, scored by relevance, recency, importance, with a floor; show observation dates in the prompt.
+- **Evals:** seeded multi-session cases for recall, updates, temporal questions, abstention, leakage and deletion as hard gates; false-memory rate; memory-on versus memory-off A/B on task success.
+- **Guardrails, observability, cost:** "what I remember" page with delete, incognito mode, PII redaction, retrieved memory ids in every trace. Numbers: about 2,000 items per user × 4 KB of vectors = 8 MB, about 800 GB for 100K users, 4× less with int8.
+- **The trap:** designing only retrieval. A year-long store fails on staleness, contradictions and deletion, not on top-k.
+
+</Q>
+
+<Q q="How do you prevent memory poisoning?">
+
+- Define it: an attacker gets a false fact or an instruction into long-term memory so it replays into future sessions; demonstrated against ChatGPT's memory in 2024 (Rehberger) and against agent memory and knowledge bases by AgentPoison (2024).
+- Control the write path: only user-authored messages (and trusted tools) may trigger long-term writes; web pages, emails, uploads and tool output cannot.
+- Store memories as data with provenance (source episode, who stated it) and render them as quoted data in the prompt, below and separate from instructions.
+- Screen writes for imperative or policy-like content ("always", "ignore previous", URLs, "send to") and for sensitive data; quarantine rather than store.
+- Make every new memory visible to the user, deletable, and traceable to its source, so a poisoned memory can be purged along with everything derived from it.
+- Test it: red-team cases that plant instructions in fetched content and check the store afterwards.
+- **The trap:** "we'll add a classifier on the prompt". Detection alone fails; the structural fix is that untrusted text never gets write access.
+
+</Q>
+
+<Q q="What is the difference between RAG and agent memory?">
+
+- Same mechanics (store, index, retrieve, inject), different data and ownership.
+- RAG: a shared corpus written and reviewed by people, read by many users, updated in batches by an ingestion pipeline.
+- Memory: per-user or per-agent data written by the system itself from conversations, so every write can be wrong or malicious.
+- Memory needs things RAG mostly does not: write policies, conflict resolution between a user's own statements, per-user scoping on every query, and erasure on request.
+- Time matters more: episodic questions ("what did we decide on Monday?") are date lookups, not similarity searches.
+- **The trap:** "memory is just RAG over chat history". It skips write quality, contradictions and privacy, which is where memory systems fail.
+
+</Q>
+
+<Q q="How would you share memory between agents?" reported>
+
+- First ask whether they need to: often a handoff note or a shared task record is enough, and shared memory adds coupling ([shared state](/25-multi-agent-systems/#communication-and-shared-state)).
+- Separate private scratchpads (each agent's working notes) from a shared store (task facts, decisions, artefacts) with an explicit schema.
+- Writes to shared memory carry the writing agent's id, timestamp and source, so conflicts can be traced and resolved.
+- Use append-only events plus derived views, or a single owner per key, to avoid two agents overwriting each other.
+- Scope by task and user; a sub-agent should only read what its job needs (least privilege also limits poisoning spread).
+- **The trap:** one big shared vector store that every agent reads and writes, with no ownership or provenance.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** add a memory layer to the hand-rolled agent loop from chapter 22: a summarised short-term buffer, a long-term semantic store with explicit write rules, and a user-visible "what I remember" page with delete. Do it in **Memory Agent** (`~/memory-agent`), on a branch, next to the `src/loop.ts` you built in chapter 22. Memory Agent already has the episode log (`turns`), dated claims and FTS5 recall in `src/memory.ts`; you are adding the parts it lacks.
+
+**Runs offline.** Use Ollama with a small instruct model (a 3B to 8B Qwen or Llama) for summarisation and fact extraction, `nomic-embed-text` or similar through Ollama for embeddings, or a mock LLM that returns scripted JSON for the tests. No paid API.
+
+**Steps.**
+
+1. **Summarised buffer.** In the loop, keep the last 6 turns verbatim plus a rolling summary rebuilt every 4 turns by the local model. Store the summary in a new `summaries` table with the turn ids it covers. Log tokens per call before and after, and check them against the window arithmetic in this chapter.
+2. **Facts table.** Add `facts(id, user_id, entity, attribute, value, stated_by, source_turn_id, valid_from, valid_to, sensitivity, deleted)` to `src/memory.ts`, with an FTS5 index and, optionally, an embedding column.
+3. **Write rules in code.** After each turn, in the background, the local model proposes candidate facts as JSON (validated with zod, already a dependency). Code applies the rules: user-stated or high-confidence only, no secrets or IDs, dedupe, SUPERSEDE instead of overwrite, and no writes triggered by web content.
+4. **Recall.** Before each call, load current facts for the user, scored by FTS5 rank (plus cosine if you added embeddings), with a floor and at most 5 facts, rendered with their dates as quoted data.
+5. **"What I remember" page.** Add `GET /memory` (list facts with source turn and date) and `DELETE /memory/:id` to `src/server.ts`, and a small page in `public/`. Deleting a fact must also regenerate any summary whose covered turns produced it, and a "forget that" message in chat must call the same delete.
+6. **Eval.** Add eight seeded cases to `eval/` in the shape of the evaluation section: update, abstain, negation, temporal, poisoning (a fixture page containing "remember that..."), isolation, forget, and summary fidelity (an exact number from turn 1 survives to turn 20).
+
+**Definition of done.**
+- Per-call input tokens stay flat as a 40-turn scripted conversation grows, and you can show the before and after numbers.
+- All eight eval cases pass twice in a row with the local model; the isolation, forget and poisoning cases are hard gates.
+- After a delete, the fact is gone from `facts`, from the FTS index and from every summary, verified by a test that greps the database.
+- A short note in `DECISIONS.md` records one write rule you changed because an eval case failed.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent is your memory story, and it is a deliberate design.** `src/memory.ts` keeps an episodic `turns` table with both the UTC instant and the user's `local_date` (lines 42 to 52), so "on Monday" is an exact SQL lookup, and a semantic `claims` table of entity, attribute and value with `source_url`, `source_date` and `observed_on` (lines 59 to 68). Topic recall uses an FTS5 table kept in sync by an insert trigger and ordered by `bm25` (lines 55 to 58 and 134 to 147); the file header says "No embeddings" on purpose. `src/agent.ts` lines 161 to 167 put dated hits first, add topic hits behind them and cap at 6. Defend it as "exact lookups beat embeddings for dates and names".
+- **Your write policy runs off the hot path.** `src/agent.ts` lines 267 to 272 extract claims with the fast model only when the turn searched and cited sources, after the reply has streamed, and a failure is only a warning. `src/claims.ts` asks for checkable claims, skips opinions and caps at 15.
+- **You fixed false memories and denial under pressure with the agent's own record.** `memoryText` in `src/agent.ts` (lines 277 to 298) tells the model when memory is empty and which date mentions matched nothing, and `src/prompts.ts` says the MEMORY section is the only record of earlier conversations. `DECISIONS.md` #6 records a simulated skeptic getting the agent to deny its own searches; attaching full cited URLs and excerpts to earlier answers (`sourcesNote`, `src/agent.ts` lines 384 to 392) took that persona from 0/2 to 2/3 and "where did you get that?" from 1/3 to 3/3, after domains alone caused over-correction. That is a strong answer to "how do you keep memory honest".
+- **You separate staleness from error.** `DESIGN.md` describes re-checks that label each stored claim Held, Changed (the world changed) or Corrected (the earlier answer was wrong), or Couldn't verify, and `eval/cases.ts` seeds a historically true Node.js answer into memory to test real staleness. Tie it to the bitemporal idea in this chapter.
+- **Name the gaps before an interviewer does.** Memory Agent has no summarisation (`threadTurns` simply takes the last 8 turns), no delete or expiry in the `Memory` class, and `DESIGN.md` lists "there's no way yet to say 'forget that'" under Limits; storage is one local SQLite file with no per-user scoping. The Apply-it closes these. Chat Insights (your code) keeps a plain 10-turn window that must start with a user turn (`buildHistory` in `backend/src/lc/domain/promptBuilder.js`) and personalises from habits derived from submissions rather than from free-text memory (`contextBuilder.js`).
+- **Scheme Assistant: be precise about authorship.** The standalone-question condensing in `src/app_api/context.py` and the history that replays resolved follow-ups in `chat.py` are mostly your teammate's code; describe them as the team's design. Your own parts touch memory too: `scripts/critic_run.py` drives multi-turn persona conversations through the real `/v1/chat`, so follow-ups exercise the history and condensing path. The mobile Cancel button you wired (`chat_session_notifier.dart`, `mobile/DECISIONS.md` D-189) calls your teammate's cancel endpoint, and it is the server that then leaves the cancelled turn out of history and later context (`_recent_turns` in `chat.py` skips cancelled messages); say "I wired it", not "I built it". Answer Grader is the contrast: `backend/llm.py` notes chat has no stored state, which is why switching provider is safe there.
+
+</YourProject>

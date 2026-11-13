@@ -1,0 +1,445 @@
+---
+id: "34"
+title: "Product UX for AI and the Feedback Loop"
+summary: "Design the screens around a model that is sometimes wrong (states, progress, citations, approvals, errors) and build a feedback loop whose signals become eval cases and fixes, measured with product metrics you can defend."
+readingTime: "25 min"
+---
+
+Your model is right 85% of the time on your eval set. The interface decides what that means to users. One screen shows the wrong 15% in the same confident layout as the right 85%, so users believe everything or nothing. Another marks what it checked, shows where each claim came from, says plainly when it does not know, and lets the user fix or undo. Same model, different product.
+
+The second problem is learning. Offline evals cover failures you imagined; production holds the rest, and the cheapest way to find them is to let users tell you, directly or through what they do. A thumbs button whose results nobody reads is not a loop. A loop is a pipeline: signal tied to a trace, review queue, regression case, fix, and a metric showing the fix worked.
+
+This chapter builds on [streaming mechanics](/31-cost-and-latency-engineering/#streaming-and-perceived-latency), [the five kinds of non-answer](/29-guardrails-and-safety/#refusals-and-fallbacks), [feedback stored as trace scores](/30-observability/#feedback-into-traces) and [eval statistics](/19-evals-methodology/#noise-statistics-sample-sizes) without re-teaching them. Two public references are worth skimming: Google's People + AI Guidebook (PAIR) and Microsoft's 18 Guidelines for Human-AI Interaction (Amershi et al., CHI 2019, the HAX Toolkit).
+
+## Designing for probabilistic output
+
+### UI conventions promise certainty
+
+Users have learned that what a screen shows is true: a balance, a count, a "4/5". A model's output is a sample. Ask again and it may differ, and wrong answers arrive in fluent prose. Pour that sample into a layout built for facts and the layout lies for the model.
+
+So the first decision is the **response contract**: the states an answer can be in, chosen before anyone draws a screen. Answered; answered with a caveat (a check flagged part of it); abstained; out of scope or refused; degraded (fallback template); failed. Scheme Assistant's core has this shape: an `AnswerStatus` enum (`src/app/core/contracts.py`, teammates' code) with `answered`, `abstained`, `out_of_scope`, `needs_clarification` and `redirect`. The backend returns the state; the frontend maps state to layout and never infers it by parsing prose.
+
+```ts
+type Source = { id: number; title: string; url: string; quote?: string };
+type AnswerView =
+  | { kind: "answered"; text: string; sources: Source[] }
+  | { kind: "caveat"; text: string; sources: Source[]; unverified: string[] }
+  | { kind: "abstained"; route: string }
+  | { kind: "out_of_scope"; covers: string[] }
+  | { kind: "degraded"; text: string }
+  | { kind: "failed"; message: string; retryable: boolean };
+
+function banner(v: AnswerView): string {
+  switch (v.kind) {                       // exhaustive: a new state forces every screen to decide
+    case "answered": return "";
+    case "caveat": return `Check before relying on: ${v.unverified.join(", ")}`;
+    case "abstained": return `The documents don't answer this. ${v.route}`;
+    case "out_of_scope": return `I can help with: ${v.covers.join(", ")}`;
+    case "degraded": return "Simplified reply (the assistant is limited right now)";
+    case "failed": return v.retryable ? `${v.message} Try again.` : v.message;
+  }
+}
+```
+
+### Drafts versus final answers
+
+Is the output a **draft** the user finishes or a **final answer** the user acts on? An email reply or code suggestion is a draft: show an editable box, the user is the author, and a human reads before anything leaves. A scheme-eligibility answer or an exam score is final: the user acts without editing, so it needs more checking, visible sources and honest precision. Drafts also yield the best feedback signal there is: the diff between what the model wrote and what the user sent.
+
+### False precision
+
+Answer Grader scored each criterion 1 to 5 and showed "4/5" beside a headline of "4.5/10"; students read 4/5 as 80% and the headline as failure. Gaurav's fix (`critLevel` in `backend/api/static/evaluation.html`, around line 4302) shows a band word and a five-dot meter, "never '4/5', which read as 80% beside a headline of 4.5/10", with an `aria-label` ("4 out of 5") so screen readers keep the number. Rule: show the coarsest unit the system is reliable at. If two runs can differ by a point, a decimal is a lie.
+
+## Expectation setting
+
+Users build a mental model from their first few interactions and keep it. HAX's first two guidelines name the job: "Make clear what the system can do" and "Make clear how well the system can do what it can do." Too generous and users over-trust, then feel betrayed by the first error; too narrow and they never find the useful parts.
+
+Set expectations in four places:
+
+1. **Capability, concretely.** Scheme Assistant's out-of-scope copy (`src/app_api/mapping.py`, around line 295) lists the schemes it has documents for, in Hindi and English. A list beats a rule users must guess.
+2. **Quality, on the user's scale.** Answer Grader's `backend/calibration.py` maps rubric scores onto anchors from 143 real marksheets and prints one line under each score: "In real marksheets, toppers score about 37-44% on GS1; the Mains cut-off sits near 33%." A 5/10 then reads as "near the cut-off", which is true. Certificate Assistant ships an `honesty_note` with its eval output: measured on synthetic data, re-measure on real records before any pilot.
+3. **Time.** "This usually takes a minute or two" stops users assuming a hang at second ten.
+4. **Cost and limits, before they bite.** Memory Agent prints each answer's time and estimated cost; Chat Insights's cap message says "It resets at 00:00 UTC."
+
+Starter prompts on an empty chat are expectation setting too: pick them from cases your eval passes reliably.
+
+The trade-off is attention. A generic "AI can make mistakes" footer on every answer is banner blindness by design. A specific, conditional warning ("Check before relying on: ₹1,200, not in the text of source 2") shown only when a check fired gets read.
+
+## Chat vs embedded vs ambient vs agentic UX
+
+The same model can sit behind four interaction shapes, and the shape sets your eval set, latency budget and blast radius.
+
+| Shape | Input | Error cost | Main UX problem |
+|---|---|---|---|
+| Chat | open text | user reads and judges | discoverability, over-trust |
+| Embedded (a button in a workflow) | narrow, structured | one field or page | latency inside the workflow |
+| Ambient (appears unasked) | none | interruption | timing and dismissal |
+| Agentic (multi-step, acts) | a goal | actions in the world | progress, approval, undo |
+
+**Chat** is easiest to build and hardest to evaluate: the input distribution is everything users can type. Right for open-ended work (Memory Agent); wrong when the user has one job, because a blank box makes them invent the prompt. **Embedded** features have predictable input: Answer Grader is upload-an-answer, get-a-result-page, so the eval set can cover the real distribution; Chat Insights is a side panel inside LeetCode that takes its context from the page. **Ambient** features need an easy dismiss (HAX: "Support efficient dismissal") and must learn from dismissals or users switch them off. **Agentic** UX means supervising a worker, so [progress](#streaming-and-progress-ux) becomes a step log, [approval](#approval-ux) gates actions and [reversibility](#trust-control-reversibility) becomes a requirement.
+
+Pick the narrowest shape that does the job. Every step toward chat or agentic widens what you must evaluate and design for.
+
+## Streaming and progress UX
+
+### Waiting needs design
+
+Nielsen's response-time limits (*Usability Engineering*, 1993) are the classic guide: about 0.1 s feels instant, about 1 s keeps the train of thought, about 10 s is the edge of attention. LLM features live between 1 s and minutes, so you design what users see while waiting. In rising order of effort: token streaming (perceived latency becomes time to first token); named status events before tokens exist; determinate progress when the step count is known; elapsed time with an honest estimate; going async with a notification for jobs past a minute; and a stop button that stops server-side work.
+
+### Real progress, not theatre
+
+Progress must come from real backend state. A bar that fills on a timer is caught the first time it sits at 95% for a minute, and then nothing it says is believed.
+
+Answer Grader's waiting page (Gaurav's code) shows four named stages ("Reading your answer", "Finding topper references", "Writing the model answer", "Scoring your answer") keyed to the status values the pipeline writes, plus an elapsed timer. `formatElapsed` switches to "taking longer than usual" past ten minutes, so an abandoned job does not show a six-digit counter, and `scheduleRefresh` stops after 240 polls at 2 s (about 8 minutes) and tells the user to reload.
+
+Memory Agent's `DECISIONS.md` (decision 3) records that after a server-side search its thinking models buffered the whole answer, so token streaming showed nothing for about 9 s. The fix was to stream the agent's work: each query appears as "Searched for ..." when it starts, then its results with page dates.
+
+```python
+from dataclasses import dataclass, asdict
+import json, time
+
+@dataclass
+class Progress:
+    v: int                        # schema version; old clients ignore unknown types
+    type: str                     # "stage" | "text" | "sources" | "done" | "error"
+    stage: str | None = None      # the backend's real state, never a timer
+    step: int | None = None
+    total: int | None = None
+    ts: float = 0.0
+
+def sse(e: Progress) -> str:
+    e.ts = time.time()
+    return f"data: {json.dumps(asdict(e))}\n\n"
+
+def run(job):
+    stages = ["reading", "retrieving", "writing", "checking"]
+    for i, name in enumerate(stages, 1):
+        yield sse(Progress(v=1, type="stage", stage=name, step=i, total=len(stages)))
+        job.do(name)              # mocked work; an exception becomes an "error" event
+    yield sse(Progress(v=1, type="done"))
+```
+
+Version the schema: an old mobile build will receive events from a new server. Health Triage's `SSEEvent` (a teammate's code) carries `v`, `step`, `totalSteps` and `percent` for this reason.
+
+### Polling versus streaming
+
+Polling is fine at small scale. A Answer Grader run took 24 to 43 s per a code comment, so 12 to 22 status requests. But 1,000 concurrent jobs polled every 2 s is 500 requests per second of "still running". SSE uses one connection per job at the cost of proxies, timeouts and reconnects ([SSE vs WebSockets](/32-deployment-and-llmops/#streaming-over-sse-websockets)). Health Triage's Flutter analysis screen (Gaurav's code) does both: SSE, with 3-second polling when the stream errors or closes early.
+
+When an answer must pass a check before display, do not stream tokens. Scheme Assistant sends a verified answer whole; Gaurav's `JmRevealText` reveals it word by word, but its comment says this is presentation only: full text laid out from the first frame so nothing reflows, full text to screen readers at once, and no animation under reduced motion.
+
+**What goes wrong:** progress not tied to real state; streaming unverified text then retracting it; layout jumping as text arrives; a stop button that hides the spinner while the server keeps generating and billing.
+
+## Showing sources and uncertainty
+
+### Citations users can check
+
+A citation promises "you can verify this", and keeps the promise only if the user gets from claim to evidence in one step: inline numbered markers near the claim; a target that opens at the page or quoted span, not page one of a 200-page PDF; dates or versions that affect trust; and verification before display, so every cited id is one you retrieved and ideally supports the claim ([faithfulness checks](/20-evals-judges-and-ci/#faithfulness-checks)).
+
+Memory Agent's `renderAnswer` (`public/app.js`, line 61) turns markers into numbered superscript links with the title as tooltip and sanitises the HTML with DOMPurify; its source list shows page ages. Scheme Assistant's answer card ends in a source chip ("Source: document, clause, page") that opens the cited PDF at the cited page. Answer Grader lists the retrieved topper answers with a "% similar question" badge from the true cosine similarity, deliberately not the blended rerank score, so the badge means what it says.
+
+```python
+def citations_for_display(cites: list[int], retrieved: dict[int, dict]):
+    shown, dropped = [], []
+    for cid in dict.fromkeys(cites):                 # dedupe, keep order
+        chunk = retrieved.get(cid)
+        if chunk is None:
+            dropped.append(cid)                      # invented id: log on the trace, never render
+            continue
+        shown.append({"n": len(shown) + 1, "title": chunk["title"],
+                      "page": chunk.get("page"), "quote": chunk["text"][:200]})
+    return shown, dropped
+```
+
+### Uncertainty without a fake number
+
+Avoid a confidence percentage unless it is **calibrated**: among answers shown as 80%, about 80% are right on real traffic. Token probabilities and judge scores usually are not, and a precise number invites over-trust. What works better:
+
+- **Name the unverified part.** Memory Agent's number guard compares each price or percentage with its source's excerpt; on a mismatch the UI says "Check before relying on: $X (not in the text of source N)" and still shows the answer.
+- **Categorical verdicts with actions.** Certificate Assistant's reader marks each field "matches", "spelling variant", "differs, check original" or "unclear read" (a dash when not applicable). An officer knows what to do with each; nobody knows what to do with 0.73.
+- **Show why.** Certificate Assistant lists which fields agreed for each suggested match and their learned weights (HAX: "Make clear why the system did what it did").
+- **Abstain** when nothing grounded can be said.
+
+**What goes wrong:** citations that exist but do not support the claim (users click once, find nothing, stop clicking); rendering attacker-controlled URLs from retrieved content ([exfiltration](/33-security-prompt-injection/#exfiltration-channels-markdown-images-links-tools)); confidence displays never checked against outcomes.
+
+## Approval UX
+
+The mechanism (risk tiers, durable pause, rejections returned to the model) is in [chapter 21](/21-tool-use/#human-approval). This section is the screen, because a bad approval step costs a human's time and buys no safety.
+
+**The card shows the real call**, rendered for humans from the arguments, not the model's summary: "Send ₹2,499 refund to card ending 4417". It shows what changes (a diff, the recipient list), states reversibility ("cannot be undone" or "undo for 30 minutes"), links the evidence, and offers edit, approve and reject, with reject asking for a one-tap reason (which is feedback).
+
+**The rubber-stamp problem.** A reviewer who approves 99% of requests in two seconds is theatre. Ask rarely: auto-run reads and reversible writes with undo, and gate only irreversible or external actions. Batch low-risk items. Do not pre-select the answer: Certificate Assistant's `VerdictCard.tsx` says it "states facts and the officer's task; it never pre-selects an outcome", an anti-anchoring rule from an earlier review round. Measure approval rate, time to decide, edit-before-approve rate and post-approval reversals.
+
+Approval applies to AI output that becomes data, too. Chat Insights stores LLM findings about a student as `unreviewed` (`backend/src/services/snapshotRunner.js`) until the student confirms, defers or rejects them. Scheme Assistant's push-to-talk (`voice_input_notifier.dart`, Gaurav's code) puts the transcript in the input box "for the citizen to check before sending": speech recognition mishears names and numbers, and a wrong transcript sent silently gets a confident answer to a question nobody asked.
+
+```python
+import time, uuid
+
+def plan_ux(action: dict) -> dict:
+    if action["risk"] == "read":
+        return {"mode": "auto"}
+    if action["risk"] == "reversible":
+        return {"mode": "auto_with_undo", "undo_window_s": 1800}
+    return {"mode": "approve",
+            "pending_id": str(uuid.uuid4()),          # idempotency key for execution
+            "expires_at": time.time() + 24 * 3600,    # yesterday's "send the latest invoice" may mean another invoice today
+            "card": {"what": action["rendered_from_args"], "irreversible": True,
+                     "evidence": action["evidence_links"]}}
+```
+
+## Error and refusal UX
+
+[Chapter 29](/29-guardrails-and-safety/#refusals-and-fallbacks) separates refusal, out of scope, abstain, degraded fallback and escalation. The UX rule on top: **no dead ends**. Every error says what happened in the user's words, whether it is their fault or the system's, and what to do next.
+
+The repos have good copy:
+
+- Chat Insights's `chatErrorCopy` (`extension-leetcode/sidepanel.js`, line 3301) gives each failure class its own sentence: "Daily hint cap reached. It resets at 00:00 UTC.", "Reload the LeetCode tab so LeetCode Coach can read this problem, then try again.", "LeetCode Coach is locked during contests."
+- Memory Agent's `friendlyError` (`src/server.ts`) catches a provider's out-of-credits error that arrives as a plain 400; a comment says it was found when their own eval drained the account and users saw only "something went wrong".
+- Certificate Assistant's reader returns, for a missing archive record, that this "is not a ground for rejection". In a government workflow the most dangerous error is one an officer reads as evidence against the applicant.
+- Scheme Assistant's abstain copy (a teammate's line in `mapping.py`) says it is better to speak to a person than risk a wrong answer; the redirect copy beside it (Gaurav's) names where to go: "Check it on the official PMAY-G website or ask at the Gram Panchayat."
+
+**Language is part of the error.** Scheme Assistant's critic evaluation (`docs/critic-eval/`, Gaurav's harness, 25 October report) found users typing Hindi in Roman letters got refusals in English, because refusal copy was chosen by script. Route and test refusal copy per language like answers.
+
+**Retry is UX and cost.** Each regenerate is a full call: if a tenth of answers are regenerated once, spend rises about 10%. Make retries idempotent where requests have side effects, and smarter than a repeat: a timeout retry can take a faster route, and a regenerate after a thumbs-down can carry the reason. Never copy exception text into user-facing errors.
+
+## Explicit feedback
+
+| Form | User effort | Information | Best use |
+|---|---|---|---|
+| Thumbs | one tap | 1 noisy bit | finding traces to review |
+| Thumb plus reason chips | two taps | which failure mode | routing to a fix |
+| Stars 1 to 5 | one tap | ordinal, scale varies by person | coarse trends |
+| Free-text note | high | rich, rare | new failure modes |
+| Correction (edited output) | part of the task | the right answer | eval cases, examples, training data |
+
+HAX calls it "Encourage granular feedback": a reason ("wrong language") points at a fix; a thumb only says something is off.
+
+Design rules, each from code Gaurav wrote:
+
+1. **Bank the cheap signal at once.** Chat Insights's "hint missed?" (`sidepanel.js`, line 2952) records a thumbs-down on click, then opens an optional note: "The signal is banked immediately, even if they type nothing."
+2. **Adapt the follow-up.** Answer Grader's stars change the note prompt: at 3 or below, "What was wrong or missing?"; above, "What helped most?".
+3. **Key it to the trace.** Chat Insights stores `thumb`, `reason` and `note` on the assistant message row that also records rung, provider, model, usage, guard result and `degraded` (`backend/src/lc/db/repo.js`), so one query answers "do thumbs-down cluster on fallback replies?". `pilot_report.js` counts feedback share per day.
+4. **One record per person per item, rate-limited.** Answer Grader upserts one row per rater per evaluation and caps ratings at 30 per hour per IP.
+5. **Ask after the outcome.** Certificate Assistant accepts tool feedback (`yes`, `no`, `wrong_family`, optional note) only once the officer has decided (`app/backend/api.py`, line 1232 returns 409 before that). Asking earlier would anchor the decision.
+
+```python
+REASONS = {"wrong", "unsupported", "too_long", "wrong_language", "not_what_i_asked", "helped"}
+
+def record_feedback(store: dict, trace_id: str, user_key: str, thumb: str,
+                    reason: str | None = None, note: str | None = None, redact=lambda s: s) -> dict:
+    if thumb not in ("up", "down"):
+        raise ValueError("thumb")
+    if reason is not None and reason not in REASONS:
+        raise ValueError("reason")
+    store[(trace_id, user_key)] = {               # upsert: one opinion per person per answer
+        "thumb": thumb, "reason": reason, "source": "user",
+        "note": redact(note)[:500] if note else None}    # notes carry personal data
+    return store[(trace_id, user_key)]
+```
+
+**Corrections are gold.** Where the user is the author, make output editable and store original and edit. Twenty real corrections in one failure mode beat a thousand thumbs: each is an eval case with a reference answer.
+
+## Implicit and conversational feedback
+
+Few users rate; everyone behaves. Implicit signals: accept or copy; **kept ratio** (how much of a draft survived to sending); regenerate; rephrase within a short window; stop mid-answer; abandon; escalate; and downstream outcomes (code passed tests, the officer confirmed the match).
+
+Each is ambiguous alone. Copy may mean "useful" or "pasting into a complaint"; regenerate may mean "bad" or "show me another". Use them in aggregate, compare across versions, and validate each against human review first: of 100 regenerates, how many followed a bad answer? Every event must carry the trace id of the answer it reacts to.
+
+```python
+import difflib
+
+def kept_ratio(draft: str, sent: str) -> float:
+    return difflib.SequenceMatcher(None, draft, sent).ratio()
+
+def is_rephrase(prev_q: str, q: str, gap_s: float, embed, threshold=0.85) -> bool:
+    if gap_s > 90:
+        return False
+    a, b = embed(prev_q), embed(q)                       # unit-normalised vectors
+    return sum(x * y for x, y in zip(a, b)) >= threshold
+```
+
+**Conversational feedback** ("no, I meant the 2024 rules", "that's wrong") is the richest signal in chat and is usually thrown away. Handle it in the turn: Memory Agent's prompt (`src/prompts.ts`) says to recheck a disputed fact and change the answer only if a source supports it, a guard against [sycophancy](/07-post-training-and-alignment/#sycophancy-reward-hacking-over-refusal). Then log it: a cheap classifier labels user turns as correction, complaint, clarification or new question and attaches the label to the previous answer's trace. Memory Agent does the first and not the second.
+
+**Which acts count as labels** is the hardest decision. Certificate Assistant's `learning.py` header says only officers' "same family" / "not this family" confirmations train the matcher; approve, reject and send-back decisions are never used, because they depend on documents, policy and the applicant's claim, not on whether two records are one family. A recalibration is a proposal until the model owner signs it off. A user act becomes a label only when it answers the exact question the model answers.
+
+## Feedback pitfalls
+
+- **Selection bias.** Raters are not your users: unhappy users rate more, some cohorts never do, and people who gave up rate nothing.
+- **Placement bias.** Buttons only on successful answers mean timeouts and fallbacks are never rated.
+- **Policy versus quality.** A thumbs-down on a correct refusal means "I dislike the rule". Reason chips separate them.
+- **Feedback as a performance metric.** Certificate Assistant writes "for improving the tool, not an officer metric" into the audit note and rejects a second submission per decision with a 409, since a repeat "would silently flip the Collector's feedback tile".
+- **Training on raw thumbs** teaches a model to please. Use feedback to find failures; use reviewed labels to fix them.
+
+So thumbs-down rate is not your quality metric. Feedback is a **targeted sampler** that points reviewers at likely failures; rates come from a **random sample** ([online evals](/20-evals-judges-and-ci/#online-evals-and-production-sampling)). The loop is the [trace → eval → fix cycle](/30-observability/#the-trace-eval-fix-loop):
+
+```text
+ thumbs-down / reason / correction / rephrase / stop   (each with trace_id)
+        ▼
+ weekly review queue: targeted (feedback) + random (for rates)
+        ▼
+ label failure modes (ch 19 open/axial coding) ──► taxonomy counts
+        ▼
+ regression case: input, retrieved ids, checks, trace provenance
+        ▼
+ fix ── CI eval gate ── ship ── watch that failure mode's rate on the random sample
+```
+
+Review time is the constraint. One person-hour a day at 2 minutes per trace is 30 traces a day, about 150 a week. Split 100 targeted and 50 random: at a 10% failure rate the random half gives SE = √(0.1 × 0.9 / 50) ≈ 0.042, so ± 8 points weekly. Pool a month, or let a [validated judge](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans) read more of the random sample.
+
+The loop stalls when nobody owns the queue, feedback never joins traces, or cases are added without checks. Answer Grader's `backend/analytics.py` reports the average rating, its distribution and recent comments, but no arrow leads from a low rating to an eval case; that arrow is the loop.
+
+## Trust, control, reversibility
+
+### Calibrated trust
+
+The goal is trust that matches reliability. **Over-trust** (automation bias) is accepting wrong outputs because the system usually works; **under-trust** is redoing everything by hand, so the feature saves nothing. Honest states, specific warnings, checkable citations and visible limits all push toward calibration.
+
+### Control and reversibility
+
+- **Stop.** Scheme Assistant's mobile stop button ("रद्द करें", `cancel()` in `chat_session_notifier.dart`, line 453) is Gaurav's code on a server-side cancel his teammate Chiman designed. The waiting turn leaves at once and the server stops generating and stores nothing, so the cancelled answer stays out of later context.
+- **Global controls** (HAX: "Provide global controls"): memory, language, how much help. Chat Insights's depth meter shows the rung the server actually returned, "never the depth requested", and "fallback" for a degraded reply (`depthMeterText`).
+- **Undo.** Reversible actions can run with less friction. Certificate Assistant's `clear-match` (`app/backend/api.py`, line 468) undoes an officer's family match until the decision is signed, and the audit trail records it.
+
+### Accessibility and Indic-language users
+
+Most LLM products are designed by fluent English readers on fast laptops. Scheme Assistant's users are rural citizens in Chhattisgarh; Answer Grader has a full Hindi interface for aspirants who write in Hindi.
+
+- **Language parity.** Every string, including errors, refusals and feedback prompts, exists per language, and replies follow the user's language and script: Devanagari Hindi, Roman-script Hinglish and English are three cases. Scheme Assistant's critic personas wrote in all three, which is how the English-refusal bug surfaced.
+- **Voice in, confirmed.** Voice lowers the literacy barrier; show the transcript before sending ([STT and TTS](/14-multimodal-and-realtime-voice/#stt-tts)). Read-aloud helps the same users.
+- **Assistive technology.** Animations must not hide content: Scheme Assistant's reveal respects reduced motion and screen readers; Answer Grader's stars are a labelled radio group with 44-pixel targets on small screens.
+- **Weak networks.** Resume or fall back to polling; keep payloads small.
+- **Plain words.** "Differs, check original" beats "low-confidence mismatch".
+
+### Rendering is a security boundary
+
+Model output is untrusted. Raw HTML is XSS; markdown images let injected content exfiltrate data ([chapter 33](/33-security-prompt-injection/#exfiltration-channels-markdown-images-links-tools)). Memory Agent sanitises with DOMPurify; Chat Insights's `renderModelText` (`extension-leetcode/markdown.js`) builds DOM nodes and never uses `innerHTML` for model text.
+
+## Product metrics vs model metrics
+
+### Three layers
+
+| Layer | Examples |
+|---|---|
+| Model / system | eval pass rate, faithfulness, citation validity, abstain rate |
+| Product / task | task success, time to done, kept ratio, retry and escalation rates, return usage |
+| Business | cost per successful task, retention, tickets avoided |
+
+Model metrics are necessary, not sufficient: faithfulness can rise while users get less done because answers grew longer, more hedged or slower. Product metrics are the point but move slowly and for many reasons. Track both, plus **guardrail metrics** that must not regress: p95 latency, cost per task, in-scope refusal rate.
+
+Scheme Assistant's critic eval grades as a user experiences it (pass, partial, fail: "correct, complete enough for this user, right language, cited"); its 25 October report counts 177 persona questions: 48 passed, 63 incomplete, 66 failed, with no amount, date or phone number invented in 232 turns. Certificate Assistant's `PILOT_TARGETS` (`app/backend/api.py`, line 958) pairs each metric with a stop rule, such as link precision of at least 98% on random review, paused below 95% in any fortnight. A stop rule set before launch separates a pilot from a hope.
+
+### A/B testing AI features
+
+Offline evals say a change is safe; an online experiment says it helped (Kohavi, Tang and Xu, *Trustworthy Online Controlled Experiments*, 2020). AI makes experiments noisier: non-determinism adds variance; outcomes are rare or delayed; one user's many responses are correlated, so randomise and compute variance by user; novelty inflates early usage; shared caches and rate limits leak between arms.
+
+Sample size, with the formula from [chapter 19](/19-evals-methodology/#noise-statistics-sample-sizes) at 95% confidence and 80% power:
+
+n per arm = (1.96 + 0.84)² × [p₁(1 − p₁) + p₂(1 − p₂)] / δ²
+
+Task success from 30% to 32%: n = 7.84 × (0.21 + 0.2176) / 0.0004 = 7.84 × 0.4276 / 0.0004 ≈ 8,380 users per arm. Chapter 19's 80% to 75% needed about 1,090, so the two-point lift needs about 7.7 times more: (5/2)² = 6.25 from the smaller δ, and the rest because p(1 − p) is larger near 30% than near 80%.
+
+Now suppose the metric is the thumbs-up share and only 5% of responses get a thumb. The formula counts rated responses, so divide by the rating rate: a five-point drop in thumbs-up share (80% to 75%) needs 1,090 / 0.05 ≈ 21,800 responses per arm, and a two-point change at 30% to 32% would need 8,380 / 0.05 ≈ 167,600. Those are responses, not users: one user's responses are correlated, so the real requirement is higher. And the 5% who rate are a biased slice. For a product with a few thousand weekly users, most small changes are undetectable online; the offline gate does most of the work.
+
+```python
+from math import ceil
+
+def n_per_arm(p1: float, p2: float, z_a=1.96, z_b=0.84) -> int:
+    return ceil((z_a + z_b) ** 2 * (p1 * (1 - p1) + p2 * (1 - p2)) / (p2 - p1) ** 2)
+
+print(n_per_arm(0.30, 0.32))               # 8,381 users per arm
+print(ceil(n_per_arm(0.80, 0.75) / 0.05))  # 21,800 responses per arm if 5% are rated
+print(ceil(n_per_arm(0.30, 0.32) / 0.05))  # 167,620 for a two-point change
+```
+
+Before reading results, run an A/A test (same version both arms) and check **sample ratio mismatch**: a 50/50 split arriving as 52/48 at volume means assignment or logging is broken.
+
+<Production>
+
+**Failure modes.** Over-trust from confident layouts, generic disclaimers and uncalibrated confidence; users unable to correct or undo; dead-end refusals, or refusals in the wrong language; approval steps that became rubber stamps; feedback collected but never joined to traces or reviewed.
+
+**Cost.** Regenerate buttons multiply cost: a tenth of answers regenerated once is about 10% more spend. Stop buttons that do not cancel server-side keep billing. Polling every 2 s across many jobs is real load. Showing cost and limits (Memory Agent's per-answer cost, Chat Insights's daily cap) changes behaviour cheaply.
+
+**Latency.** Perceived latency is what users judge: stream tokens where you can, real progress where you cannot, honest estimates, async for long jobs. Verify-then-show trades first-token time for correctness on purpose; make the wait visible.
+
+**Observability.** Every feedback event, implicit signal and approval decision carries its answer's trace id and is stored as a trace score ([chapter 30](/30-observability/#feedback-into-traces)). Slice feedback share and reasons by prompt version and degraded versus normal; compute rates from the random sample only.
+
+**Security.** Sanitise rendered output, never `innerHTML` raw model text, proxy or block images, allowlist link targets. Redact feedback notes and restrict access. Rate-limit feedback endpoints.
+
+</Production>
+
+<Interview>
+
+<Q q="How do you collect useful feedback without annoying users?">
+
+- One tap banked immediately, then reason chips and an optional note; no modal surveys.
+- Ask after the outcome is known, not before a decision (anchoring).
+- Lean on implicit signals: copy, kept ratio of drafts, regenerate, rephrase, stop, escalate, downstream outcomes; validate each against human review.
+- Design editable drafts so corrections, the best signal, happen as part of the task.
+- Key every signal to a trace id; one record per person per item; rate-limit; redact notes.
+- Feedback finds failures (targeted review); a random sample measures rates.
+- **The trap:** "add thumbs and track the percentage" as a quality metric, ignoring who rates and that nobody reads them.
+
+</Q>
+
+<Q q="How would you measure whether an AI feature is succeeding?">
+
+- Define task success for this feature first (answer accepted, draft sent mostly unedited, resolved without escalation).
+- Three layers: model metrics offline, product metrics online, business metrics (cost per successful task, retention).
+- Guardrail metrics that must not regress: p95 latency, cost per task, in-scope refusal rate.
+- Rates from random samples with intervals; experiments randomised by user and sized (30% to 32% needs about 8,400 users per arm); A/A and sample-ratio checks.
+- Targets and stop rules set before launch.
+- **The trap:** one offline accuracy number or thumbs-up rate as "success", or a two-point win on a few hundred users.
+
+</Q>
+
+<Q q="Design the UX for an agent that takes irreversible actions.">
+
+- Scope: which actions are irreversible or external, who approves, time-to-decision SLO.
+- Tiers: reads auto; reversible writes auto with an undo window; irreversible actions need per-action approval rendered from the real arguments, with diff, evidence and "cannot be undone".
+- Against rubber-stamping: ask rarely, batch low-risk items, never pre-select approve, expire stale approvals, idempotency key per action.
+- Step-log progress, a stop that cancels server-side, a durable pause while waiting.
+- Rejections return to the agent with a reason, which is also feedback.
+- Measure approval rate, time to decide, edit-before-approve and post-approval reversals, tied to traces.
+- **The trap:** "the system prompt tells it to ask first", or a dialog showing the model's summary instead of the actual call.
+
+</Q>
+
+<Q q="Should you show users a confidence score next to AI answers?">
+
+- Only if calibrated on real traffic; token probabilities and judge scores usually are not.
+- Prefer naming the unverified part, categorical verdicts with actions, abstaining, and checkable citations.
+- If you show it, bucket it (high, medium, low) and check bucket accuracy regularly.
+- **The trap:** showing the model's self-reported confidence as a probability.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** turn one feature into a full loop: thumbs plus reason, checkable citations, undo and approval, progress, feedback joined to traces, and a week of reviewed feedback turned into eval cases.
+
+**Where:** Memory Agent (`~/memory-agent`), which already streams progress and numbered citations but captures no feedback (the `done` handler in `public/app.js` is the place). Use a mock LLM or Ollama (`qwen2.5:3b` via its OpenAI-compatible endpoint) and replace web search with 30 canned results, so nothing calls a paid API.
+
+**Steps**
+
+1. Give every turn a `traceId`, send it in `done`, and store prompt version, model, latency, cost, cited ids and guard result per trace.
+2. Add thumbs, reason chips and an optional note; bank the thumb on first click; validate, upsert per trace and user, redact, rate-limit.
+3. Log copy, stop, rephrase within 90 s and abandon with the trace id.
+4. Drop cited ids not in the retrieved set before rendering and log the drop.
+5. Add one reversible action with a 30-minute undo and one mocked "email this summary" behind an approval card rendered from the real arguments.
+6. Script 200 sessions from 20 personas, some thumbing down, rephrasing or stopping on injected failure modes.
+7. Build a review queue (100 targeted, 50 random), label failure modes, and add 10 regression cases to `eval/cases.ts` with trace ids as provenance.
+
+**Definition of done:** `docs/feedback_week.md` with feedback share, reason mix, implicit-signal counts, the random-sample failure rate with its interval, the taxonomy, 10 cases that fail before a fix and pass after, and one command that prints thumbs-down rate by prompt version.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader (your code): expectation and precision.** `backend/calibration.py` anchors scores on 143 real marksheets and prints topper and cut-off context; `critLevel` in `evaluation.html` replaced "4/5" with a band word and five-dot meter; the waiting page shows four real stages, polls every 2 s and gives up after about 8 minutes. Gap: ratings (one row per rater, 30 per hour per IP) are averaged in analytics but never become eval cases.
+- **Chat Insights: the most complete explicit-feedback design.** "hint missed?" banks a thumbs-down at once; reason and note sit on the message row with rung, model, usage, guard and `degraded`; `pilot_report.js` reports feedback share. Also `chatErrorCopy`, the "fallback" depth meter and `unreviewed` findings.
+- **Memory Agent: sources and uncertainty, plus an honest gap.** DOMPurify-sanitised numbered citations, the number guard's "Check before relying on" line, streamed search steps (decision 3), cost under each answer, honesty under pushback (decision 6). No feedback capture, and pushback is handled but not logged.
+- **Scheme Assistant: claim the mobile UX, credit the core.** Yours: confirm-before-send push-to-talk, the mobile side of stop (Chiman designed the server cancel), `JmRevealText`, the out-of-scope copy, and the critic eval (48 pass, 63 partial, 66 fail of 177) that found English refusals for Hinglish users. Teammates': `AnswerStatus` and the core RAG. Gap: no feedback control or endpoint.
+- **Certificate Assistant: human in the loop.** `VerdictCard.tsx` never pre-selects; `clear-match` undoes until signing; feedback only after the decision, once, "not an officer metric"; only family confirmations become labels; `PILOT_TARGETS` has stop rules.
+- **Health Triage (evidence only):** your Flutter screen falls back from SSE to 3-second polling; the versioned `SSEEvent` schema is a teammate's.
+
+</YourProject>

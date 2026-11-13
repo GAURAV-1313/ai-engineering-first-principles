@@ -1,0 +1,522 @@
+---
+id: "14"
+title: "Multimodal and Realtime Voice"
+summary: "Work out what an image, a scanned page or a minute of audio costs from a provider's published formula, choose between OCR and a vision model for documents, and design a voice loop (cascade or speech-to-speech) with a latency budget, endpointing, barge-in and Indic code-mixing handled, then evaluate all of it."
+readingTime: "25 min"
+---
+
+Text chat taught you one input type and one cost unit: tokens in, tokens out. Real products do not stay there. A citizen photographs a government notice. A student uploads four pages of handwriting. A support caller speaks Hinglish over a bad phone line and interrupts the bot halfway through a sentence. Each of these turns a non-text signal into something a language model can attend to, and each conversion has its own cost formula, its own latency and its own way of failing quietly.
+
+The questions are the ones you already ask of text. How does this input become tokens, and how many? What does it cost per page or per minute? Where does the time go between the user finishing a sentence and hearing the first word back? What does a wrong answer look like, and how would you notice? This chapter answers them for images, documents and speech, then covers image generation, multimodal RAG and evaluation.
+
+## Vision inputs (images, screenshots)
+
+### The problem
+
+A transformer consumes a sequence of vectors. Text gets there through a [tokenizer](/02-tokenization/#why-discrete-tokens) and an embedding table. A 1,000 × 1,000 photo is three million numbers. One position per pixel would make the sequence millions long (attention cost grows with the square of length), and pixels are not meaningful units the way subwords are. You need a few hundred or a few thousand vectors in the same space as text embeddings.
+
+### How it works underneath: patches, an encoder, a projector
+
+The idea that unlocked this came from the Vision Transformer paper (Dosovitskiy et al. 2020, "An Image is Worth 16x16 Words"). Cut the image into fixed squares called **patches**, flatten each patch into a vector, project it to the model width, add a position embedding, and run a standard transformer over the sequence. A 224 × 224 image with 16-pixel patches becomes (224 / 16)² = 14 × 14 = 196 patch vectors. The patch is the image's token.
+
+A modern vision-language model (VLM) bolts this onto an LLM in three parts:
+
+```text
+ image ──► resize / tile ──► patchify (P×P px) ──► vision encoder (ViT)
+                                                     │  one vector per patch
+                                                     ▼
+                                    projector (MLP), sometimes merges 2×2 patches
+                                                     │  vectors in the LLM's embedding space
+                                                     ▼
+ [system][text tokens][image tokens ...][text tokens] ──► decoder LLM ──► text out
+```
+
+The **vision encoder** is usually pre-trained contrastively on image-caption pairs, as in CLIP (Radford et al. 2021; see [the CLIP section](/03-embeddings-and-vector-space/#multimodal-clip-style)), so its patch vectors already carry meaning. The **projector** maps them into the LLM's embedding space; LLaVA (Liu et al. 2023, "Visual Instruction Tuning") showed a small projector plus instruction tuning is enough for a capable assistant. Some open models merge 2 × 2 neighbouring patches in the projector (Qwen2-VL, Wang et al. 2024, does this), so a 14-pixel grid becomes an effective 28-pixel grid with a quarter of the tokens. From then on, image tokens are ordinary context positions: they go through prefill, occupy KV cache and are billed as input.
+
+The engineering consequence: **resolution is a budget.** Every provider resizes large images to a cap before patchifying, and detail smaller than a patch at the post-resize scale is gone. Send a scan 4,000 pixels tall to a model capped at a 1,568-pixel long edge and 1,568 visual tokens: for a page shape the token cap binds first, the page comes out about 1,300 pixels tall, and its effective DPI falls to a third. Handwriting and small table text die here, not in the LLM. Pre-resize or crop yourself so cost and quality are predictable. Screenshots for [computer-use agents](/28-coding-and-computer-use-agents/#computer-use-screenshots-and-actions) are the extreme case: dense text, coordinates returned in the resized space, and a few thousand tokens per step re-sent in history.
+
+### Failure modes
+
+- **Hallucinated reading.** Asked to read a blurry word, a VLM produces a plausible word, not "[illegible]", unless the prompt and schema make "illegible" representable.
+- **Off-task images.** Users upload selfies and blank pages, and the model invents a task to fit. Answer Grader's extraction prompt opens with a "TASK 0" that asks whether the images show an answer at all and forbids inventing a question, so a wrong upload costs one vision call, not a pipeline run.
+- **Counting.** Models are poor counters. Count words or rows in code from a transcript, and keep the model's estimate as a cross-check.
+
+<Callout type="tip">
+
+Match resolution to the task. Classification ("is this a receipt?") survives a low-detail image at a fixed small token cost. Reading handwriting or a dense table needs full detail. Two calls (cheap gate at low detail, then a high-detail read only for pages that pass) is often cheaper than one high-detail call on everything.
+
+</Callout>
+
+## PDF/document understanding
+
+### The problem
+
+"Process these PDFs" hides four different inputs. A **born-digital** page has a text layer you can extract exactly, free, in milliseconds. A **scanned** page has no text at all. A **legacy-font** page (common in Indian government documents typed in Kruti Dev and similar fonts) has a text layer of Latin codes that only look like Devanagari when rendered, so extraction yields garbage that looks like text. A **structured** page (tables, forms) has layout that carries meaning. One pipeline for all four is either expensive (a VLM on every page) or wrong (trust every text layer).
+
+### Document understanding is a routing problem first
+
+Decide per page, not per file, using cheap signals:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class PageSignals:
+    text_chars: int          # characters in the extracted text layer
+    image_area_ratio: float  # share of page covered by raster images
+    devanagari_ratio: float  # share of letters in U+0900..U+097F
+    expected_hindi: bool
+    has_ruled_table: bool
+
+def route(p: PageSignals) -> str:
+    if p.text_chars < 50 and p.image_area_ratio > 0.5:
+        return "vlm_ocr"            # scanned: nothing to extract
+    if p.expected_hindi and p.devanagari_ratio < 0.5:
+        return "font_map_then_validate"   # legacy font: map codes, else OCR
+    if p.has_ruled_table:
+        return "table_parser"       # layout-aware extractor
+    return "text_layer"             # born-digital: exact and free
+
+# every lane's output then goes through the same validator;
+# a page that fails falls through to vlm_ocr or to human review
+```
+
+Scheme Assistant's ingestion (a teammate's triage design) works this way: lanes for clean digital text, tables, legacy-font mapping, VLM OCR for scans, typed extractors for structured files, and a quarantine list forced to OCR plus a human spot-check. The cheapest reliable extractor goes first; the VLM is the fallback.
+
+### Classical OCR vs a vision LLM
+
+| | Classical OCR (Tesseract, cloud OCR) | Vision LLM as OCR |
+|---|---|---|
+| Cost per page | near zero locally | image tokens in + transcript tokens out |
+| Handwriting, complex layout, mixed scripts | weak | strong |
+| Confidence signal | per word, with bounding boxes | none reliable |
+| Determinism | yes | no: cache results |
+| Failure style | visible garbage | fluent, plausible errors |
+
+The last row is the one that matters. Classical OCR fails loudly; a VLM "corrects" a word, completes a cut-off line, or returns an apology as the page text. It can also refuse: a page whose text is published online can trip a recitation filter and come back empty.
+
+### Making VLM OCR production-safe
+
+1. **A transcription contract**: copy, never translate, correct or reorder; mark `[illegible]`, `[stamp]`, `[signature]`. Answer Grader's transcription task also lists what to leave out (the printed question, margin labels, names and roll numbers).
+2. **Temperature 0 and a cache** keyed on (file hash, page, model), so re-runs are free and chunk text, ids and embeddings do not shift between ingests.
+3. **Validation on every lane** in code: script ratio, lexicon hit rate, malformed sequences, empty or apology replies.
+4. **Retries with backoff**, so a 250-page batch does not restart from zero after one timeout.
+5. **A human spot-check** of a sample, page image beside text.
+
+For pulling fields rather than full text, see [extraction with structured output](/13-structured-output/#extraction-and-classification-patterns); for what happens next, [ingestion and parsing](/17-rag-pipelines/#ingestion-and-parsing).
+
+<Callout type="warn">
+
+OCR errors cascade silently. "15" misread as "16" in a clause number becomes a wrong citation three stages later, and nothing raises an error. Validate at the OCR boundary and keep the page image linked to every chunk.
+
+</Callout>
+
+## STT/TTS
+
+### Speech to text (ASR)
+
+Automatic speech recognition turns a waveform into text. The common modern recipe, popularised by Whisper (Radford et al. 2022, "Robust Speech Recognition via Large-Scale Weak Supervision", trained on 680,000 hours of web audio), is an encoder-decoder transformer:
+
+```text
+ audio 16 kHz ──► 25 ms windows every 10 ms ──► 80 log-Mel features per frame (128 in large-v3)
+   30 s chunk = 3,000 frames ──► conv stem (stride 2) ──► 1,500 encoder positions
+   ──► transformer encoder ──► decoder emits text tokens (with language + task tokens)
+```
+
+Audio has a "patch" too: the frame. Whisper's 30-second window becomes 1,500 encoder positions, 50 per second. Batch models see the whole clip; **streaming ASR** works on small chunks and emits **partial transcripts** that may be revised, then a **final** one per segment. A realtime agent needs streaming; push-to-talk and voicemail are fine with batch.
+
+Measure ASR with **WER** (word error rate: substitutions + deletions + insertions, over reference words) and, for Indic languages with spelling variants, **CER** (character error rate), because WER counts a nukta variant as a whole wrong word. Track **entity accuracy** separately: 5 percent WER that lands on the account number is worse than 10 percent on filler words.
+
+**Domain vocabulary** is the classic gap: a general model has rarely heard "मस्टर रोल" or a district name. Providers expose biasing through keyword lists, prompts or custom vocabularies. Scheme Assistant's speech path (Gaurav's code) sends fifty scheme and district names as `keyterms` to Sarvam's `saaras:v4` and pins Hindi when the user chose it.
+
+### Text to speech
+
+TTS runs text → normalised text → acoustic tokens or spectrogram → waveform. Three things matter:
+
+- **Text normalisation.** "Rs 1,25,000" must be spoken as "one lakh twenty-five thousand rupees", not "one comma two five comma". Dates, account numbers (digit by digit) and abbreviations need code before TTS. Write for the ear: no Markdown, no URLs.
+- **Time to first audio.** Streaming TTS starts after the first phrase; batch TTS returns nothing until the whole text is synthesised, seconds later for a long answer.
+- **Limits and cost.** Providers cap characters per request, so split at sentence ends (Scheme Assistant cuts at "।", ".", "?", "!" into pieces of at most 2,400 characters, under a 2,500 limit). Billing is per character or per second; cache identical outputs.
+
+```ts
+// Stream LLM tokens into TTS a clause at a time, so audio starts early.
+async function* speakable(tokens: AsyncIterable<string>, minChars = 20) {
+  let buf = "";
+  // first clause or sentence end after at least minChars characters
+  const cut = new RegExp(`^([\\s\\S]{${minChars},}?[,.?!।])\\s`);
+  for await (const t of tokens) {
+    buf += t;
+    const m = buf.match(cut);
+    if (m) {
+      yield normaliseForSpeech(m[1]);   // numbers, currency, dates -> words
+      buf = buf.slice(m[0].length);
+    }
+  }
+  if (buf.trim()) yield normaliseForSpeech(buf);
+}
+declare function normaliseForSpeech(s: string): string;
+```
+
+The trade-off: a short first clause starts audio sooner but gives the TTS less context, so intonation can sound choppy. Tune by listening.
+
+## Realtime voice pipelines (cascade vs speech-to-speech)
+
+### The cascade
+
+The classic design chains three models, each streaming into the next:
+
+```text
+ mic ─► VAD ─► streaming STT ──partials/final──► LLM (+ tools, RAG) ──tokens──►
+        clause chunker ─► normaliser ─► streaming TTS ─► speaker
+        └──────────────── turn manager: endpointing, barge-in, cancel ───────────┘
+```
+
+Its strength is control: pick the best ASR for Hindi and code-mixing, the best LLM for tools, the best TTS voice, and swap each independently; run guardrails, retrieval, PII redaction and logging on exact text between stages. Its weaknesses are latency (three hops plus the gaps) and lost paralinguistics: the LLM hears words, not tone or hesitation.
+
+### Speech-to-speech
+
+A **speech-to-speech** model takes audio in and produces audio out in one network: a neural codec turns audio into discrete tokens at a fixed rate, and the model is trained on interleaved text and audio. Full-duplex research models such as Moshi (Défossez et al. 2024) listen and speak at once, modelling overlap and backchannels. Commercial realtime APIs (OpenAI's Realtime API, Google's Gemini Live API and others; check current models, languages and prices) expose this over WebSocket or WebRTC with built-in VAD and interruption events.
+
+It has fewer hops, keeps prosody, and handles interruptions natively. In exchange you get less control, no exact transcript unless you request a side transcription (where text guardrails must then run), possibly weaker tool calling than the provider's best text model, and Indic and code-mixing quality that varies by provider. Verify on your own audio.
+
+### Choosing
+
+| Question | Lean cascade | Lean speech-to-speech |
+|---|---|---|
+| Regulated actions, audit trail needed | yes | only with a side transcript |
+| Indic languages, code-mixing | best-in-class Indic ASR/TTS available | if the model is strong in your languages |
+| Tool calls and RAG mid-turn | natural (text in the middle) | supported, check quality |
+| Emotional, chatty, companion-style | weaker | stronger |
+| Latency target under about 800 ms | hard, needs every trick | easier |
+
+For an Indian support product: ship the cascade, keep a speech-to-speech prototype, and compare task success and p95 gap on the same scripted calls. The full design is [drill D04](/interview/d04/).
+
+### The latency budget
+
+Users feel the **voice-to-voice gap**: end of their speech to first audio of the reply. Stivers et al. 2009, studying ten languages, found gaps between human turns cluster around 0 to 200 ms. Machines will not match that. [D04](/interview/d04/) targets about 1 s at p50 and under about 1.5 s at p95; a well-tuned cascade gets near 800 ms, the figure often quoted as the bar (check current vendor guidance for your channel). A streaming cascade, stage by stage:
+
+```text
+stage                                 naive      tuned      lever
+endpointing (silence wait)            500 ms     250 ms     semantic end-of-turn model
+STT final after endpoint              150 ms       0 ms     start LLM on stable partial
+LLM time to first token (TTFT)        350 ms     200 ms     smaller model, cached prefix
+tokens to first clause  12 @ 60 tok/s 200 ms     100 ms     6 tokens: prompt for short openers
+TTS time to first audio               150 ms     150 ms     streaming TTS, warm connection
+network + jitter buffer               100 ms     100 ms     regional endpoints, WebRTC
+voice-to-voice                       1450 ms     800 ms
+```
+
+The arithmetic: 500 + 150 + 350 + 200 + 150 + 100 = 1,450 ms; 250 + 0 + 200 + 100 + 150 + 100 = 800 ms. **Endpointing is the biggest single term**, and it is a product decision, not a model one. The LLM costs TTFT plus the first speakable clause, not the whole reply, which streams while it plays ([TTFT and decode speed](/10-inference-mechanics/#ttft-tpot-itl-throughput), [perceived latency](/31-cost-and-latency-engineering/#streaming-and-perceived-latency)). Tool calls add on top; say a short "let me check" only when you know a lookup is slow.
+
+## Turn-taking, barge-in, VAD
+
+### VAD
+
+**Voice activity detection** classifies short frames (10 to 30 ms) as speech or not. Energy thresholds fail on a fan or traffic; small neural VADs (Silero VAD is a widely used open one) are robust and cheap enough for every frame. VAD answers "is someone speaking?", not "has the user finished?"
+
+### Endpointing
+
+**Endpointing** decides the turn is over. "Silence for T ms" is the simple rule: too short cuts off people who pause while reading a number; too long feels sluggish. Better systems add a **semantic end-of-turn** signal: "मेरा जॉब कार्ड नंबर है" (my job card number is) is unfinished; "मेरा पैसा कब आएगा?" (when will my money come?) is complete. OpenAI's Realtime API, for example, offers a `semantic_vad` mode (with an `eagerness` of low, medium or high) beside silence-based `server_vad`, and open end-of-turn models exist for self-hosted stacks.
+
+```python
+from enum import Enum
+
+class S(Enum): IDLE = 0; USER = 1; WAIT = 2; BOT = 3
+
+class TurnManager:
+    def __init__(self, base_ms=600, complete_ms=250, min_barge_ms=300):
+        self.s, self.silence, self.speech = S.IDLE, 0, 0
+        self.base, self.complete, self.min_barge = base_ms, complete_ms, min_barge_ms
+
+    def on_frame(self, is_speech: bool, frame_ms: int, partial: str) -> str | None:
+        if self.s == S.BOT:
+            self.speech = self.speech + frame_ms if is_speech else 0
+            if self.speech >= self.min_barge:      # ignore "haan", "hmm", coughs
+                self.s, self.silence = S.USER, 0
+                return "BARGE_IN"                   # stop TTS, cancel LLM, truncate
+            return None
+        if is_speech:
+            self.s, self.silence = S.USER, 0
+            return None
+        if self.s == S.USER:
+            self.silence += frame_ms
+            wait = self.complete if looks_complete(partial) else self.base
+            if self.silence >= wait:
+                self.s = S.WAIT
+                return "END_OF_TURN"                # send final transcript to LLM
+        return None
+
+    def bot_started(self): self.s, self.speech = S.BOT, 0
+
+def looks_complete(text: str) -> bool:   # stand-in for an end-of-turn model
+    return text.rstrip().endswith(("?", "।", ".")) and len(text.split()) >= 3
+```
+
+The wait adapts: 250 ms when the text looks complete, 600 ms otherwise. After the bot asks for a number, raise it further, because people pause between digit groups.
+
+### Barge-in
+
+When the user speaks over the bot, three things must happen within roughly 100 to 200 ms:
+
+1. **Stop playback** locally, without waiting for the server.
+2. **Cancel generation** so you stop paying for words nobody will hear.
+3. **Truncate history to what was heard.** If the bot generated 80 words and 25 were played, history must hold those 25, or the model will say "as I mentioned..." about things the user never heard. OpenAI's Realtime API has an explicit `conversation.item.truncate` event that takes the playback position in milliseconds (`audio_end_ms`) and deletes the server-side transcript of the unheard part; in a cascade you map played duration back to text yourself.
+
+**False barge-ins** come from backchannels ("haan", "achha", "hmm" mean "go on") and **echo**, the bot's voice leaking into the microphone. A minimum speech duration handles the first; acoustic echo cancellation (built into WebRTC stacks) handles the second. Without it, a speakerphone bot interrupts itself.
+
+### Indic languages and code-mixing
+
+Code-mixing is the default in India: "mera account block ho gaya hai, please check karo".
+
+- **ASR language.** Pinning `hi-IN` can mangle English words; auto-detect can flip mid-utterance. Some Indic providers offer a code-mix output: Sarvam's `saaras:v3` and `v4` take `mode="codemix"`, which keeps English words in Latin script and Hindi in Devanagari (check current docs). Decide the transcript's script, because retrieval and prompts depend on it.
+- **Spelling variance.** "rozgar", "rojgar", "रोज़गार", "रोजगार" are one word; normalise before matching. Scheme Assistant's keyterm list carries nukta and non-nukta spellings for this reason.
+- **Token cost.** Devanagari usually costs more tokens per word ([non-English cost](/02-tokenization/#failure-modes-arithmetic-spelling-non-english-cost)), so answers cost more and the first clause arrives later.
+- **TTS pronunciation.** Choose voices that handle both scripts; expand acronyms like "PMAY".
+- **Eval data.** Public benchmarks under-represent your accents, channels and mixing. Record (with consent) and label your own.
+
+## Image generation intuition
+
+You may be asked about this even if you never ship it, to see whether you know why it costs what it costs and fails how it fails.
+
+**Diffusion** (Ho et al. 2020, DDPM) learns to reverse a noising process. Training adds a known amount of Gaussian noise to an image and teaches a network to predict that noise, given the noisy image, the noise level and a text embedding. Generation starts from pure noise and denoises step by step, guided by the text. **Latent diffusion** (Rombach et al. 2022) runs this in an autoencoder's compressed latent space instead of pixels, which made it cheap enough for one GPU. **Classifier-free guidance** runs the denoiser with and without the text and pushes towards the conditioned prediction: higher guidance follows the prompt more literally, with less variety.
+
+A second family is **autoregressive**: an image tokenizer turns images into discrete tokens that a transformer predicts like text, so one model can interleave text and images. Providers rarely publish how closed models do it; treat architecture claims as unverified.
+
+Consequences: cost scales with steps and resolution (providers price per image by size and quality; check the price page); text in images, counting and spatial relations are historic weak spots; latency is seconds, so design the UI as a job; filter prompts and outputs, and use content credentials where supported.
+
+## Multimodal RAG
+
+Your corpus has charts, scanned forms, diagrams and tables. Text-only RAG throws that information away or mangles it. There are three patterns, in increasing order of cost and fidelity:
+
+```text
+ A. parse to text      page ──OCR/parser──► text ──► chunk ──► text embed ──► text index
+ B. describe visuals   figure ──VLM caption──► "Bar chart: wages by district 2024..."
+                       caption + nearby text ──► text embed ──► text index
+ C. embed the page     page image ──multimodal embedder──► vector(s) ──► image index
+                       at answer time: retrieve page images ──► VLM reads them
+```
+
+**A** is right when content is mostly text. **B** adds a VLM call per figure at ingestion; the risk is a caption that omits the number the user later asks about. **C** skips parsing: ColPali (Faysse et al. 2024) embeds page images as multi-vectors and matches text queries by late interaction, which suits layout-heavy documents, but the generator must then read retrieved page images (thousands of tokens each) instead of short chunks. A hybrid:
+
+```python
+def ingest_page(page, doc_id, n):
+    text = extract_or_ocr(page)                      # routed as in the PDF section
+    chunks = [{"doc": doc_id, "page": n, "text": c, "kind": "text"} for c in chunk(text)]
+    for fig in detect_figures(page):                 # charts, tables as images
+        cap = vlm_caption(fig, prompt="Describe all numbers, axes and labels.")
+        chunks.append({"doc": doc_id, "page": n, "text": cap, "kind": "figure",
+                       "image_ref": store(fig)})     # keep the pixels for answer time
+    return chunks
+
+def answer(q):
+    hits = hybrid_search(q, k=8)
+    images = [load(h["image_ref"]) for h in hits if h["kind"] == "figure"][:2]
+    return vlm_generate(q, passages=hits, images=images)   # cite page numbers
+```
+
+Every chunk keeps its page and, for figures, the original pixels, so answers cite a page a reviewer can open. Tables are covered in [tables and multimodal](/18-advanced-and-agentic-rag/#tables-and-multimodal).
+
+## Token costs of images and audio
+
+Never guess an image's token cost. Providers publish formulas; use them, and confirm with a token-counting endpoint or the `usage` field. As of November 2026 (re-check; they change with model generations):
+
+- **Anthropic:** one visual token per 28 × 28-pixel patch, tokens = ⌈width / 28⌉ × ⌈height / 28⌉ after downscaling to the largest aspect-preserving size within the model's caps: 1,568 px long edge and 1,568 tokens on standard-tier models, 2,576 px and 4,784 tokens on the high-resolution tier (Claude 4.7 and later).
+- **OpenAI tile-based models** (for example `gpt-4o`, `gpt-4.1`): `detail: "low"` costs a fixed base. High detail: fit within 2,048 × 2,048, scale the shortest side down to 768 px, count 512-pixel tiles, charge base + tiles × per-tile (85 + 170 per tile for those two). Newer OpenAI models count 32-pixel patches with a per-model multiplier and budget instead.
+- **Gemini:** the token guide gives 258 tokens for an image at most 384 px on both sides and 258 per 768 × 768 tile above that; on Gemini 3 and later a `media_resolution` setting fixes the budget (1,120 tokens per image at the default, 560 per PDF page plus the page's native text). The token guide gives audio as 32 tokens per second, while the Gemini 3 media-resolution table lists 25; check `usage` on your model.
+
+### Worked example: one scanned A4 page
+
+Render A4 (8.27 × 11.69 inches) at 200 DPI: 1,654 × 2,339 px. That is the DPI Scheme Assistant's OCR lane uses.
+
+```text
+OpenAI tile formula (gpt-4o / gpt-4.1 constants, detail high)
+  fit in 2048×2048:   scale 2048/2339 = 0.876   -> 1448 × 2048
+  shortest side 768:  scale 768/1448  = 0.530   -> 768 × 1086
+  tiles: ceil(768/512) × ceil(1086/512) = 2 × 3 = 6
+  tokens = 85 + 6 × 170 = 1,105
+
+Claude patch formula
+  standard tier: edge cap alone -> 1108 × 1568 = 40 × 56 = 2,240 patches > 1,568
+                 largest size under both caps: 924 × 1307 -> 33 × 47 = 1,551
+  high-res tier: 1654 × 2339 fits 2576, but 60 × 84 = 5,040 > 4,784
+                 largest size under both caps: 1624 × 2296 -> 58 × 82 = 4,756
+
+Gemini
+  legacy tiling: ceil(1654/768) × ceil(2339/768) = 3 × 4 tiles × 258 = 3,096
+  Gemini 3+ at default media_resolution: 1,120 per image
+```
+
+One page image costs about 1,100 to 4,750 input tokens depending on provider and tier (560 plus its text if sent as a PDF page to Gemini 3), a spread that can matter more than the per-token price. As code (the Claude function mirrors the binary search in Anthropic's reference implementation):
+
+```python
+import math
+
+def openai_tile_tokens(w, h, base=85, per_tile=170, detail="high"):
+    if detail == "low":
+        return base
+    s = min(1.0, 2048 / max(w, h)); w, h = w * s, h * s       # fit 2048 box
+    s = min(1.0, 768 / min(w, h));  w, h = int(w * s), int(h * s)  # shortest side 768
+    return base + math.ceil(w / 512) * math.ceil(h / 512) * per_tile
+
+def claude_patch_tokens(w, h, max_edge=1568, max_tokens=1568):
+    def cost(a, b): return math.ceil(a / 28) * math.ceil(b / 28)
+    def fits(a, b):
+        return (math.ceil(max(a, b) / 28) * 28 <= max_edge
+                and cost(a, b) <= max_tokens)
+    if fits(w, h):
+        return cost(w, h)
+    long, short = max(w, h), min(w, h)
+    lo, hi = 1, long                   # largest long edge that fits
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if fits(mid, round(mid * short / long)) else (lo, mid)
+    return cost(lo, round(lo * short / long))
+
+def gemini_audio_tokens(seconds, per_s=32): return per_s * seconds
+
+print(openai_tile_tokens(1654, 2339))               # 1105
+print(claude_patch_tokens(1654, 2339))              # 1551
+print(claude_patch_tokens(1654, 2339, 2576, 4784))  # 4756
+print(gemini_audio_tokens(60))                      # 1920
+```
+
+### Cost per 10,000 pages
+
+VLM OCR is output-heavy: a dense page transcribes to hundreds of output tokens, usually priced several times higher than input. Assuming 700 transcript tokens per page:
+
+```text
+cost = pages × (T_in × P_in + T_out × P_out) / 1,000,000
+     = 10,000 × (1,105 × P_in + 700 × P_out) / 1e6
+     = 11.05 × P_in + 7.0 × P_out          (dollars, with P in $ per M tokens)
+```
+
+If `P_out` is four times `P_in`, output costs 28 × `P_in` against 11 × `P_in` for the images: the transcript dominates, more so in Devanagari. A cache on (file hash, page, model) means you pay once per page.
+
+### Audio: the history trap
+
+At 32 tokens per second, a minute of audio is 1,920 tokens. In a speech-to-speech session, audio stays in history and is re-processed each turn unless cached. Ten user turns of 15 seconds (480 tokens each):
+
+```text
+counted once:          10 × 480 = 4,800 tokens
+re-sent every turn:    480 × (1 + 2 + ... + 10) = 480 × 55 = 26,400 tokens
+```
+
+That quadratic growth is why long voice sessions get expensive and why a cascade keeping only text history is often cheaper per minute (check whether your provider discounts cached audio). Cascade speech vendors bill STT per audio minute and TTS per character or second; [D04](/interview/d04/) works a cost per 1,000 call minutes, and these terms belong in your [token budget accounting](/31-cost-and-latency-engineering/#token-budget-accounting).
+
+## Evaluating multimodal outputs
+
+The reference is often in another medium, but the strategy is the text one ([eval methodology](/19-evals-methodology/#exact-functional-reference-metrics)): measure exactly in code what you can, and use judges and humans for the rest.
+
+**OCR and extraction.** CER against hand-typed transcripts of sampled pages, sliced by lane and script; field-level accuracy for entities ([evaluating structured output](/13-structured-output/#evaluating-structured-output)). In production, deterministic validators on every page: Devanagari share, residue characters, lexicon hit rate, malformed sequences. Scheme Assistant's validator (a teammate's code) calibrates these on the corpus and routes a page to pass, OCR fallback or human review.
+
+```python
+def cer(ref: str, hyp: str) -> float:
+    """Character error rate: Levenshtein distance / reference length."""
+    prev = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        cur = [i]
+        for j, h in enumerate(hyp, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r != h)))
+        prev = cur
+    return prev[-1] / max(1, len(ref))
+
+# normalise first (Unicode NFC, collapse spaces), or nukta/matra encodings
+# that render identically will count as errors
+```
+
+**Confidence-aware verdicts.** A low-confidence mismatch is not evidence. Certificate Assistant's reader turns a field mismatch into "unclear" when OCR confidence is under 60, so a shaky read never counts against an applicant. Abstaining on low confidence generalises to any multimodal decision.
+
+**Counts in code.** If the product depends on a number derived from an image, compute it from the transcript and keep the model's estimate beside it.
+
+**ASR.** WER and CER on your own audio, sliced by language, code-mix ratio, channel and noise; entity accuracy on digits and names.
+
+**TTS.** Mean opinion scores from human raters on a fixed script set, a pronunciation checklist for numbers and Hindi names, and a cheap **round-trip check**: run ASR on the TTS output and compute WER against the input text.
+
+**Voice agents.** Task success graded on final state in code; false endpoint, dead-air and false barge-in rates; voice-to-voice p50 and p95 per stage. Simulated callers are TTS voices plus noise played into the real pipeline.
+
+**Vision QA and generation.** A judge that sees the image can grade answers once validated against human labels ([judge biases](/20-evals-judges-and-ci/#judge-biases)). For generated images, human preference is the main signal; CLIPScore (Hessel et al. 2021) and FID (Heusel et al. 2017) are coarse proxies.
+
+<Production>
+
+**Failure modes.** OCR errors cascade into wrong chunks and wrong citations with no error raised; VLM OCR fails fluently (corrects, completes, or returns an apology as page text), and recitation filters can blank a page whose text is published online. In voice: endpointing cuts users off mid-number, echo makes the bot interrupt itself, backchannels trigger false barge-ins, untruncated history makes the bot cite things the user never heard, and unnormalised numbers come out as nonsense.
+
+**Cost.** Compute image tokens per page from the provider's formula (about 1,100 to 4,750 for one A4 scan) and remember OCR output tokens often cost more than the image. Audio is per-minute STT, per-character or per-second TTS, or about 1,920 tokens per minute (at 32 per second) on token-billed models, growing quadratically if re-sent each turn. Cache OCR by (file hash, page, model) and TTS by hash of (language, voice settings, text); gate at low detail before a high-detail read.
+
+**Latency.** Voice needs roughly sub-second voice-to-voice at p50 (verify against current vendor guidance). The levers, largest first: semantic endpointing, starting the LLM on a stable partial, a small model with a cached prefix, a short first clause, streaming TTS on warm connections. Batch OCR is throughput-bound: cap concurrency at the rate limit and retry with backoff.
+
+**Observability.** One trace per voice session, spans per turn: VAD end, STT final, LLM first token, first clause, TTS first byte, playback start, barge-in and truncation point. Log sizes and durations, not audio or text, unless you have consent and a retention policy. For documents, log lane, OCR mode, validator verdict and cache hit per page.
+
+**Security.** Text inside an image or scan reaches the model exactly like typed text, and OCR'd text in a later prompt is [indirect injection](/33-security-prompt-injection/#indirect-injection): delimit it and never let it change tools or permissions. Voice can be cloned, so never authenticate account actions by voice alone. Audio and page images are personal data: hold them in memory for the call and keep images on device where you can (Certificate Assistant's reader sends only a perceptual hash of the page).
+
+</Production>
+
+<Interview>
+
+<Q q="Design a voice assistant for customer support." reported>
+
+- **Scope and SLOs**: phone and app; Hindi, English, Hinglish; read and simple-action tasks, human transfer for the rest; voice-to-voice around 1 s p50, 1.5 s p95; task success and transfer rate as product metrics.
+- **Baseline**: streaming cascade (VAD, streaming STT with domain keyterms, LLM with a few tools, clause chunker, normaliser, streaming TTS) plus a turn manager; speech-to-speech as a measured alternative, because you want transcripts, text guardrails and the best Indic ASR.
+- **Numbers**: endpointing 250 to 500 + STT 0 to 150 + TTFT 200 to 350 + first clause 100 to 200 + TTS 150 + network 100 ≈ 0.8 to 1.45 s; cut endpointing first.
+- **Guardrails**: read back and confirm before actions; OTP, never voice biometrics; PII redaction; reprompt ladder, then transfer.
+- **Evals and cost**: WER and entity accuracy on your own code-mixed calls, scripted audio scenarios graded on final state, false-endpoint and false-barge-in rates; cost per call minute = STT minutes + TTS characters + LLM tokens, priced from current pages, to see which term dominates.
+- **The trap:** three boxes (STT, LLM, TTS) with no endpointing, barge-in, latency numbers or plan for code-mixing.
+
+</Q>
+
+<Q q="How do you hit low latency in a voice agent?">
+
+- Measure voice-to-voice p50 and p95 with a span per stage before changing anything.
+- Replace a fixed silence wait with semantic end-of-turn detection, adapted to context (longer after asking for digits).
+- Stream and overlap everything; start the LLM on a stable partial transcript and discard if the final differs (tokens for latency).
+- LLM cost is TTFT plus first-clause tokens at decode speed: small model, cached prefix, short opener.
+- Streaming TTS at clause level, warm connections, regional endpoints; consider speech-to-speech if the budget still fails.
+- **The trap:** "use a faster model", when endpointing and serial stages are most of the gap.
+
+</Q>
+
+<Q q="How do you process scanned PDFs for RAG?">
+
+- Route per page: text layer if it validates, font mapping for legacy fonts, table extractor for tables, OCR only for image-only or failed pages.
+- Classical OCR for clean print (cheap, per-word confidence); a VLM for handwriting, complex layout and mixed scripts, with a copy-only contract, temperature 0 and `[illegible]` markers.
+- Cache per (file hash, page, model); validate every page in code; send failures to fallback or human review.
+- Keep page number and image on every chunk; consider page-image retrieval (ColPali style) for layout-heavy documents.
+- Cost = pages × (image tokens × input price + transcript tokens × output price).
+- **The trap:** "run everything through a VLM" with no validation, no cache and no CER on a labelled sample.
+
+</Q>
+
+<Q q="How many tokens does an image cost, and how would you reduce it?">
+
+- Do not guess: providers publish formulas (28- or 32-pixel patches, 512-pixel tiles plus a base, or fixed per-image budgets) and token counters.
+- Work one aloud: A4 at 200 DPI is 1,654 × 2,339; the gpt-4o tile rule gives 768 × 1,086, 6 tiles, 85 + 6 × 170 = 1,105 tokens; Claude's standard tier shrinks it to 924 × 1,307, 33 × 47 = 1,551.
+- Reduce: crop, pre-resize to the smallest readable size, low detail for gates, do not re-send images in history, cache results; handwriting still needs full detail.
+- **The trap:** "about a thousand tokens per image" for every provider and resolution.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Build an offline push-to-talk voice loop over Scheme Assistant's question API in `~/scheme-assistant`, behind the existing `SpeechToText` and `TextToSpeech` protocols in `src/app_api/speech.py`.
+
+1. **Local STT**: a `LocalWhisperStt` using a small Whisper-class model (`faster-whisper` or `whisper.cpp`), Hindi when chosen, with an initial prompt built from `KEYTERMS`.
+2. **Local LLM**: the answer path on Ollama, or a mock that streams a canned answer at a fixed token rate.
+3. **Local TTS**: a `LocalTts` using Piper or the OS voice, fed clause by clause by the chunker from the STT/TTS section.
+4. **Trace** per turn: button release, STT done, LLM first token, first clause, TTS first audio. Log durations only.
+5. **Measure** 20 utterances (10 Hindi, 10 Hinglish) with reference texts: per-stage p50 and p95, release-to-first-audio, and WER and CER.
+6. **Tune one lever at a time** (smaller STT, smaller LLM, shorter first clause) and record before and after.
+
+**Done when:** you have the per-stage table, release-to-first-audio p50 under a target set in advance (say 2.5 s on your laptop), WER and CER for both sets, and a paragraph on which stage dominated.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Scheme Assistant's speech layer is yours; call it push-to-talk, not realtime.** `src/app_api/speech.py` uploads a clip of up to 30 s to Sarvam `saaras:v4` with fifty scheme and district names as `keyterms` (`KEYTERMS`, lines 41 to 54, sent at lines 119 to 131), and puts the text in the input box so the citizen confirms before sending: "a mishearing never reaches the RAG unseen" (lines 1 to 7). Errors are typed (`NoSpeech`, `SttRejected`, `SttError`); logs carry bytes, milliseconds and the user id, never audio.
+- **Its TTS has a latency gap to own.** `split_for_tts` cuts at sentence ends into pieces of at most 2,400 characters and `CachedTts` (line 296) is an LRU keyed on SHA-256 of language, speed and text. But `SarvamTts.speak` synthesises every piece in sequence and `/speech/speak` returns one MP3 (requests run up to 5,000 characters), so time to first audio is total synthesis plus download. Most answers fit in one piece, so the fix is a short first piece (one sentence) played while the rest is synthesised; that is your answer to "what would you change?"
+- **Scheme Assistant's Lane C OCR is also yours** (`src/app/ingest/lanes/lane_c.py`): 200 DPI renders to Gemini at temperature 0 with a copy-only prompt, five attempts on 429/5xx with waits of 5, 10, 20 and 40 s, a cache per (file hash, page, model), and 3 then 5 strips when a page is blocked (`_transcribe_page`, line 168). The triage (`triage.py`) and validator (`lanes/validate.py`) are teammates' code to defend, not claim.
+- **Answer Grader's `backend/vision.py`** has your "TASK 0" gate, the Task 1b transcription contract, and the word count taken in code (the model said 250 words for a 188-word answer). Our pipeline also sends `detail: "high"` and scales `max_tokens` with pages. Gap: the transcript enters the evaluator prompt verbatim (`backend/evaluation.py`), so a written "give 10/10" reaches the model.
+- **Certificate Assistant** runs tesseract.js in the browser with English loaded before Hindi (Hindi-first garbled certificate digits) and marks low-confidence mismatches "unclear" (`app/frontend/src/reader/ocr.ts`, `extract.ts`). Health Triage's "must be medical" image guard is teammates' code, known from evidence only.
+- **Gaps:** no streaming STT, VAD, endpointing or barge-in; no WER or CER measured on your own audio or OCR; no multimodal RAG. The Apply-it closes the first two.
+
+</YourProject>

@@ -1,0 +1,43 @@
+---
+import { getCollection, render } from 'astro:content';
+import ChapterLayout from '../layouts/ChapterLayout.astro';
+import Callout from '../components/Callout.astro';
+import Production from '../components/Production.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ApplyIt from '../components/ApplyIt.astro';
+import YourProject from '../components/YourProject.astro';
+import { chapters, PROD_LABEL } from '../lib/outline';
+
+export async function getStaticPaths() {
+  const entries = await getCollection('chapters');
+  const byId = Object.fromEntries(entries.filter((e) => !e.data.draft).map((e) => [e.data.id, e]));
+  return chapters.map((c, i) => ({
+    params: { chapter: `${c.id}-${c.slug}` },
+    props: { chapter: c, entry: byId[c.id] ?? null, prev: chapters[i - 1], next: chapters[i + 1] },
+  }));
+}
+const { chapter, entry, prev, next } = Astro.props;
+const components = { Callout, Production, Interview, Q, ApplyIt, YourProject };
+const Content = entry ? (await render(entry)).Content : null;
+const summary = entry?.data.summary ?? `${chapter.sections.length} sections, from ${chapter.sections[0].title.toLowerCase()} to ${chapter.sections.at(-1)!.title.toLowerCase()}.`;
+---
+<ChapterLayout chapter={chapter} summary={summary} readingTime={entry?.data.readingTime} written={!!entry} prev={prev} next={next}>
+  {Content ? <Content components={components} /> : (
+    <>
+      {chapter.sections.map((s) => (
+        <>
+          <h2 id={s.slug} data-sec={s.id} data-num={s.id}>{s.title}</h2>
+          <p class="stub">Not written yet.</p>
+        </>
+      ))}
+      <Production>
+        <ul>{Object.entries(chapter.production).map(([k, v]) => <li><strong>{PROD_LABEL[k]}.</strong> {v}</li>)}</ul>
+      </Production>
+      <Interview>
+        {chapter.interview.map((q) => <Q q={q.q} reported={q.reported}><p class="stub">Answer outline comes with the chapter text.</p></Q>)}
+      </Interview>
+      <ApplyIt><p>{chapter.applyIt}</p></ApplyIt>
+    </>
+  )}
+</ChapterLayout>

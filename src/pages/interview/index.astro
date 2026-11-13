@@ -1,0 +1,121 @@
+---
+import { inlineMd } from '../../lib/inline-md';
+import { getCollection } from 'astro:content';
+import Page from '../../layouts/Page.astro';
+import { chapterById, chapterHref, sectionHref, sectionById, FAST_TRACK, stars, parts } from '../../lib/outline';
+import { allQuestions } from '../../lib/questions';
+import core from '../../../data/core25.json';
+
+const written = new Set((await getCollection('chapters')).filter((e) => !e.data.draft).map((e) => e.data.id));
+const drills = (await getCollection('drills')).sort((a, b) => a.data.id.localeCompare(b.data.id));
+const questions = allQuestions();
+const byChapter = parts.flatMap((p) => p.chapters).map((id) => ({ c: chapterById[id], list: questions.filter((q) => q.chapter === id) }));
+const RUBRIC = [
+  ['a', 'Scope: users, traffic, SLOs (p95 latency, cost per task, quality bar), what is out of scope.'],
+  ['b', 'Baseline first: the simplest architecture that works, drawn end to end, before anything clever.'],
+  ['c', 'Choices with trade-offs: retrieval, model per step, context, tools; say what you rejected and why.'],
+  ['d', 'Evals: offline set, metrics per stage, judge validation, how a change is accepted.'],
+  ['e', 'Guardrails and fallbacks: abstain paths, validation, injection, human escalation, provider failover.'],
+  ['f', 'Observability and cost: traces, per-task cost, dashboards, alerts, budgets.'],
+  ['g', 'Numbers: QPS, tokens per request, cost per 1K requests, latency budget per stage, index size.'],
+  ['h', 'Communication: clarify first, narrate trade-offs, check in, time-box.'],
+];
+---
+<Page title="AI Engineer Interview Prep: Questions, Core Concepts and System-Design Drills" description="Prepare for AI-engineer and LLM-engineer interviews: the fast-track reading order, 25 core concepts to explain in a minute, twelve LLM system-design drills with a rubric, and every chapter's interview questions with a self-check." crumb="Interview" current="interview" wide>
+  <header class="view-head">
+    <p class="home-kicker">Interview prep</p>
+    <h1 class="view-title">Crack the AI-engineer loop</h1>
+    <p class="view-lede">Loops in 2025 and 2026 test five things: LLM system design, RAG debugging, evals, practical trade-offs and a working take-home with evaluation. This page is the revision layer over the book: the fast-track order, the 25 concepts you must explain cold, twelve design drills with a rubric, and every chapter's questions with a self-check.</p>
+    <p class="progress-line" data-iv-progress>Self-check: <b data-iv-known>0</b> of {questions.length} questions marked as answerable without notes.</p>
+  </header>
+
+  <section class="iv-sec" aria-labelledby="ft-h">
+    <h2 class="sec-h" id="ft-h">Fast track</h2>
+    <p class="sec-note">If time is short, read in this order. Chapters 05, 07, 08 and 09 are worth a two-minute explanation each; read them after.</p>
+    <ol class="ft-list">
+      {FAST_TRACK.map((id, i) => {
+        const c = chapterById[id];
+        return <li><a href={chapterHref(c)}><span class="ft-i">{i + 1}</span><span class="iv-id">{c.id}</span><span class="ft-t">{c.title}</span><span class="ft-s">{stars(c.weight)}</span><span class:list={['ft-w', { on: written.has(id) }]}>{written.has(id) ? 'written' : 'outline'}</span></a></li>;
+      })}
+    </ol>
+  </section>
+
+  <section class="iv-sec" aria-labelledby="core-h">
+    <h2 class="sec-h" id="core-h">The core 25</h2>
+    <p class="sec-note">The concepts that come up in almost every loop. Say each answer out loud in under a minute, then open the section to check yourself.</p>
+    <ol class="core-list">
+      {core.map((k: { n: number; term: string; sections: string[]; answer?: string }) => (
+        <li class="core-item">
+          <details>
+            <summary><span class="iv-id">{String(k.n).padStart(2, '0')}</span><span class="core-t">{k.term}</span>
+              <span class="core-secs">{k.sections.map((s) => <span>{s}</span>)}</span></summary>
+            <div class="core-body">
+              {k.answer ? <p>{k.answer}</p> : <p class="stub">The one-minute answer is being written. Read the sections below.</p>}
+              <p class="core-links">{k.sections.map((s) => sectionById[s] && <a href={sectionHref(s)}>{s} {sectionById[s].title}</a>)}</p>
+            </div>
+          </details>
+        </li>
+      ))}
+    </ol>
+  </section>
+
+  <section class="iv-sec" aria-labelledby="drills-h">
+    <h2 class="sec-h" id="drills-h">System-design drills</h2>
+    <p class="sec-note">Set a 45-minute timer, talk through the design out loud or on paper, then open the drill to compare. Every drill is graded on the same rubric.</p>
+    <ol class="rubric">{RUBRIC.map(([k, v]) => <li><b>{k}</b><span>{v}</span></li>)}</ol>
+    <div class="iv-grid">
+      {drills.length ? drills.map((d) => (
+        <a class="iv-card" href={`/interview/${d.data.id.toLowerCase()}/`}>
+          <span class="iv-id">{d.data.id}</span>
+          <h3>{d.data.title}</h3>
+          <p>{d.data.prompt}</p>
+          <p class="iv-meta">Revise {d.data.sections.join(' · ')}</p>
+        </a>
+      )) : <p class="stub">Drills are being written.</p>}
+    </div>
+  </section>
+
+  <section class="iv-sec" aria-labelledby="all-h">
+    <h2 class="sec-h" id="all-h">Every chapter's questions</h2>
+    <p class="sec-note">Tick a question when you can answer it cold. Ticks are kept in this browser and shared with the chapter pages. <span class="iv-filter"><label><input type="checkbox" data-iv-hide-known /> Hide the ones I know</label> <label><input type="checkbox" data-iv-reported /> Only reported in real loops</label></span></p>
+    {byChapter.map(({ c, list }) => (
+      <div class="iv-ch" data-iv-ch>
+        <h3 class="iv-ch-h"><a href={chapterHref(c)}><span class="iv-id">{c.id}</span> {c.title}</a> <span class="ft-s">{stars(c.weight)}</span>{!written.has(c.id) && <span class="iv-k">outline only</span>}</h3>
+        <ul class="iv-list">
+          {list.map((q) => (
+            <li data-iv-key={q.key} data-reported={q.reported ? '1' : undefined}>
+              <input type="checkbox" class="iv-box" aria-label="I can answer this without notes" data-iv-box />
+              <a href={q.href} set:html={inlineMd(q.q)} />
+              <span class="iv-k">{q.reported ? 'reported' : ''}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ))}
+  </section>
+</Page>
+
+<script>
+  import { loadKnown } from '../../lib/progress';
+  const KEY = 'aie-known';
+  const known = loadKnown();
+  const rows = [...document.querySelectorAll<HTMLElement>('[data-iv-key]')];
+  const count = () => { const el = document.querySelector('[data-iv-known]'); if (el) el.textContent = String(rows.filter((r) => known[r.dataset.ivKey!]).length); };
+  const hideKnown = document.querySelector<HTMLInputElement>('[data-iv-hide-known]');
+  const onlyReported = document.querySelector<HTMLInputElement>('[data-iv-reported]');
+  const filter = () => {
+    for (const r of rows) r.hidden = (!!hideKnown?.checked && !!known[r.dataset.ivKey!]) || (!!onlyReported?.checked && !r.dataset.reported);
+    document.querySelectorAll<HTMLElement>('[data-iv-ch]').forEach((ch) => { ch.hidden = ![...ch.querySelectorAll<HTMLElement>('[data-iv-key]')].some((r) => !r.hidden); });
+  };
+  for (const r of rows) {
+    const box = r.querySelector<HTMLInputElement>('[data-iv-box]')!;
+    box.checked = !!known[r.dataset.ivKey!]; r.classList.toggle('is-known', box.checked);
+    box.addEventListener('change', () => {
+      if (box.checked) known[r.dataset.ivKey!] = Date.now(); else delete known[r.dataset.ivKey!];
+      try { localStorage.setItem(KEY, JSON.stringify(known)); } catch { /* private mode */ }
+      r.classList.toggle('is-known', box.checked); count(); filter();
+    });
+  }
+  hideKnown?.addEventListener('change', filter); onlyReported?.addEventListener('change', filter);
+  count();
+</script>

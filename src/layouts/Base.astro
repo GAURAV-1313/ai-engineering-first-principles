@@ -1,0 +1,76 @@
+---
+import '@fontsource-variable/geist';
+import '@fontsource-variable/geist-mono';
+import '@fontsource-variable/source-serif-4';
+import '../styles/tokens.css';
+import '../styles/base.css';
+import '../styles/prose.css';
+import '../styles/annotated.css';
+import '../styles/site.css';
+import '../styles/views.css';
+import { SITE_NAME, SITE_DESCRIPTION, abs } from '../lib/seo';
+
+interface Props {
+  title: string;
+  description?: string;
+  /** Keep a page out of search (e.g. the library's mirrored third-party chapters). */
+  noindex?: boolean;
+  ogType?: 'website' | 'article';
+  /** Schema.org nodes for this page; emitted as one JSON-LD @graph. */
+  jsonLd?: object[];
+}
+const { title, description = SITE_DESCRIPTION, noindex = false, ogType = 'website', jsonLd = [] } = Astro.props;
+const site = Astro.site;
+const canonical = abs(site, Astro.url.pathname);
+const ogImage = abs(site, '/og.png');
+// The dev server and the private build stay out of search; public pages are indexable unless a page opts out.
+const robots = import.meta.env.DEV || process.env.AIE_PRIVATE ? 'noindex, nofollow'
+  : noindex ? 'noindex, follow'
+  : 'index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1';
+const graph = jsonLd.length ? JSON.stringify({ '@context': 'https://schema.org', '@graph': jsonLd }).replace(/</g, '\\u003c') : null;
+---
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <meta name="description" content={description} />
+  <meta name="robots" content={robots} />
+  <link rel="canonical" href={canonical} />
+  <meta name="author" content="Gaurav Singh" />
+  <meta name="theme-color" content="#c1391c" />
+
+  <meta property="og:site_name" content={SITE_NAME} />
+  <meta property="og:type" content={ogType} />
+  <meta property="og:title" content={title} />
+  <meta property="og:description" content={description} />
+  <meta property="og:url" content={canonical} />
+  <meta property="og:image" content={ogImage} />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content={SITE_NAME} />
+  <meta property="og:locale" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content={title} />
+  <meta name="twitter:description" content={description} />
+  <meta name="twitter:image" content={ogImage} />
+
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="sitemap" type="application/xml" href="/sitemap.xml" />
+  <link rel="alternate" type="text/plain" title="llms.txt" href="/llms.txt" />
+  {graph && <script type="application/ld+json" set:html={graph} />}
+  <script is:inline>
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('aie-theme'); } catch (e) {}
+      var theme = saved === 'light' || saved === 'dark' ? saved : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <slot />
+</body>
+</html>

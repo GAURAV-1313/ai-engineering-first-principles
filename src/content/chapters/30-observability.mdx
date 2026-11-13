@@ -1,0 +1,746 @@
+---
+id: "30"
+title: "Observability"
+summary: "Instrument an LLM or agent system so you can reconstruct any request, see what it cost and whether quality is moving, and turn bad production traces into eval cases and fixes."
+readingTime: "35 min"
+---
+
+A user messages you on a Tuesday: "the answers got worse last week." Your dashboard is green. Every request returned HTTP 200, p95 latency is flat, the error rate is 0.1%. You open the logs and find one line per request: method, path, status, milliseconds. You cannot see which prompt version served last week's answers, which model actually responded, what was retrieved or what the model said. You cannot reproduce the bad answer, because the model is not deterministic and you never kept the input.
+
+That is the default state of most LLM features shipped by backend teams. An LLM system can be up, fast and cheap while being wrong, and it can become wrong without a deploy on your side, because the model behind the API, the documents behind your retriever and the questions users ask all move independently of your code.
+
+Observability here means three things you can do on demand: **reconstruct** any request (every model call, tool call and retrieval, with versions, tokens, cost and timings), **aggregate** those records into quality, latency, cost and error metrics that alert before users do, and **feed** bad cases back into your eval set. This chapter builds each piece in plain code, then shows what OpenTelemetry's GenAI conventions and tools like Langfuse, Arize Phoenix and LangSmith do for you. [Trace review](/19-evals-methodology/#trace-review) and [online evals](/20-evals-judges-and-ci/#online-evals-and-production-sampling) live in the eval chapters; this chapter produces the data they consume.
+
+## Why APM isn't enough
+
+**APM** (application performance monitoring: Datadog, New Relic, Grafana with Prometheus and Tempo) grew up around web services. Its core signals are the **RED metrics**, request **R**ate, **E**rror rate and **D**uration, plus traces of HTTP and database calls. The hidden assumption is that correctness shows up in the protocol: a 500 is a failure, a 200 with the right shape is a success.
+
+For an LLM feature that assumption breaks in five ways.
+
+1. **Failure lives in the content.** A confident wrong eligibility rule, an English reply to a Hindi question, a hallucinated citation: all are HTTP 200 with valid JSON.
+2. **Cost varies per request by orders of magnitude.** One request uses 800 tokens, the next 80,000 because a user pasted a document or an agent looped. Cost is a per-request metric, not a monthly invoice.
+3. **You cannot reproduce by re-running.** Hosted models vary even at temperature 0. If you did not record the exact input and output, the bad answer is gone.
+4. **One request is many calls.** Embedding, vector query, rerank, generation, guard; or ten agent steps whose number you did not know in advance. One latency number says nothing about where the time went.
+5. **The dependency changes under you.** A provider moves an alias to a new snapshot, ships an inference bug or changes a filter. Your tests still pass and behaviour moves.
+
+The last point is not hypothetical. In September 2025 Anthropic published a postmortem of three infrastructure bugs that degraded Claude responses for some users over several weeks: a routing error that sent some requests to servers configured for a different context window, a misconfiguration that put stray Thai or Chinese characters into English answers, and a compiler bug in approximate top-k token selection. It says their standard evals did not catch what users reported, privacy controls limited access to conversations, and each bug showed different symptoms at different rates, so reports looked like noise. If the provider had that much trouble seeing it, your app needs its own signals.
+
+So LLM observability is three layers on top of ordinary APM, not a replacement:
+
+| Layer | Answers | Signals |
+|---|---|---|
+| System | Is it up and fast? | RED metrics, infra |
+| Call | Which call was slow or expensive, and what ran? | Per model/tool span: model id, prompt version, tokens, cost, TTFT, finish reason, retries |
+| Quality | Was it right, and is that changing? | Outcome labels, code checks, judge verdicts, user feedback attached to traces |
+
+<Callout type="warn">
+
+"200 OK" is not "success" for an LLM endpoint. Record an outcome per request (answered, abstained, refused, fallback, guard-blocked, error) and count those. A refusal rate that doubles overnight is an incident even though the error rate never moved.
+
+</Callout>
+
+## Traces and spans for LLM calls
+
+### The data model
+
+A **trace** is the record of one logical request, structured as a tree of **spans**. A span is one timed operation with a `trace_id` shared by the whole tree (16 random bytes in OpenTelemetry), its own `span_id` (8 bytes), a `parent_span_id`, a name, start and end times, **attributes** (typed key-value pairs such as `gen_ai.request.model`), a **status** and optional **events** (timestamped points, such as "first token received").
+
+The trace id turns twelve unrelated log lines into one story. Across processes it travels in the W3C `traceparent` header; inside a process it lives in a context variable (`contextvars` in Python, `AsyncLocalStorage` in Node), so nested code finds its parent without passing ids around. Chapter 19's "trace", the thing a reviewer reads, is the same object rendered for humans.
+
+A RAG request as a span tree:
+
+```text
+trace 4bf92f35...  POST /chat                          2,940 ms
+├─ embed  (embeddings text-embedding-3-small)             85 ms
+├─ retrieve  (pgvector hnsw, k=40)                        41 ms   top1=0.71
+├─ rerank  (cross-encoder, 40 -> 8)                      190 ms
+├─ chat claude-haiku-4-5   prompt=answer-v14           2,480 ms   in=6,210 (cache_read=4,096) out=412
+│    event: first_token at 620 ms
+├─ citation_check                                         12 ms   cited=3 verified=3
+└─ write_audit                                            18 ms
+```
+
+One glance shows generation is 84% of the time, TTFT is 620 ms, two thirds of the input came from the prompt cache, and the citation check passed.
+
+### A tracer in 30 lines
+
+No vendor needed to understand the mechanism:
+
+```python
+import contextvars, json, os, time, uuid
+from contextlib import contextmanager
+
+_current = contextvars.ContextVar("span", default=None)
+SINK = open("spans.jsonl", "a")
+
+@contextmanager
+def span(name: str, **attrs):
+    parent = _current.get()
+    s = {"trace_id": parent["trace_id"] if parent else uuid.uuid4().hex,
+         "span_id": os.urandom(8).hex(), "parent_id": parent["span_id"] if parent else None,
+         "name": name, "attrs": dict(attrs), "status": "ok", "start": time.time()}
+    token = _current.set(s)
+    try:
+        yield s
+    except Exception as e:
+        s["status"], s["attrs"]["error.type"] = "error", type(e).__name__
+        raise
+    finally:
+        s["end"] = time.time()
+        _current.reset(token)
+        SINK.write(json.dumps(s) + "\n")
+
+def fake_llm(prompt):                       # stand-in for a provider call
+    time.sleep(0.2)
+    return {"text": "Apply at the gram panchayat.", "usage": {"input_tokens": 950, "output_tokens": 12}}
+
+def answer(question: str) -> str:
+    with span("answer", **{"app.route": "/chat"}):
+        with span("retrieve", k=8) as r:
+            r["attrs"]["top1_score"] = 0.71
+        with span("chat mock-1", **{"gen_ai.operation.name": "chat", "gen_ai.prompt.version": "answer-v14"}) as c:
+            out = fake_llm(question)
+            c["attrs"].update({f"gen_ai.usage.{k}": v for k, v in out["usage"].items()})
+        return out["text"]
+```
+
+Real libraries add batching, export over the network, sampling and cross-process propagation, but the core is this: ids, a parent pointer in context, timing, attributes, error status and a sink.
+
+### Streaming, retries and async work
+
+- **Streaming.** End the span when the stream ends, not at the first byte, or every generation looks fast. Record **TTFT** ([defined here](/10-inference-mechanics/#ttft-tpot-itl-throughput)) as an event or attribute. If the client disconnects, end the span with a `cancelled` outcome.
+- **Retries.** The GenAI conventions say a model span covers the logical operation including automatic retries. Add an `attempts` attribute so a 4-second call that was two attempts and a 429 is visible.
+- **Async boundaries.** Context does not cross a task queue, a hand-made thread or a fire-and-forget promise. Carry the trace context into background jobs explicitly, or use a **span link** (a reference to another span without a parent relationship) when the parent does not wait.
+
+### Sampling
+
+**Head-based sampling** decides at the start (keep 10% by hashing the trace id): simple, but it discards the rare slow or failed request you most need. **Tail-based sampling** buffers a trace in a collector and decides after it ends: keep every error, every trace above p99 latency or a cost threshold, every guard hit, plus a random share.
+
+For LLM systems a third pattern works well: **keep all metadata, expire content.** Span attributes without prompt text are around a kilobyte; keep all of them for exact rates and costs. Full prompts and completions are tens of kilobytes; keep them for a short window (say 7 to 14 days), because feedback and judge scores arrive minutes or days after the trace ended, too late for a tail sampler. Promote flagged traces to longer retention and let the rest expire.
+
+### Overhead
+
+Creating a span and setting a dozen attributes costs microseconds; next to a 2-second model call it is invisible. Real overhead comes from synchronous exporters that block when the collector is down, serialising 30 KB prompts into attributes on the request path, and storage. Use a batching exporter with a bounded queue that drops rather than blocks, and keep large content out of span attributes.
+
+<Callout type="tip">
+
+Return the trace id to the client in every response. It costs nothing and it is the key that later joins user feedback, support tickets and screenshots to the exact request.
+
+</Callout>
+
+## OpenTelemetry GenAI conventions
+
+**OpenTelemetry (OTel)** is a vendor-neutral telemetry standard: an API and SDKs per language, a wire protocol (**OTLP**, gRPC on port 4317 or HTTP on 4318), and a **collector** that receives, processes (sampling, redaction) and forwards data to any backend. **Semantic conventions** are agreed attribute names so a backend can show "model" and "input tokens" without knowing which library produced the span. Without them one team logs `model`, another `llm.model_name`, and no dashboard works across both.
+
+### Status, as of November 2026
+
+The GenAI conventions are young and still moving:
+
+- Every GenAI document (inference, embeddings, tool execution, agent spans, events, metrics, and the provider pages for OpenAI, Anthropic, AWS Bedrock and Azure AI Inference) is marked **Development**, the status before stable.
+- In 2026 they moved out of the main `semantic-conventions` repository into a dedicated one, `open-telemetry/semantic-conventions-genai`; the old opentelemetry.io pages now say "moved".
+- Names have already changed. Older instrumentations emit `gen_ai.system` (deprecated, replaced by `gen_ai.provider.name`) and a single `gen_ai.client.token.usage` histogram; current drafts use separate counters such as `gen_ai.client.inference.usage.input_tokens`. OpenTelemetry's Python GenAI instrumentations emit the newest names only with `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`.
+
+Practical rule: pin instrumentation versions, map provider responses to attributes in **one** function you own, and treat a convention upgrade as a migration with a dashboard check.
+
+### The attributes that matter
+
+| Attribute | Meaning |
+|---|---|
+| `gen_ai.operation.name` | `chat`, `embeddings`, `execute_tool`, `invoke_agent`... (required) |
+| `gen_ai.provider.name` | `openai`, `anthropic`, `aws.bedrock`... (required) |
+| `gen_ai.request.model` / `gen_ai.response.model` | Model asked for vs model that answered (aliases resolve to snapshots) |
+| `gen_ai.request.temperature`, `max_tokens`, `seed`, `reasoning.level` | Sampling and effort parameters |
+| `gen_ai.response.finish_reasons` | Why generation stopped: `stop`, `length`, `content_filter`, `tool_calls` |
+| `gen_ai.usage.input_tokens` / `output_tokens` | Input includes cached tokens; output includes reasoning tokens |
+| `gen_ai.usage.cache_read.input_tokens`, `cache_write.input_tokens`, `reasoning.output_tokens` | The breakdown cost needs |
+| `gen_ai.conversation.id` | Session or thread, to group turns |
+| `gen_ai.prompt.name`, `gen_ai.prompt.version` | Which template version produced the input |
+| `gen_ai.tool.name`, `gen_ai.agent.name` | On tool and agent spans |
+| `error.type` | Low-cardinality error class: `timeout`, `429`, `500` |
+
+The span name is `{operation} {model}`, for example `chat claude-haiku-4-5`. Metrics have their own names (`gen_ai.client.inference.duration`, `gen_ai.client.inference.time_to_first_chunk`, token counters by type). An event, `gen_ai.evaluation.result`, carries `gen_ai.evaluation.name`, `score.value`, `score.label` and `explanation`, parented to the span it evaluates: the standard home for a judge verdict or feedback score.
+
+### Token accounting: normalise once
+
+OpenAI-style `prompt_tokens` **includes** cached tokens (repeated under `prompt_tokens_details.cached_tokens`). Anthropic's `input_tokens` **excludes** them: cache reads and writes come back as `cache_read_input_tokens` and `cache_creation_input_tokens`. The conventions define `gen_ai.usage.input_tokens` as the total including cached tokens, and the Anthropic page says to compute it as `input_tokens + cache_read + cache_write`. This matches [the pricing chapter](/11-serving-and-model-economics/#pricing-input-output-cached-thinking); Gemini, whose prompt count includes cached tokens but reports thinking apart from output, is in [chapter 31's normaliser](/31-cost-and-latency-engineering/#token-budget-accounting).
+
+```python
+def usage_attrs(provider: str, u: dict) -> dict:
+    """Provider usage -> GenAI attributes. Input always INCLUDES cached tokens."""
+    if provider == "anthropic":
+        read = u.get("cache_read_input_tokens") or 0
+        write = u.get("cache_creation_input_tokens") or 0
+        total_in = u["input_tokens"] + read + write           # input_tokens excludes both
+    else:                                                      # OpenAI: Chat Completions or Responses
+        d = u.get("prompt_tokens_details") or u.get("input_tokens_details") or {}
+        read, write = d.get("cached_tokens") or 0, d.get("cache_write_tokens") or 0
+        total_in = u.get("prompt_tokens", u.get("input_tokens", 0))   # already includes cached
+    return {"gen_ai.usage.input_tokens": total_in,
+            "gen_ai.usage.output_tokens": u.get("output_tokens", u.get("completion_tokens", 0)),
+            "gen_ai.usage.cache_read.input_tokens": read,
+            "gen_ai.usage.cache_write.input_tokens": write}
+
+def cost_usd(a: dict, p: dict) -> float:
+    """p: USD per million tokens. Check the current price page."""
+    read, write = a["gen_ai.usage.cache_read.input_tokens"], a["gen_ai.usage.cache_write.input_tokens"]
+    uncached = a["gen_ai.usage.input_tokens"] - read - write
+    return (uncached * p["in"] + read * p["cache_read"] + write * p["cache_write"]
+            + a["gen_ai.usage.output_tokens"] * p["out"]) / 1e6
+```
+
+Worked example: an Anthropic response with `input_tokens = 2,114`, `cache_read_input_tokens = 4,096`, no cache write, `output_tokens = 412`. Total input is 6,210, so the cache hit rate is 4,096 / 6,210 = 66%. At assumed prices of $1 per million input, $0.10 cache read and $5 output (check the price page), cost = (2,114 × 1 + 4,096 × 0.1 + 412 × 5) / 10⁶ = (2,114 + 410 + 2,060) / 10⁶ ≈ $0.0046. Treat 2,114 as the total and you under-report input by two thirds; subtract cache reads from it again and you go negative.
+
+### What the conventions leave to you, and what tools add
+
+There is no standard cost attribute: cost depends on your price table and contract, so use your own namespace (`app.cost_usd`, `app.cost_source = provider | price_table`). Outcome labels, feature and tenant ids, guard verdicts and retrieval scores are yours too; document them next to the mapping function.
+
+Instrumentation libraries (OpenTelemetry's GenAI instrumentations, OpenLLMetry, OpenInference) patch the OpenAI, Anthropic or LangChain clients so spans appear without wrappers. **Jaeger** or **Grafana Tempo** store plain traces. **Langfuse** and **Arize Phoenix** (open source, self-hostable, both accept OTLP) and **LangSmith** (LangChain's platform) add LLM views: prompt and completion viewers, token and cost roll-ups, sessions, scores attached to traces, datasets built from traces. Each is the 30-line tracer plus storage and a UI. Choose on hosting and data residency first, features second.
+
+## Logging prompts, completions, tool calls
+
+### The per-call record
+
+| Group | Fields |
+|---|---|
+| Identity | trace id, span id, parent, timestamp, service version (git SHA) |
+| Context | feature, tenant, pseudonymous user id, conversation id, language |
+| What ran | provider, requested and response model, prompt name and version, parameters, tool definitions version |
+| Usage and cost | input (incl. cached), cache read, cache write, output, reasoning tokens; cost and cost source |
+| Timing | TTFT, total duration, attempts |
+| Outcome | finish reason, error class, outcome label, guard verdict, schema validity |
+| Tool calls | name, call id, redacted or hashed args, result size, `is_error`, latency |
+| Content | a reference to the stored input and output, not the text |
+
+**Prompt version** is what lets you say "answers got worse when `answer-v15` shipped". The robust version is a content hash of the template computed at load time, plus a human name: it changes exactly when the text changes, even if someone forgets to bump a number. **Response model** lets you notice an alias moving to a new snapshot.
+
+```python
+import hashlib, time
+
+TEMPLATE = open("prompts/answer.txt").read()
+PROMPT_VERSION = "v14+" + hashlib.sha256(TEMPLATE.encode()).hexdigest()[:12]
+
+def call_llm(client, messages, *, model, feature, user_hash, content_store, **params):
+    with span(f"chat {model}", **{"gen_ai.operation.name": "chat", "gen_ai.request.model": model,
+              "gen_ai.prompt.name": "answer", "gen_ai.prompt.version": PROMPT_VERSION,
+              "app.feature": feature, "app.user": user_hash}) as s:
+        t0 = time.perf_counter()
+        resp = client.create(model=model, messages=messages, **params)    # mocked in tests
+        a = usage_attrs(resp["provider"], resp["usage"])
+        s["attrs"].update(a | {
+            "gen_ai.response.model": resp["model"],
+            "gen_ai.response.finish_reasons": [resp["stop_reason"]],
+            "app.cost_usd": round(cost_usd(a, PRICES[resp["model"]]), 6),
+            "app.latency_ms": int((time.perf_counter() - t0) * 1000),
+            "app.content_ref": content_store.put(s["trace_id"], s["span_id"], messages, resp["text"]),
+        })
+        return resp
+```
+
+`content_store.put` writes the full input and output to a separate, access-controlled table keyed by trace and span id, with its own retention; the span carries only the reference. The GenAI conventions describe the same pattern (content capture is opt-in and off by default, with a hook for uploading content to external storage). It keeps your general log pipeline, which many people and tools can read, free of user text.
+
+### Store enough to replay
+
+The test of your log design is whether you can **replay** a bad request. That needs the exact model snapshot, parameters, the rendered input (or template version plus every variable, including retrieved chunk ids and the index version) and the tool results the model saw. Record tool outputs and replay against the recording; re-running live tools means debugging a different request. Do not expect bit-exact replay: batching and floating-point order make hosted outputs vary, so replay several times and compare the distribution.
+
+### Storage arithmetic
+
+Take 1 million model calls a day, averaging 6,000 input and 500 output tokens, at roughly 4 characters per English token:
+
+- content ≈ 6,500 × 4 = 26 KB per call, 26 GB a day, about 780 GB a month before compression;
+- metadata ≈ 1 KB per call, 1 GB a day.
+
+Text compresses several-fold, and RAG prompts repeat: store the template version once and the variables per call, and 6,000 tokens might shrink to the 2,000 that vary. Devanagari takes 3 bytes per character in UTF-8, so a Hindi workload stores more per token than the English estimate. The shape holds: metadata is cheap enough to keep for a year; content is the line item you size and expire deliberately.
+
+### What not to log
+
+- **Secrets:** API keys in headers, OAuth tokens, database URLs. Never log raw request headers or client config. Provider error bodies can echo your request; log the class and status, not the body.
+- **Raw PII in the general stream:** names, phone, Aadhaar, addresses, health details. If kept at all, they go in the restricted content store ([log privacy](#log-privacy-and-retention)).
+- **Content you promised not to keep.** If the product says code is not stored, traces must honour it. Metadata-only logging is a legitimate design that costs debuggability; choose it consciously.
+
+<Callout type="warn">
+
+Exception trackers capture local variables and request bodies by default. One uncaught exception inside `call_llm` can ship the full prompt, with whatever the user pasted, to a third-party error service. Configure scrubbing in the SDK before you need it.
+
+</Callout>
+
+## Agent trajectory tracing
+
+### The run is the trace
+
+An agent run maps onto a span tree: the root is the run (`invoke_agent` in the GenAI conventions), each loop iteration adds a `chat` span and zero or more `execute_tool` spans, and a sub-agent is a nested `invoke_agent` span. The [agent loop chapter](/22-agent-loop/#harness-design) puts the tracer in the harness because that one place sees every step.
+
+```text
+invoke_agent refund-agent                     run_id=r-81f2  steps=5  stop=final_answer   $0.031
+├─ chat model-m   step=1   in=3,050  out=96   finish=tool_calls
+├─ execute_tool get_order        48 ms   ok   result=1.1 KB
+├─ chat model-m   step=2   in=4,190  out=88   finish=tool_calls
+├─ execute_tool get_policy       35 ms   ok   result=3.9 KB
+├─ chat model-m   step=3   in=8,140  out=120  finish=tool_calls
+├─ execute_tool issue_refund    410 ms   ERROR is_error=true  "amount exceeds order total"
+├─ chat model-m   step=4   in=8,420  out=110  finish=tool_calls
+├─ execute_tool issue_refund    380 ms   ok   approved_by=human:ops-12
+└─ chat model-m   step=5   in=8,700  out=180  finish=stop
+```
+
+### What only shows up at the trajectory level
+
+- **Loops:** the same tool with the same arguments repeatedly. Hash `(tool name, normalised args)` per run.
+- **Context growth.** Each step's input carries all earlier steps. With a 3,000-token base and about 1,500 tokens added per step, 10 steps total 10 × 3,000 + 1,500 × (0 + 1 + ... + 9) = 30,000 + 67,500 = 97,500 input tokens, versus 30,000 without growth. A per-call panel shows ten "normal" calls; only a run-level sum shows the bill.
+- **Where the error entered.** Above, step 3 proposed a refund larger than the order; the policy retrieved in step 2 is the first place to look. The final answer can look fine while the trajectory broke a rule. [Trajectory evals](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory) need exactly this data.
+- **Stop reason:** final answer, step budget, cost budget, deadline, error, handoff. A rising share of runs ending on budget is an early quality signal.
+
+```python
+import hashlib, json
+from collections import Counter
+
+def run_summary(spans: list[dict]) -> dict:
+    root = next(s for s in spans if s["parent_id"] is None)
+    op = lambda s: s["attrs"].get("gen_ai.operation.name")
+    llm = [s for s in spans if op(s) == "chat"]
+    tools = [s for s in spans if op(s) == "execute_tool"]
+    sig = Counter(hashlib.sha1(json.dumps([t["attrs"].get("gen_ai.tool.name"),
+                  t["attrs"].get("app.args_hash")]).encode()).hexdigest() for t in tools)
+    return {"steps": len(llm), "tool_calls": len(tools),
+            "tool_errors": sum(t["status"] == "error" for t in tools),
+            "repeated_calls": sum(n - 1 for n in sig.values() if n > 1),
+            "input_tokens": sum(s["attrs"].get("gen_ai.usage.input_tokens", 0) for s in llm),
+            "cost_usd": round(sum(s["attrs"].get("app.cost_usd", 0) for s in llm), 4),
+            "stop_reason": root["attrs"].get("app.stop_reason")}
+```
+
+Write the summary onto the root span when the run ends, so dashboards can filter runs by cost, steps and stop reason without walking every tree.
+
+### Multi-agent and long-running runs
+
+- **Across processes**, a sub-agent receives `traceparent` and continues the same trace; otherwise its cost cannot be attributed to the parent run. For queue-based fan-out, put trace context in message headers.
+- **Fire-and-forget workers** get span links to the orchestrator, not fake parent relationships.
+- **Long sessions** can produce thousands of spans, past what most trace UIs handle well. Use a trace per run or user turn, tie them with `gen_ai.conversation.id`, and keep large tool outputs in the content store by reference.
+- **Resumed runs** ([checkpointing](/22-agent-loop/#long-running-agents-checkpointing-resumability)) start a new trace linked to the old one, with the checkpoint id on both.
+
+## Quality/latency/cost/error metrics
+
+Traces answer "what happened on this request"; **metrics** answer "how is the system doing", as pre-aggregated counters and histograms you can graph for months and alert on in seconds. Derive both from the same instrumentation so they never disagree. Keep metric labels low-cardinality (model, feature, provider, outcome, prompt version); a user-id label with a million values creates a million time series.
+
+### The four families
+
+**Latency.** p50, p95 and p99 of TTFT and total duration per feature and model; time per output token; per-stage duration. Percentiles, not means: output length varies, so the mean hides the tail. For agents, run duration and steps per run.
+
+**Cost.** Tokens by type and cost per request, feature, tenant and model. **Prompt cache hit rate** = cache-read tokens / total input tokens. **Cost per successful task** = spend / tasks that met their success criterion ([unit economics](/31-cost-and-latency-engineering/#unit-economics-per-task-user)).
+
+**Errors.** Provider errors by class (429, 5xx, timeout, context-too-long), retry rate, fallback rate, schema or parse failure rate, tool error rate, and `finish_reason = length` rate, because truncated answers are silent errors.
+
+**Quality.** Outcome mix (answered, abstained, refused, blocked, fallback); code-check pass rates on all traffic (citations valid, numbers match sources, reply language matches); sampled judge pass rates per failure mode, [corrected for TPR and TNR](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans); thumbs-down, regeneration and escalation rates.
+
+```text
+┌ Traffic & errors ──────────────┬ Latency ────────────────────────┐
+│ req/min by feature             │ TTFT p50/p95 by model           │
+│ error rate by class (429,5xx)  │ total p95 by feature            │
+│ fallback rate, retry rate      │ stage breakdown (stacked)       │
+├ Cost ──────────────────────────┼ Quality ────────────────────────┤
+│ $/hour vs same hour last week  │ outcome mix by prompt version   │
+│ $/request p95 by feature       │ code-check pass rate            │
+│ cache hit rate, top tenants    │ judge pass rate (sampled) + CI  │
+│ agent runs ending on budget    │ thumbs-down rate, length-stops  │
+└────────────────────────────────┴─────────────────────────────────┘
+annotations: deploys, prompt version changes, model changes
+```
+
+The annotations matter as much as the panels: a quality line that drops exactly where `answer-v15` shipped is half a diagnosis.
+
+### Alerts worth waking up for
+
+An alert needs a baseline, a minimum volume and a threshold that respects noise. For a rate p on n requests, the standard error is √(p(1 − p) / n). If the abstain rate is normally 8% at 500 requests an hour, SE = √(0.08 × 0.92 / 500) ≈ 0.0121, so a 3-SE band is about ±3.6 points: alert above 11.6%. A slice with 50 requests an hour has a ±11.5-point band, so aggregate it daily.
+
+```python
+import math
+
+def rate_alert(name, bad, n, baseline, min_n=200, z=3.0):
+    if n < min_n:
+        return None                                  # too little data to judge
+    p, se = bad / n, math.sqrt(baseline * (1 - baseline) / n)
+    return {"alert": name, "rate": round(p, 4)} if p > baseline + z * se else None
+
+print(rate_alert("abstain_rate", bad=63, n=500, baseline=0.08))   # 12.6% > 11.6%: fires
+```
+
+A starting set: spend per hour above twice the same-hour median of the past week (runaway agents, abuse); refusal or abstain rate out of band; 429 and 5xx above a few percent; fallback-rate jump; length-stop jump; daily judge pass rate outside its interval. Cost-specific alerts and tenant budgets are in [chapter 31](/31-cost-and-latency-engineering/#dashboards-and-alerts).
+
+## Drift detection
+
+**Drift** is a change in the distribution of something your system depends on. Five things move: **inputs** (new question types, a new language mix, exam season for Answer Grader), **the model** (alias moves, provider bugs), **your data** (re-ingested corpus, a new embedding model mixed with old vectors), **your prompts and code**, and, as a consequence, **outputs and quality**. Drift is not automatically bad; new users asking new questions is growth. It means your eval set may no longer match traffic.
+
+### Detecting it without labels
+
+You rarely have ground truth in production. You do have **proxies** that move with quality, computed from traces: output length; refusal, abstain and fallback rates; finish-reason mix; retrieval score distribution (top-1 similarity dropping means queries drift away from your corpus, or the index broke); input language and topic mix; code-check pass rates; implicit feedback; and a validated judge on a small daily sample, the closest thing to a label you can afford.
+
+### Measuring a shift
+
+The **population stability index (PSI)** compares binned shares in a recent window (aᵢ) with a reference window (eᵢ): PSI = Σ (aᵢ − eᵢ) × ln(aᵢ / eᵢ). A common rule of thumb from credit-risk modelling reads below 0.1 as stable, 0.1 to 0.25 as moderate and above 0.25 as large; calibrate on your own history.
+
+Output length in three bins (short, medium, long): reference 0.30, 0.50, 0.20; this week 0.15, 0.50, 0.35.
+
+- short: (0.15 − 0.30) × ln(0.5) = (−0.15) × (−0.693) = 0.104
+- medium: 0
+- long: (0.35 − 0.20) × ln(1.75) = 0.15 × 0.560 = 0.084
+- PSI ≈ 0.19, a moderate shift: answers got longer. Look for a coinciding prompt or model change.
+
+```python
+import math
+
+def psi(ref, cur, edges, eps=1e-4):
+    def shares(xs):
+        counts = [0] * (len(edges) + 1)
+        for x in xs:
+            counts[sum(x > e for e in edges)] += 1
+        return [max(c / len(xs), eps) for c in counts]
+    e, a = shares(ref), shares(cur)
+    return sum((ai - ei) * math.log(ai / ei) for ai, ei in zip(a, e))
+
+# output tokens, bins: <=150, 151-400, >400
+print(round(psi(last_month_lengths, this_week_lengths, edges=[150, 400]), 3))
+```
+
+For inputs, cluster a reference month of input embeddings and track the share of new inputs per cluster, plus the share far from every centroid (new topics).
+
+### Sentinels isolate provider drift
+
+Live-traffic proxies mix user drift with model drift. **Sentinel prompts** separate them: 20 to 50 fixed inputs with code-checkable expected answers, run through the production configuration on a schedule and logged as their own traces. Their inputs never change, so if their pass rate or length moves, something below your code changed. Pin model snapshots where you can and log `gen_ai.response.model` to see aliases move. The cost is small: 50 prompts × 24 runs × 3,000 tokens = 3.6 million tokens a day, a few dollars at small-model prices (check the price page).
+
+Drift detection fails when seasonal shifts fire every year (compare with the same period last year), when the reference window contains an incident, and when you trust a stable distribution: an answer can keep its length and become subtly wrong, which is why the sampled judge stays.
+
+## Feedback into traces
+
+### Make feedback addressable
+
+Feedback is only useful if it attaches to the request it is about:
+
+1. Every response carries its trace id, or a message id that maps to one.
+2. The feedback endpoint accepts that id plus a thumb, a reason from a small enum ("wrong", "outdated", "didn't answer", "wrong language") and an optional short note.
+3. It is stored as a **score on the trace**: name, value, source (`user`, `judge`, `human_review`, `code_check`), comment, time.
+
+Judge verdicts and code checks go in the same table, so a trace's quality evidence accumulates in one place. In OTel terms it is the `gen_ai.evaluation.result` event; in Langfuse, Phoenix or LangSmith it is a score or feedback object.
+
+```sql
+CREATE TABLE trace_scores (
+  trace_id   text NOT NULL,
+  span_id    text,                          -- null = whole trace
+  name       text NOT NULL,                 -- 'user_thumb', 'faithfulness', 'citations_valid'
+  value      double precision,
+  label      text,                          -- 'down', 'pass', 'fail'
+  source     text NOT NULL CHECK (source IN ('user','judge','human_review','code_check')),
+  comment    text,                          -- redact before storing
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- thumbs-down rate by prompt version, last 7 days
+SELECT t.prompt_version, avg((s.label = 'down')::int) AS down_rate, count(*) AS n
+FROM trace_scores s JOIN traces t USING (trace_id)
+WHERE s.name = 'user_thumb' AND s.created_at > now() - interval '7 days'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+**Implicit signals** are more plentiful: regenerate, copy, rephrase within a minute, abandon, escalate, heavy edits before sending. Each needs an event with the trace id of the answer it reacts to ([implicit feedback](/34-product-ux-and-feedback/#implicit-and-conversational-feedback)).
+
+### What feedback is good for
+
+Explicit feedback is sparse and skewed: few users rate, unhappy ones rate more, and some thumbs-down mean "I dislike the policy", not "the answer was wrong". So do not report thumbs-down rate as your quality metric. Use feedback to **find** traces to review (targeted sampling), to compare prompt versions with enough volume, and as one drift input. The reason enum is often worth more than the thumb: "wrong language" points straight at a fix.
+
+It fails when feedback attaches to a message id with no link to the model-call logs, when a trace id goes to the client but no endpoint accepts feedback, when notes containing PII sit next to traces with broad access, and when buttons appear only on successful answers, so timeouts and fallbacks are never rated.
+
+## Debugging from traces
+
+### Five steps
+
+1. **Find.** Start from the trace id the user gave, or a filter: thumbs-down on feature X since Monday, abstains on prompt `v15`, p99 outliers, cost above $0.50.
+2. **Read top-down:** what was asked, retrieved, sent, said, and what the guard decided.
+3. **Localise** the first span where things went wrong. Later spans inherit the error.
+4. **Classify:** data (the document is not in the corpus), retrieval (exists but not retrieved or reranked out), prompt (in context, instructions misled), model (in context, clear instructions, still wrong), tool (bad args, error, stale result), guard (false block or pass), infra (timeout, truncation, fallback model).
+5. **Reproduce and pin.** Replay, confirm the failure rate, fix, add the eval case before closing.
+
+| Symptom | Look first at |
+|---|---|
+| Confident wrong fact | Retrieved chunks and scores, then the prompt the model actually saw |
+| "I don't know" when the answer exists | Retrieval and rerank spans, the abstain reason, prompt-budget truncation |
+| Answer cut off | `finish_reason = length`, `max_tokens` |
+| Wrong language or format | Prompt version, response model (did a fallback answer?), parse and repair spans |
+| Slow | Critical path through the tree, TTFT vs generation, tool latency, retries |
+| Expensive | Input tokens per step, cache hit rate, step count, repeated tool calls |
+
+### Worked example: a latency regression
+
+Alert: p95 latency on the search feature went from 6 s to 11 s on Wednesday. Compare a slow Wednesday trace with a Tuesday trace of the same intent:
+
+```text
+Tuesday                                   Wednesday
+answer                       5.8 s        answer                       10.9 s
+├─ plan (small model)        0.9 s        ├─ plan (small model)         0.9 s
+├─ chat writer               4.6 s        ├─ chat writer                9.7 s
+│   └─ web_search            1.2 s        │   ├─ web_search  x4         5.0 s
+└─ guard                     0.2 s        └─ guard                      0.2 s
+```
+
+The plan step is unchanged; the writer runs four searches instead of one. The **critical path**, the chain of sequential spans that sets total duration, grew by the extra searches and the extra generation reading their results. Deploy annotations show a planner prompt edit on Wednesday that lists more entities, and the search budget scales with entity count. The fix is in the planner prompt or the budget formula; the eval to add is "a single-entity question uses at most one search".
+
+### Replay
+
+```python
+def replay(trace: dict, call_model, n: int = 5) -> list[str]:
+    """Re-run the recorded model call with recorded inputs. Never re-run live tools."""
+    call = next(s for s in trace["spans"] if s["name"].startswith("chat"))
+    messages = trace["content"][call["span_id"]]["input"]            # from the content store
+    params = {k.removeprefix("gen_ai.request."): v for k, v in call["attrs"].items()
+              if k.startswith("gen_ai.request.") and k != "gen_ai.request.model"}
+    return [call_model(model=call["attrs"]["gen_ai.response.model"], messages=messages, **params)
+            for _ in range(n)]
+```
+
+If the failure appears in 4 of 5 replays, you have a bug and a test. If 1 of 5, it is a reliability problem: the fix is more likely a verification step or better context than a prompt tweak, and the eval needs repeats. Debugging fails when the bad trace was sampled away, when content was never stored by design, when prompt version was not recorded, and when the trace stops at a queue boundary.
+
+## Incident response and postmortems
+
+### LLM incidents have their own shapes
+
+- **Provider outage or rate-limit storm:** 429s and 5xx climb, fallbacks fire.
+- **Cost runaway:** an agent loop, a prompt that stopped hitting the cache, an abusive tenant ("denial of wallet").
+- **Quality regression:** prompt deploy, snapshot change, corpus re-ingest or provider bug, with a flat error rate and rising complaints.
+- **Safety or privacy incident:** harmful output, an injection-driven action, PII in an answer or a log.
+- **Data incident:** wrong documents ingested, so answers are confidently wrong with valid citations.
+
+### Build the levers before you need them
+
+Mitigation is fast only if the switches exist: prompt versions as config so rollback is not a deploy ([prompts as code](/32-deployment-and-llmops/#prompts-and-config-as-code)), model routing as config with a tested fallback, a per-feature kill switch that serves a safe templated reply, hard spend caps and per-tenant budgets, and a way to disable one tool without disabling the agent.
+
+### Runbook
+
+Detect and declare an owner; **assess impact from traces** (how many requests, which features, tenants and languages, since when); **mitigate first** (roll back, fall back, kill, cap); communicate; fix the cause and verify on the traces that showed it; write the postmortem within days. With outcome labels and versions on every trace, impact is a query:
+
+```sql
+SELECT outcome, count(*) AS requests, count(DISTINCT user_hash) AS users, sum(cost_usd) AS spend
+FROM traces
+WHERE feature = 'scheme_answer' AND prompt_version = 'answer-v15'
+  AND started_at BETWEEN '2026-11-04 10:00' AND '2026-11-05 16:30'
+GROUP BY outcome;
+```
+
+### The postmortem
+
+Blameless: what about the system let this happen, not who typed the prompt. Sections: summary and impact (requests, users, bad answers served, extra spend); timeline (change, first bad trace, detection, mitigation, resolution; the gap from first bad trace to detection is the number to shrink); root cause and trigger; detection (which signal fired, or why none did); what went well and badly in mitigation; owned action items.
+
+The Anthropic postmortem is a good model: it separates the three bugs, gives a timeline for each, says plainly why detection was slow, and commits to more sensitive evals, continuous quality evals on production and better privacy-preserving debugging tools.
+
+<Callout type="tip">
+
+Every postmortem should leave behind at least one eval case built from the incident's traces and one new or tuned alert. A postmortem that leaves only a prompt edit lets the same class of failure come back unnoticed.
+
+</Callout>
+
+## Log privacy and retention
+
+### Your traces are a sensitive dataset
+
+Prompts contain whatever users type: names, phone numbers, Aadhaar and PAN numbers, addresses, symptoms, code, and occasionally pasted passwords and keys. Retrieved context may include documents only some users may see. A trace store with content is one of your most sensitive databases and often the one with the widest access. India's Digital Personal Data Protection Act, 2023 gives people rights to correction and erasure, as GDPR does in Europe; deletion must reach traces, content stores, eval sets and backups, not just the users table.
+
+### Controls, in order of value
+
+1. **Minimise:** do not collect what you will not use.
+2. **Separate:** metadata in the general pipeline, content in a restricted store keyed by trace id.
+3. **Redact at the source**, before data leaves the process; the OTel collector can redact again as a second layer.
+4. **Pseudonymise:** log `HMAC(secret, user_id)`, not the id or email. You can still group by user; a leaked log names no one.
+5. **Control and audit access:** reading a trace's content is itself an event to log.
+6. **Retain by tier** and delete on schedule.
+
+```python
+import hashlib, hmac, re
+
+PATTERNS = [
+    (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "[EMAIL]"),
+    (re.compile(r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)"), "[PHONE_IN]"),
+    (re.compile(r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)"), "[AADHAAR?]"),
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b"), "[API_KEY]"),
+]
+SENSITIVE_KEYS = {"authorization", "apikey", "token", "password", "otp", "phone", "email", "cookie"}
+
+def scrub(v):
+    if isinstance(v, dict):
+        return {k: "[REDACTED]" if k.lower().replace("_", "").replace("-", "") in SENSITIVE_KEYS
+                else scrub(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [scrub(x) for x in v]
+    if isinstance(v, str):
+        for rx, repl in PATTERNS:
+            v = rx.sub(repl, v)
+    return v
+
+def pseudonym(user_id: str, key: bytes) -> str:
+    return hmac.new(key, user_id.encode(), hashlib.sha256).hexdigest()[:16]
+```
+
+Regexes catch structured identifiers and miss names, addresses and free-text health details. A named-entity model (Microsoft Presidio is a common open-source choice) catches more at a cost in latency and false positives; see [PII detection](/29-guardrails-and-safety/#pii-detection-and-redaction). Redaction also limits debugging: if the bug is "the model misread the phone number", a redacted trace cannot show it. That is the case for a short-lived restricted content store rather than redacting everything everywhere.
+
+| Data | Example retention | Access |
+|---|---|---|
+| Metrics and span metadata | 13 months (year-on-year comparison) | All engineers |
+| Full prompts and completions | 7 to 30 days | On-call and named reviewers, logged |
+| Flagged traces | Until reviewed, then into the eval set or deleted | Reviewers |
+| Eval cases from traces | Life of the eval set, redacted, with provenance | Team |
+| Secrets | Never stored | Nobody |
+
+These are examples to adapt to your legal and product commitments. A hosted observability vendor, or an LLM judge reading production traces, is a data processor for everything you send it: check where it stores data ([data residency](/11-serving-and-model-economics/#data-residency-confidential-inference)), whether it can be self-hosted (Langfuse and Phoenix can), and redact before sending.
+
+Privacy fails through debug logging left on, error bodies echoing input, exception trackers capturing request bodies, a scrubber in one code path while another sets the user's email on the error report, and eval sets built from production that become the least-protected copy of user data.
+
+## The trace → eval → fix loop
+
+Everything in this chapter feeds one cycle, and it is the cycle interviewers want to hear:
+
+```text
+  production traffic ── traces: spans + content + versions
+        │
+        ▼
+  sample & flag ── random (for rates) + targeted (thumbs-down, abstain, guard, cost, slow)
+        │
+        ▼
+  review & code failures (ch 19) ──► failure taxonomy
+        │
+        ▼
+  eval cases (redacted, with provenance: trace id, date, failure mode)
+        │
+        ▼
+  fix (data / retrieval / prompt / tool / guard / code) ── new version
+        │
+        ▼
+  CI eval gate (ch 20) ──► deploy with annotations ──► watch that failure mode's metric
+        │
+        └──────────────► back to production traffic
+```
+
+The method of review is in [trace review](/19-evals-methodology/#trace-review) and [failure taxonomies](/19-evals-methodology/#failure-taxonomies); the gate is [evals in CI](/20-evals-judges-and-ci/#evals-in-ci). This chapter supplies the plumbing that makes the loop cheap: versioned traces, readable content, scores on traces, and a one-command path from a trace to a case.
+
+```python
+import json
+
+def trace_to_case(trace: dict, annotation: dict, redact) -> dict:
+    """annotation comes from the reviewer: failure mode and the checks a good answer must pass."""
+    final = trace["content"][trace["final_span_id"]]
+    return {"id": f"prod-{trace['trace_id'][:12]}",
+            "source": {"trace_id": trace["trace_id"], "date": trace["date"],
+                       "prompt_version": trace["prompt_version"], "model": trace["response_model"]},
+            "input": redact(final["user_message"]),
+            "context_ids": trace.get("retrieved_ids", []),      # replay with the same chunks
+            "failure_mode": annotation["failure_mode"],           # e.g. 'english_reply'
+            "checks": annotation["checks"],                       # code checks first, judge if needed
+            "bad_output": redact(final["output"])}                # useful for judge validation
+
+with open("eval/cases_prod.jsonl", "a") as f:
+    f.write(json.dumps(trace_to_case(t, ann, scrub), ensure_ascii=False) + "\n")
+```
+
+Keep the provenance: when a case starts failing months later, the trace id shows what the original incident looked like.
+
+Three numbers tell you whether the loop works: **time from a flagged trace to a merged regression case** (days, not months), **share of the eval set that came from production** (near zero means your evals test what you imagined), and **each failure mode's rate after its fix ships** (if it does not drop, you fixed the instance, not the class). The loop stalls when nobody owns review, when cases are added without checks so they never fail, and when the set grows only from loud complaints; keep adding random-sample cases too.
+
+<Production>
+
+**Failure modes.**
+
+- No way to reproduce a bad answer: no stored input, prompt version or response model, and tool results not recorded.
+- Silent quality drift after a provider or data change while every APM panel stays green. Outcome labels, proxies, sentinels and a sampled judge catch it.
+- Trace context lost across queues, background tasks and sub-agents, hiding the slow or expensive part.
+- Token accounting mixed across providers (Anthropic `input_tokens` excludes cache reads and writes; OpenAI `prompt_tokens` includes cached tokens), so cost panels are wrong by a large factor.
+
+**Cost.** The bill is mostly content storage: at 1 million calls a day of about 6,500 tokens, roughly 26 GB of raw text a day against about 1 GB of metadata. Keep all metadata, keep content for a short window, store template versions plus variables, promote only flagged traces. Size sampled judges with the arithmetic in [online evals](/20-evals-judges-and-ci/#online-evals-and-production-sampling).
+
+**Latency.** Spans cost microseconds. Overhead comes from synchronous exporters, serialising large content on the request path and inline judges: use batching exporters with bounded dropping queues, write content asynchronously, run judges off the request path.
+
+**Observability.** This chapter is the "O" for every other chapter: per-call spans with model, prompt version, tokens by type, cost, TTFT, finish reason and outcome; run summaries for agents; four metric families with deploy annotations; user, judge and code-check scores on trace ids; a path from any flagged trace to an eval case.
+
+**Security.** Prompts and logs contain PII and sometimes secrets. Redact at the source, pseudonymise user ids with a keyed hash, restrict and audit content access, scrub exception-tracker payloads, honour deletion across traces and eval sets, and treat hosted observability vendors and LLM judges as data processors. Text a judge reads can carry injection aimed at your monitoring; delimit it as data.
+
+</Production>
+
+<Interview>
+
+<Q q="Users say answers got worse last week. How do you investigate?">
+
+- Make it concrete: which feature, which users, examples with trace ids. Read those traces and classify each failure (data, retrieval, prompt, model, tool, guard).
+- Check what changed in the window: deploy and prompt-version annotations, `gen_ai.response.model` (did an alias move?), corpus re-ingests, embedding version, traffic mix.
+- Compare before and after, split by version: outcome mix, code-check pass rates, finish reasons, output length, retrieval scores, sampled judge pass rate with its interval.
+- Run sentinel prompts and the offline eval set on old and new configurations to separate our change, provider change and user change.
+- Replay bad traces several times to measure how often it reproduces.
+- Mitigate (roll back the prompt, pin the model) while fixing; add the cases to the eval set and an alert that would have caught it.
+- **The trap:** "I'd check error rate and latency." They will be green; the failure is in content, and without versions on traces you cannot attribute it.
+
+</Q>
+
+<Q q="What would you log for every LLM call?">
+
+- Identity: trace and span ids, parent, timestamp, service version.
+- What ran: provider, requested and response model, prompt name and version (content hash), parameters, tool definitions version.
+- Usage and cost: input tokens including cached, cache read and write, output and reasoning tokens, normalised across providers; cost and its source.
+- Timing and outcome: TTFT, total latency, attempts, finish reason, error class, outcome label, guard verdict, schema validity. Tool calls: name, redacted args, result size, `is_error`, latency.
+- Content by reference in a restricted store with short retention; never secrets; user ids pseudonymised.
+- Name the OTel GenAI attributes (`gen_ai.request.model`, `gen_ai.usage.input_tokens`) and note they are still in Development, so map them in one place.
+- **The trap:** "Log the prompt and the response." That is the riskiest and least aggregatable part; without versions, tokens and outcome you cannot answer any trend question.
+
+</Q>
+
+<Q q="Design observability for a multi-agent system.">
+
+- Scope and SLOs: what a run is, task success rate, p95 run duration, cost per successful task, which actions are high-risk.
+- Trace model: one trace per task; root `invoke_agent` for the orchestrator, nested `invoke_agent` per sub-agent, `chat` and `execute_tool` per step; `traceparent` across services and queue headers; span links for fire-and-forget fan-out; `gen_ai.conversation.id` across runs.
+- Run summaries on the root span: steps, tool errors, repeated calls, tokens, cost, stop reason, handoffs, approvals; metrics from these by agent and version.
+- Content and tool results by reference, so runs replay without re-executing side effects.
+- Quality: end-state outcome checks, trajectory checks (approval before writes, loops), sampled judges, user feedback, all as scores on the trace.
+- Alerts and numbers: cost per run and tenant, runs ending on budget, loop detections, tool error rate. Context growth makes 10 steps cost about 97,500 input tokens against 30,000 without growth.
+- **The trap:** flat per-call log lines with no parent-child structure, so cost and errors cannot be attributed to the sub-agent or step that caused them.
+
+</Q>
+
+<Q q="How do you detect quality drift without labels?">
+
+- Proxies that move with quality: outcome mix, finish reasons, output length, retrieval scores, reply-language match, code-check pass rates.
+- Compare windows with PSI or a KS test, and rate bands from SE = √(p(1 − p) / n), alerting beyond 3 SE with a minimum volume.
+- Input drift: share of inputs per embedding cluster from a reference period, plus outliers far from every centroid.
+- Sentinel prompts on a schedule to isolate model or provider drift from traffic drift; pin snapshots, log the response model.
+- A validated judge on a small daily sample, corrected for TPR and TNR, gives an approximate label with an interval. Implicit feedback lags but helps.
+- **The trap:** "Wait for thumbs-down to rise." Feedback is sparse and skewed; a regression can run for weeks first.
+
+</Q>
+
+<Q q="What is the difference between a trace and a span, and how would you sample traces for an LLM app?">
+
+- A span is one timed operation with attributes, status and a parent; a trace is the tree of spans sharing one trace id for one request or agent run.
+- Head sampling decides up front (cheap, loses rare failures); tail sampling decides after the trace ends (keeps errors, slow, expensive, guard-hit traces) at the cost of buffering.
+- For LLM apps keep all metadata spans, keep full content for a short window because feedback and judge scores arrive late, then promote flagged traces and expire the rest.
+- Compute rates only from the random sample; use targeted samples to find failures.
+- **The trap:** uniform 1% sampling, then discovering the one complaint you must debug was not kept.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Instrument **Memory Agent** (`~/memory-agent`), which has hand-measured timings and `console.warn` but no trace ids or spans, with OTel GenAI spans; view them locally; build one dashboard and one alert; write a mock postmortem. Everything runs offline behind a mock model (or a small Ollama model), so no paid API is called.
+
+1. **Backend.** Run a local Jaeger all-in-one container exposing OTLP (4317, 4318) and the UI (16686); check the Jaeger docs for the current image name. Self-hosted Langfuse via docker compose is the alternative.
+2. **Mock model.** Add `MOCK_LLM=1`, returning canned plans and answers with Anthropic-shaped `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`) and a 300 to 2,000 ms delay. Make 10% of calls throw a 429 and 5% stop on `max_tokens`.
+3. **Spans.** Use the OpenTelemetry Node SDK with the OTLP HTTP exporter and a batch processor. Root span around `runTurn`; `chat {model}` spans for planner, writer and claim extraction; `execute_tool web_search` per search. Set `gen_ai.operation.name`, `provider.name`, `request.model`, `response.model`, `response.finish_reasons`, normalised `gen_ai.usage.*`, `gen_ai.prompt.version` (hash of `src/prompts.ts` text), `app.cost_usd`, `app.ttft_ms`, `app.outcome`. Link the background extraction to the turn.
+4. **Content.** Keep prompts out of attributes: write redacted input and output to a local SQLite table keyed by trace and span id and set `app.content_ref`.
+5. **Feedback.** Add `traceId` to `done.meta`, show it in the UI, add a thumbs control that POSTs `{traceId, thumb, reason}` into a scores table.
+6. **Dashboard and alert.** From exported spans, report requests, error rate by class, p50/p95 TTFT and total, cost per turn, cache hit rate and outcome mix by prompt version. Code one alert: length-stop or fallback rate above baseline + 3 SE, minimum 200 turns.
+7. **Mock incident.** Edit the planner prompt to list more entities, run 300 mock turns, find the cause from traces, roll back, and write a one-page postmortem (impact, timeline, detection, root cause, action items including one case in `eval/cases.ts` and one alert).
+
+**Definition of done:** one turn shows in Jaeger as a single trace with planner, writer, search and extraction spans and correct token attributes; root-span cost equals the sum of child spans under the normalisation rule; a thumbs-down lands as a score keyed by trace id; the alert fires on the injected regression and not on a clean 300-turn run; the postmortem cites trace ids and adds one eval case.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Chat Insights: a good per-call log line with nothing to join it to.** `backend/src/lc/services/llm/index.js` logs `{evt: 'lc.llm', provider, model, latency_ms, usage, attempts}` and an `lc.llm.error` line on failure, never prompt or reply; `chatService.js` stores usage, guard verdict, provider, model and a `degraded` flag per assistant row and accepts thumb, reason and note per message. But the request logger in `backend/src/lc/app.js` has no request id, so `lc.req`, `lc.chat` and `lc.llm` lines cannot be joined. Name the fix: a request id in AsyncLocalStorage on every line, then spans.
+- **Answer Grader: cost per run saved on the result.** `backend/llm.py` keeps a per-run ledger in a `ContextVar` (the same mechanism a tracer uses); `record_usage` stores step, provider, model, tokens, cost and `cost_source`, and `backend/pipeline.py` saves the summary as `evaluation["cost"]` in INR and USD. Gaps: logs keyed by `submission_id[:8]`, no trace id, no per-call latency or cached tokens. The same file keeps raw provider errors out of student-facing data. Your trace-to-fix story: a comment in `backend/evaluation.py` records that on 5 of 8 re-marked copies the feedback asked for content already on the page, which led to a transcript-based check in code.
+- **Memory Agent: per-turn metrics, no traces.** `src/agent.ts` returns `planMs`, `firstTokenMs`, `totalMs`, searches, guard counts and `costUsd` in `done.meta`, but no spans wrap planner, writer and extractor, and `public/app.js` has no feedback control. Its cost line subtracts `0.9 × cacheRead` from Anthropic's `input_tokens`, which already excludes cache reads; the Apply-it is where to fix both.
+- **Scheme Assistant: be precise about ownership.** `src/app/core/answer_query.py` (a teammate's code) creates a UUID `trace_id` per question and writes an audit row with status, abstain reason, provider, timings and raw model output, and the API returns `traceId`; there is no feedback endpoint, no per-call tokens or cost, and a trace id is not a span tree. Yours: the critic spend meter in `scripts/critic_api.py` that prices every Gemini response into a ledger and refuses calls past a rupee cap, the `fix_hint` in `docs/critic-eval/JUDGE.md` that closed one trace-to-fix loop, and speech logging in `src/app_api/speech.py` that records sizes and timings, never the text.
+- **Health Triage (teammates' code).** A request id is accepted or generated and copied into Celery task headers so API and worker logs share it (`app/core/request_id.py`, `app/workers/celery_app.py`), and a recursive scrubber redacts sensitive keys before Sentry events leave. The same code sets the user's email on the Sentry scope: the "scrubber in one path, leak in another" failure.
+- **The honest gap:** none of your repos emits OpenTelemetry spans or uses an LLM observability backend. Instrumenting Memory Agent is the smallest change that makes "I trace my agent" true.
+
+</YourProject>

@@ -1,0 +1,21 @@
+---
+interface Props { current?: 'book' | 'interview' | 'library' | 'repos' | 'gaps' | 'chapter' }
+const { current } = Astro.props;
+const links = [
+  { id: 'book', href: '/', label: 'Book' },
+  { id: 'interview', href: '/interview/', label: 'Interview' },
+  { id: 'library', href: '/library/', label: 'Library' },
+  { id: 'repos', href: '/repos/', label: 'Your repos' },
+  { id: 'gaps', href: '/gaps/', label: 'Gaps' },
+];
+---
+<nav class="sitenav" aria-label="Views">
+  <div class="sitenav-inner">
+    {links.map((l) => (
+      <a href={l.href} class:list={['sitenav-link', { on: current === l.id }]} aria-current={current === l.id ? 'page' : undefined}>{l.label}</a>
+    ))}
+    <button type="button" class="sitenav-search" data-palette-open aria-label="Search concepts, questions and your code">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><span class="sitenav-search-l">Search</span><kbd>⌘K</kbd>
+    </button>
+  </div>
+</nav>

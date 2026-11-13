@@ -1,0 +1,128 @@
+---
+id: "D05"
+title: "Deep-research agent with citations"
+prompt: "Design an agent that takes a research question, searches the web for several minutes, and returns a report where every factual claim is cited. How do you make the citations trustworthy, and how do you keep cost under control?"
+sections: ["18.06", "18.07", "25.02", "25.04", "17.09", "20.07", "31.12"]
+minutes: 45
+---
+
+This prompt tests whether you can bound an open-ended agent. Search can go on forever, pages contain instructions aimed at your model, and a fluent report with plausible links is easy to produce and hard to trust. The interviewer wants a budgeted plan-search-read-write loop, an evidence store that separates reading from writing, citations verified by code, and an honest answer to "one agent or many?".
+
+## Clarify and scope
+
+- **Users and questions.** Assume analysts asking broad questions ("How are Indian states regulating ride-hailing surge pricing since 2024?"), not quick facts. Reports of 1,000 to 2,500 words.
+- **Sources.** The open web, plus optionally an internal document index. Ask whether some domains are preferred (regulators, primary filings) or banned.
+- **Time and cost.** Async is fine: 3 to 10 minutes, with progress shown. Assume a hard cost ceiling per report that the business sets.
+- **Citation standard.** Every factual sentence links to a source, and the quoted passage must actually support it. Conflicts between sources are shown, not hidden.
+- **Volume.** Assume 2,000 reports a day.
+
+## Baseline architecture
+
+```text
+ question ─► clarify (optional 1-2 questions) ─► lead planner
+   plan = sub-questions + search intents + budget per sub-question
+   ─► fan out: N workers in parallel, each with its own context
+        loop (max S steps): search ─► pick results ─► fetch page
+              ─► clean (strip nav, scripts, hidden text) ─► snapshot (url, hash, fetched_at)
+              ─► extract notes {claim, quote, url, published_date, snapshot_id}
+        return compact notes, never raw pages
+   ─► evidence store (dedupe by url + quote, near-duplicate pages merged)
+   ─► lead reviews coverage: gaps? conflicts? ─► at most one more round
+   ─► writer: outline ─► sections, each sentence cites note ids only
+   ─► verifier (code + small model):
+        cited note exists? quote found in snapshot? quote supports sentence?
+        numbers and dates in sentence present in quote?
+   ─► report + sources + "conflicting evidence" + "could not verify"
+ budget guard on every step: searches, fetches, tokens, wall time, money
+```
+
+The single most important line is "the writer cites note ids only". The writer never sees a raw page, so it cannot cite something that was never extracted, and every citation resolves to a stored snapshot. That makes verification a lookup instead of a judgement. The [advanced RAG chapter](/18-advanced-and-agentic-rag/#deep-research-iterative-search) covers the iterative search pattern.
+
+## Key choices and trade-offs
+
+**One agent with parallel searches, or orchestrator and sub-agents?** Sub-agents give context isolation: each worker reads dozens of pages and hands back a few hundred tokens of notes, so the lead's context stays small and focused. Anthropic's June 2025 engineering post on its own research system reports that a lead agent with sub-agents beat a single agent by 90.2% on its internal research eval, used about 15 times the tokens of a chat, and suits breadth-first questions rather than tasks where every agent needs the same context. Those are the vendor's own numbers on its own eval. The cost: more tokens, more latency, and coordination failures (two workers researching the same thing, a worker drifting off scope). For narrow questions a single agent issuing parallel searches is faster and cheaper. Route by question breadth: the planner decides how many workers to start, from zero to a cap.
+
+**Search quality.** Ask the planner for neutral queries (no leading wording, no assumed answer), use `site:` queries for primary sources, and keep a domain deny list for content farms. Prefer the newest authoritative source and record the publish date on every note.
+
+**Fetch and snapshot.** Search snippets are too short to support most claims; fetch the page, clean it and store a snapshot with a hash. Citations point at the snapshot, so they stay checkable when the live page changes.
+
+**Budgets as first-class design.** Per report: maximum workers, steps per worker, searches, fetches, tokens and wall time, plus a money ceiling computed from token counts as you go. When a budget runs out, the system writes with what it has and lists the open sub-questions. See [agent budgets](/31-cost-and-latency-engineering/#agent-budgets-and-runaway-control).
+
+**Model mix.** A strong model for planning and writing; a cheap fast model for workers' page reading and note extraction, where most tokens go; a small model or code for verification.
+
+<Callout type="interview">
+Say the failure you are designing against: a report whose citations exist but do not say what the sentence claims. Link checks will not catch it; quote matching against a snapshot plus a support check will.
+</Callout>
+
+## Evals
+
+- **Citation precision.** Share of cited sentences whose quote, found in the snapshot, supports the sentence. Check quote presence in code; check support with a judge calibrated against about 100 human labels.
+- **Citation recall.** Share of factual sentences that carry a citation at all.
+- **Factual accuracy.** A set of questions with known, dated answers, including ones where the answer changed recently, so stale sources are caught.
+- **Coverage.** For 50 or so questions, an expert writes the points a good report must cover; a judge scores coverage against that list.
+- **Source quality.** Share of citations from primary or preferred domains.
+- **Trajectory.** Searches per sub-question, duplicate work across workers, budget hits. Grade the trajectory as well as the report.
+- **Variance.** Run each question several times. One run is a sample, not a measurement. Public benchmarks such as GAIA and BrowseComp are useful for comparing approaches; your own question set decides releases.
+
+## Guardrails and fallbacks
+
+- **Indirect prompt injection.** Every fetched page is untrusted. Workers have only search and fetch tools, nothing that writes or sends. Page text is wrapped as data, hidden text is stripped during cleaning, and notes are extracted under a schema, so an instruction on a page becomes at most a strange note that fails verification. See the [lethal trifecta](/33-security-prompt-injection/#the-lethal-trifecta): this design removes the "send data out" leg.
+- **Output rendering.** The report is sanitised HTML; no auto-loaded remote images, links rendered with `rel="noopener"`.
+- **Unverifiable claims** are removed or moved to a "could not verify" section rather than kept silently.
+- **Copyright and fairness.** Quote short spans; respect robots rules and paywalls.
+- **Fallbacks.** Search provider down: retry, then a second provider. A worker crash loses only its sub-question; the report notes the gap.
+
+## Observability and cost
+
+A trace tree per report: lead span, one span per worker, a span per search and fetch with URL and status, extraction token counts, verifier verdicts. Dashboards: cost per report (p50, p95), wall time, budget-hit rate, citation precision from sampled judge runs, verifier drop rate, top fetched domains. Alert when p95 cost per report creeps up; it is the first sign of a looping worker.
+
+## The numbers
+
+**Per report (assumptions to state).**
+
+```text
+sub-questions             6
+searches                  6 × 3          = 18
+pages fetched             6 × 5          = 30
+tokens per cleaned page   ~6K            → 180K tokens read by workers
+worker overhead           ~20K in, notes 30 × 400 = 12K out
+lead planning + review    ~2 × 10K in, ~3K out
+writer                    ~20K in (notes + outline), ~4K out
+verifier                  ~60 claims × ~300 tokens = ~20K in, ~2K out
+```
+
+So roughly 220K input and 14K output tokens on the cheap model (workers and verifier), and about 40K input and 7K output on the strong model.
+
+**Cost per 1K reports** (P in dollars per million tokens, check current prices):
+
+```text
+cheap  = 220 × P_in_small + 14 × P_out_small
+strong = 40 × P_in_large + 7 × P_out_large
+search = 18,000 × P_search            (per-search fee, if billed)
+total  = cheap + strong + search + fetch/proxy infrastructure
+```
+
+Page reading dominates token volume, which is why it goes to the cheap model and why cleaning pages (dropping navigation and boilerplate) is a cost lever, not just a quality one.
+
+**Latency.** Planning 10 to 20 s. Workers in parallel, each about 5 steps of search (1 to 3 s), fetch (1 to 5 s) and extraction (3 to 10 s): about 1 to 3 minutes. Optional second round: another 1 to 2 minutes. Writing 30 to 60 s, verification 20 to 40 s. Total about 3 to 6 minutes.
+
+**Throughput.** 2,000 reports a day × 30 fetches = 60K fetches a day, under 1 per second averaged; peaks maybe 5×. Fetching is not the bottleneck; provider token rate limits on the cheap model might be, at about 2,000 × 220K = 440M input tokens a day.
+
+## Follow-ups they will ask
+
+- **"A citation link works but the page does not say that."** That is exactly what quote-in-snapshot plus a support check catches; measure citation precision and fail the release if it drops.
+- **"Two sources disagree."** Keep both notes, prefer the more recent primary source in the text, and put the disagreement with both citations in a conflicts section.
+- **"How do you stop runaway cost?"** Count tokens and searches as they happen, check a money ceiling before each step, and stop gracefully with a partial report.
+- **"Why not one big model with a long context reading everything?"** Thirty pages at 6K tokens fits in a long context, but you pay strong-model prices for page reading and lose isolation; sub-agents compress reading into notes on a cheap model.
+- **"How do you evaluate a report with no single right answer?"** Decompose: citation precision and recall in code and a calibrated judge, coverage against an expert checklist, accuracy on the subset with known answers.
+
+## How to bring in your own work
+
+Memory Agent is a small research agent, so this is one of your strongest drills. Be clear it is a chat agent with one search tool, not a multi-minute report writer.
+
+- **Planner with neutral queries.** The planner returns a typed Plan whose schema asks for 1 to 5 neutral queries and `site:` queries on vendor domains for prices (`src/planner.ts` lines 25 to 31). `DECISIONS.md` (lines 166 to 178) records that prompting alone did not make search prefer vendors, while `site:` gave 10 of 10 vendor results against 0 of 10 without.
+- **Budgets.** The search budget is max(default, entities + 2) capped at 10, after an 8-product question skipped two products under a flat 6 (`src/agent.ts` lines 176 to 178), plus a 45 s turn deadline (`src/config.ts` lines 28 to 35) and at most 3 rounds when the server-side search loop pauses (`src/answer.ts` line 85).
+- **Citations from structure, checked in code.** Citations come from the API's search-result locations, not parsed from wording (`src/answer.ts` lines 127 to 140). A deterministic guard checks every price and percentage against the cited excerpt (`src/guard.ts` lines 37 to 50); replaying it over stored runs took flags from 543 on 36% of turns (v1) to 8 on 1.3% (v2.1), all fair on hand review (`DECISIONS.md` lines 148 to 151). `eval/guard-recall.ts` measured that only 508 of 1,630 prices (31.2%) sat behind complete excerpts (`DECISIONS.md` line 159), so the guard cannot check most prices: the reason to fetch full pages.
+- **One agent versus sub-agents, decided for latency.** `DECISIONS.md` lines 32 to 36 chooses one writer call per turn that runs several searches in parallel, with no sub-agents, citing research sub-agents in earlier work that took a median of 8.6 minutes. That is the right call for a chat agent; say that a multi-minute report writer flips the trade-off and that you have not measured sub-agents on report quality.
+- **Judge with its own search, and variance.** The eval judge is Opus with up to 3 searches so it can check disputed facts (`eval/run.ts` lines 140 to 153), and `eval/report.ts` combines runs because the same code scored 22/28 and 26/28.
+- **Honest gaps.** No page fetching or snapshots (search excerpts only), no orchestrator with parallel workers, no evidence store separate from the writer, no checkpointing for multi-minute runs, and no injection screening of search results (they flow straight into the model, `src/answer.ts` lines 119 to 126; the only mitigation is having no write tools).

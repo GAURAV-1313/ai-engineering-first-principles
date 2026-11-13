@@ -1,0 +1,126 @@
+---
+import Page from '../../layouts/Page.astro';
+import { evidence, repos } from '../../lib/data';
+import { parts, chapterById, chapterHref } from '../../lib/outline';
+
+// Sections that are theory to understand rather than something to build: not counted as gaps.
+const THEORY_CH = new Set(['05', '06']);
+const THEORY = /origins|intuition|history|landscape|hypothesis|interpretability|scaling laws|why stateless|why rag|why discrete|why post-train|why coding|one-hot|rnn limits|^from |as the core loop|n×m|what post-training implies|lineage|accelerators|serving parallelism|parallelism intuition|training instability/i;
+type Sec = { id: string; slug: string; title: string; href: string; status: 'solid' | 'naive' | 'none'; theory: boolean; repos: string[] };
+const chapters = parts.flatMap((p) => p.chapters).map((id) => {
+  const c = chapterById[id];
+  return {
+    c,
+    secs: c.sections.map((s): Sec => {
+      const list = evidence.filter((e) => e.section === s.id);
+      const status = !list.length ? 'none' : list.some((e) => e.quality === 'solid') ? 'solid' : 'naive';
+      return { id: s.id, slug: s.slug, title: s.title, href: `${chapterHref(c)}#${s.slug}`, status,
+        theory: THEORY_CH.has(c.id) || THEORY.test(s.title), repos: [...new Set(list.map((e) => e.repo))] };
+    }),
+  };
+});
+const all = chapters.flatMap((x) => x.secs);
+const never = chapters.map((x) => ({ ...x, list: x.secs.filter((s) => s.status === 'none' && !s.theory) }))
+  .filter((x) => x.list.length).sort((a, b) => b.c.weight - a.c.weight || b.list.length / b.secs.length - a.list.length / a.secs.length);
+const naive = chapters.map((x) => ({ ...x, list: x.secs.filter((s) => s.status === 'naive') })).filter((x) => x.list.length);
+const nNever = never.reduce((a, x) => a + x.list.length, 0);
+const nNaive = naive.reduce((a, x) => a + x.list.length, 0);
+const nSolid = all.filter((s) => s.status === 'solid').length;
+const chip = Object.fromEntries(repos.map((r) => [r.slug, r]));
+// Best place to build a missing section: the repo with the most solid examples in the same chapter
+// (neighbouring sections count triple).
+const solid = evidence.filter((e) => e.quality === 'solid');
+const bestFit = (secs: Sec[], s: Sec, chapter: number): string | null => {
+  const i = secs.indexOf(s);
+  const near = new Set([secs[i - 1]?.id, secs[i + 1]?.id].filter(Boolean));
+  const score = new Map<string, number>();
+  for (const e of solid) if (e.chapter === chapter) score.set(e.repo, (score.get(e.repo) ?? 0) + (near.has(e.section) ? 3 : 1));
+  return [...score].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? null;
+};
+const BUILD = [
+  ['A real tool-use agent loop', 'Client-side tools, stop conditions, a step and cost budget, error feedback. Build it in Memory Agent.', '22.05'],
+  ['An MCP server and client', 'Expose Memory Agent memory or Scheme Assistant search as an MCP server; call it from a host.', '26.06'],
+  ['Multi-agent orchestration', 'An orchestrator with isolated sub-agents for a deep-research task.', '25.02'],
+  ['LLM tracing with OpenTelemetry', 'GenAI spans around every call in Scheme Assistant; a trace view from query to citation.', '30.03'],
+  ['Semantic caching', 'A similarity-keyed answer cache with a measured false-hit rate.', '31.04'],
+  ['Token counting and context budgets', 'Count tokens before the call; trim by budget instead of by characters.', '31.02'],
+  ['Indirect prompt-injection defence', 'Screen and quarantine fetched web content in Memory Agent; test with planted instructions.', '33.03'],
+  ['Batch API for evals and backfills', 'Run Answer Grader or Scheme Assistant eval sets through a batch job at a fraction of the price.', '31.07'],
+  ['Fine-tuning or distillation', 'LoRA on a small open model for one narrow task, evaluated against the prompted baseline.', '09.05'],
+  ['Cross-encoder reranking in production', 'Replace Answer Grader’s lexical boost with a local cross-encoder; measure nDCG@5.', '17.08'],
+];
+---
+<Page title="What to Build Next: AI Engineering Project Ideas · AI Engineering from First Principles" description="AI-engineering skills interviewers probe that a typical portfolio does not show yet, each with a concrete project to build: tracing, MCP, batch evals, reranking and more." crumb="Gaps" current="gaps" wide>
+  <header class="view-head">
+    <p class="home-kicker">What to build next</p>
+    <h1 class="view-title">What your code hasn't taught you yet</h1>
+    <p class="view-lede">{evidence.length
+      ? `${nSolid} of the book's ${all.length} sections have a solid example somewhere in your repos. ${nNever} hands-on sections have none, and ${nNaive} only have a naive one. Interviewers probe exactly these, so they are the best next things to build.`
+      : 'Examples from your repos are still being collected. The build list below comes from the repo inventory.'}</p>
+  </header>
+
+  <section class="iv-sec" aria-labelledby="build-h">
+    <h2 class="sec-h" id="build-h">The build list</h2>
+    <p class="sec-note">No repo of yours does these yet, and each one is a standard interview topic. Ordered by learning value.</p>
+    <ol class="build-list">
+      {BUILD.map(([t, d, s], i) => (
+        <li><span class="iv-id">{String(i + 1).padStart(2, '0')}</span><span><b>{t}</b><span class="build-d">{d}</span></span><a class="iv-k" href={`${chapterHref(s.slice(0, 2))}#${chapterById[s.slice(0, 2)].sections.find((x) => x.id === s)?.slug}`}>{s}</a></li>
+      ))}
+    </ol>
+  </section>
+
+  {evidence.length > 0 && (
+    <section class="gapmap" aria-label="Every section of the book, by coverage">
+      <p class="gapmap-key"><span><i class="k-solid"></i> solid example</span><span><i class="k-naive"></i> only naive</span><span><i class="k-none"></i> none</span><span><i class="k-read"></i> theory section</span></p>
+      {parts.map((p) => (
+        <div class="gaprow">
+          <p class="gaprow-h">Part {p.id} · {p.title}</p>
+          <div class="gaprow-chs">
+            {chapters.filter((x) => x.c.part === p.id).map((x) => (
+              <div class="gapch">
+                <a class="gapch-h" href={chapterHref(x.c)} title={x.c.title}>{x.c.id}</a>
+                <div class="gapcells">
+                  {x.secs.map((s) => <a href={s.href} class:list={['gapcell', s.status, { reading: s.theory && s.status === 'none' }]}
+                    title={`${s.id} ${s.title}: ${s.status === 'none' ? (s.theory ? 'theory' : 'no examples') : s.status === 'naive' ? 'only naive' : 'solid'}`}
+                    aria-label={`${s.id} ${s.title}, ${s.status === 'none' ? 'no examples' : s.status}`}></a>)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </section>
+  )}
+
+  {evidence.length > 0 && (
+    <div class="gaplists">
+      <section aria-labelledby="never-h">
+        <h2 class="sec-h" id="never-h">Never demonstrated <span class="sec-count">{nNever}</span></h2>
+        <p class="sec-note">Core chapters first. Theory sections are left out. The chip is the repo that already does the most in that chapter: the natural place to build it.</p>
+        {never.map(({ c, list, secs }) => (
+          <div class="gapgroup">
+            <h3><a href={chapterHref(c)}><span class="iv-id">{c.id}</span> {c.title}</a> <span>{list.length} of {secs.length}</span></h3>
+            <ul>{list.map((s) => { const fit = bestFit(secs, s, Number(c.id)); return (
+              <li><a href={s.href}><span class="iv-id">{s.id}</span> {s.title}</a>
+                {fit && <span class="gap-chips"><a class="chip" style={`--fam: var(--fam-${chip[fit].hue})`} href={`${chapterHref(c)}?repo=${fit}`}
+                  title={`Best fit: ${chip[fit].name}`}>{chip[fit].chip}</a></span>}</li>
+            ); })}</ul>
+          </div>
+        ))}
+      </section>
+      <section aria-labelledby="naive-h">
+        <h2 class="sec-h" id="naive-h">Only done naively <span class="sec-count">{nNaive}</span></h2>
+        <p class="sec-note">Your code touches these, but every example is naive or missing. The margin card says what to fix.</p>
+        {naive.map(({ c, list }) => (
+          <div class="gapgroup">
+            <h3><a href={chapterHref(c)}><span class="iv-id">{c.id}</span> {c.title}</a></h3>
+            <ul>{list.map((s) => (
+              <li><a href={s.href}><span class="iv-id">{s.id}</span> {s.title}</a>
+                <span class="gap-chips">{s.repos.map((r) => <a class="chip" style={`--fam: var(--fam-${chip[r].hue})`} href={`${chapterHref(c)}?repo=${r}#${s.slug}`} title={chip[r].name}>{chip[r].chip}</a>)}</span></li>
+            ))}</ul>
+          </div>
+        ))}
+      </section>
+    </div>
+  )}
+</Page>

@@ -1,0 +1,123 @@
+---
+id: "D06"
+title: "Text-to-SQL analyst assistant"
+prompt: "Design an assistant that lets business users ask questions in plain English about the company's data warehouse and get back correct numbers, a chart and the SQL it ran. How do you make it correct and safe?"
+sections: ["18.03", "13.04", "21.13", "33.09", "19.09", "20.08", "15.14"]
+minutes: 45
+---
+
+Text-to-SQL looks like a solved demo and is hard in production for one reason: a wrong query returns a confident, well-formatted wrong number. The interviewer wants to hear how you ground the model in the real schema and the company's metric definitions, how you validate and sandbox the SQL before it runs, and how you evaluate on execution results rather than SQL text.
+
+## Clarify and scope
+
+- **Users.** Assume 500 business users (sales, operations, finance) who do not write SQL, plus analysts who will review answers. About 5,000 questions a day.
+- **Data.** A warehouse with about 500 tables and 15,000 columns, many unused or deprecated, with some PII columns. Ask whether a semantic layer or metric definitions exist (what exactly is "active customer" or "revenue"?). The answer changes the design.
+- **Permissions.** Users must only see data they are allowed to see. Assume row-level rules by region and team already exist in the warehouse.
+- **Answer format.** A number or table, a chart, a one-paragraph explanation with assumptions stated ("revenue = net of refunds, IST calendar months"), and the SQL itself for anyone who wants to check.
+- **Latency.** Under about 10 s for typical questions, with progress shown; heavy queries may take longer.
+- **Out of scope for v1.** Writing data, scheduling reports, joining external sources.
+
+## Baseline architecture
+
+```text
+ question ─► auth (user, role, region) ─► rate limit
+   ─► classify: answerable? ambiguous? ─► clarify question if ambiguous
+   ─► resolve dates in code ("last quarter" → explicit range, fiscal calendar, timezone)
+   ─► schema linking:
+        retrieve tables/columns from a catalog index
+        (names, descriptions, sample values, join keys, popularity, deprecated flags)
+        + metric definitions from the semantic layer
+        + 3-5 verified question→SQL examples (retrieved by similarity)
+   ─► generate: structured {sql, tables_used, assumptions[], chart_hint}
+   ─► validate in code:
+        parse (SQL parser) · single SELECT only · tables in allowlist for role
+        · no PII columns unless permitted · LIMIT added · EXPLAIN cost below cap
+   ─► execute on read replica / warehouse as the USER's role (row-level security),
+        statement timeout, bytes-scanned cap
+        error? ─► feed error + schema back, retry at most 2 times
+   ─► result checks: empty? suspicious magnitudes? ─► summarise (small model) + chart
+   ─► show answer + assumptions + SQL ─► feedback (correct / wrong + fix)
+   analyst-verified pairs ─► example store + eval set
+```
+
+See the [text-to-SQL section](/18-advanced-and-agentic-rag/#text-to-sql-and-query-construction) for query construction more broadly.
+
+## Key choices and trade-offs
+
+**Schema linking is the core problem.** 15,000 columns of DDL is far too much to put in every prompt, and most wrong answers come from picking the wrong table or join, not bad SQL syntax. Build a catalog: each table and column with a human-written description, example values, foreign keys and how often analysts actually query it. Retrieve the top 10 or so tables by hybrid search over that catalog, then expand along known join keys. Deprecated tables are excluded from the index entirely. Curating the catalog is the highest-leverage work in the project, and it is mostly not AI work.
+
+**Semantic layer over raw SQL where possible.** If "revenue" and "active customer" are defined once in a metrics layer, have the model choose metrics, dimensions and filters, and let the layer generate SQL. That removes a whole class of errors (different definitions of the same metric) at the cost of only answering questions the layer covers. Use raw SQL generation as the fallback for the long tail, with a visible "this used custom SQL" label.
+
+**Verified examples.** A store of question and SQL pairs that analysts have approved, retrieved as few-shot examples. It is the cheapest way to teach company conventions (fiscal year, test accounts to exclude, IST timezone), and it grows from user feedback.
+
+**Dates in code, not in the model.** Relative dates are a classic failure: "last quarter" depends on the fiscal calendar, "this week" on the timezone and week start. Resolve them in code before generation and pass explicit ranges.
+
+**Ask, don't guess.** If two tables could answer "how many customers", or the metric is undefined, ask one clarifying question with the options. Guessing silently is how wrong numbers reach a board deck.
+
+**Structured output.** The model returns SQL plus the tables it used and the assumptions it made, under a schema validated in code ([Pydantic/Zod validation](/13-structured-output/#pydantic-zod-validation)). The assumptions are shown to the user; they are how a non-SQL user catches a wrong interpretation.
+
+## Evals
+
+- **Execution accuracy, not string match.** Build 300 to 500 questions with analyst-written gold SQL. Run both against a frozen snapshot of the warehouse and compare result sets (order-insensitive, with numeric tolerance). Two different queries can both be correct; two similar-looking ones can differ by a join.
+- **Slices.** Joins across 3+ tables, date logic, metric definitions, ambiguous questions (the right behaviour is to ask), unanswerable questions (the right behaviour is to say so), and permission-restricted questions.
+- **Component metrics.** Schema-linking recall (were the gold tables among those retrieved?), validation rejection rate, retries per question, and clarification precision.
+- **Public benchmarks** such as Spider (Yu et al. 2018: cross-domain questions over about 200 databases, scored by exact match and execution) and BIRD (Li et al. 2023: large, messy real databases with external-knowledge evidence, scored by execution accuracy plus an efficiency score) are useful for comparing models; your own warehouse set decides releases, because your schema and definitions are the hard part.
+- **Online.** Thumbs and "wrong, here is why" feedback, analyst review of a weekly sample, and the share of answers users open the SQL for.
+
+## Guardrails and fallbacks
+
+- **Read-only by construction.** The database role can only SELECT, the parser rejects anything that is not a single SELECT, and execution happens on a replica or a warehouse with per-query limits. Do not rely on the prompt saying "only write SELECT". See [least-privilege tools](/33-security-prompt-injection/#least-privilege-tools-and-scoped-credentials).
+- **Permissions in the database.** Queries run as the user's role so row-level security applies. The model never decides what a user may see; a query touching a forbidden table fails validation before it runs.
+- **Cost control.** EXPLAIN or a dry run estimates bytes scanned; above the cap, ask the user to narrow the question. Statement timeout on every query.
+- **PII.** Sensitive columns are excluded from the catalog for roles without access, and masked in results.
+- **Injection through data.** Cell values (a customer note, a product name) can contain instructions. The summariser receives results as data, has no tools, and its output is escaped.
+- **Sanity checks.** Flag empty results, negative counts, or values far from the usual range for that metric, and say so in the answer instead of presenting them flatly.
+
+## Observability and cost
+
+Trace per question: retrieved tables, examples used, generated SQL, validation result, retries and error messages, rows returned, bytes scanned, query time, tokens. Dashboards: execution success rate, retries per question, clarification rate, thumbs-down rate by table, warehouse cost from assistant queries, p95 end-to-end time. The table-level thumbs-down view tells you which catalog descriptions to fix next.
+
+## The numbers
+
+**Prompt size.**
+
+```text
+full schema   15,000 columns × ~15 tokens   ≈ 225K tokens (does not fit usefully)
+linked schema ~10 tables × ~30 columns × ~15 tokens ≈ 4.5K tokens
+examples      4 × ~300                      ≈ 1.2K tokens
+rules + metric definitions (cacheable)      ≈ 1.5K tokens
+input per generation                        ≈ 7K tokens; output ≈ 300
+```
+
+**Cost per 1K questions** (P in dollars per million tokens; check current prices):
+
+```text
+generation  1.3 calls avg (retries) × (7 × P_in + 0.3 × P_out)
+summary     2 × P_in_small + 0.2 × P_out_small    (results ~2K tokens in)
+LLM total   ≈ 9.1 × P_in + 0.39 × P_out + summary
+warehouse   1,000 × average bytes scanned × warehouse price per byte
+```
+
+Warehouse cost can exceed LLM cost if queries scan large tables, which is why the bytes-scanned cap matters.
+
+**Load.** 5,000 questions over a 10-hour office day is 5,000 / 36,000 ≈ 0.14 questions per second; plan for perhaps 1 per second at peak. LLM throughput is not the constraint; warehouse concurrency and query time are.
+
+**Latency budget (targets).** Auth, classify and date resolution 200 to 500 ms; schema retrieval 100 to 300 ms; generation 1 to 3 s; validation and EXPLAIN 200 to 500 ms; execution anywhere from 0.5 s to tens of seconds; summary 1 to 2 s. A retry adds a generation and an execution. Most of the variance is the query, not the model.
+
+## Follow-ups they will ask
+
+- **"The SQL runs and the number is wrong. How would you even know?"** Show assumptions and SQL, run sanity range checks, collect feedback, and measure execution accuracy on a gold set; for key metrics, route through the semantic layer so the definition cannot drift.
+- **"How do you handle a schema with thousands of tables?"** Retrieve over a curated catalog with descriptions and usage stats, expand along join keys, and keep deprecated tables out of the index.
+- **"What if the model writes DELETE?"** It cannot matter: read-only role, parser allowlist of a single SELECT, and a replica; the prompt is not the control.
+- **"How do you improve over time?"** Every analyst-corrected answer becomes a verified example and an eval case; track which tables produce wrong answers and fix their descriptions.
+- **"Agent or pipeline?"** A pipeline with a bounded retry loop on SQL errors; give it an agentic step (explore a table's distinct values) only if evals show linking failures that a lookup would fix.
+
+## How to bring in your own work
+
+You have not built a text-to-SQL system, and none of your repos has an LLM generating SQL, a SQL parser in the loop, or a semantic layer. Say so, then point to the pieces that transfer.
+
+- **Dates resolved in code.** Memory Agent parses date phrases with chrono-node and code decides past versus future, week and month ranges and alternatives for "last Tuesday", so the model never does calendar arithmetic (`src/dates.ts` lines 61 to 70). A guard stops "Monday.com" becoming a date (lines 57 to 59). That is exactly the "last quarter" step above.
+- **SQL as the retrieval layer.** Memory Agent's memory recall is SQL over SQLite FTS5 ordered by bm25 (`src/memory.ts` lines 133 to 147). Certificate Assistant's record-linkage comparison levels are reproduced one-to-one in DuckDB SQL for Splink training (`app/backend/matcher.py` lines 9 to 10, `app/backend/train_model.py`). Neither is text-to-SQL, but both show you think in queries.
+- **Validating model output against a contract.** Chat Insights re-validates types, ranges and caps after parsing with a validator shared by the guard and tests (`backend/src/lc/services/llm/schema.js` lines 27 to 37); its evidence notes the `rung` field should be an enum so constrained decoding enforces it, the same point as an allowlist of tables and columns.
+- **Bounded retry with the error fed back.** Chat Insights's single retry with the violations listed (`backend/src/lc/services/chatService.js` lines 99 to 110) is the "feed the SQL error back, at most twice" loop.
+- **Gap to close.** Build a small text-to-SQL assistant on a public sample database with a gold set scored by execution accuracy and a parser-based validator; until then, present this drill as design reasoning, not experience.

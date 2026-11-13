@@ -1,0 +1,17 @@
+---
+import Base from './Base.astro';
+import SiteHeader from '../components/SiteHeader.astro';
+import SiteNav from '../components/SiteNav.astro';
+import Palette from '../components/Palette.astro';
+interface Props {
+  title: string; description?: string; current?: 'book' | 'interview' | 'library' | 'repos' | 'gaps'; wide?: boolean; crumb?: string;
+  noindex?: boolean; ogType?: 'website' | 'article'; jsonLd?: object[];
+}
+const { title, description, current, wide = false, crumb, noindex, ogType, jsonLd } = Astro.props;
+---
+<Base title={title} description={description} noindex={noindex} ogType={ogType} jsonLd={jsonLd}>
+  <SiteHeader crumb={crumb} />
+  <SiteNav current={current} />
+  <main id="main" class:list={['page', { wide }]}><slot /></main>
+  <Palette />
+</Base>

@@ -1,0 +1,622 @@
+---
+id: "13"
+title: "Structured Output"
+summary: "Turn a model call into a typed function your code can trust: choose between JSON mode, schema-enforced output and local grammar decoding, validate and repair what comes back, design schemas that make wrong answers representable, and measure extraction accuracy field by field."
+readingTime: "34 min"
+---
+
+Most LLM calls in a real backend are not chat. They are a step in a pipeline: classify this ticket, pull the invoice number and total out of this PDF, decide which route this message takes, grade this answer on four criteria. The next step is code: a database insert, an `if`, a queue. Code cannot read a friendly paragraph. It needs an object with known fields of known types, every time.
+
+The first generation of LLM apps got that object by asking nicely ("Return only JSON") and then scraping: strip the Markdown fence, find the first `{`, call `JSON.parse`, hope. That works most of the time in a demo. At 100,000 calls a day, even a 1 percent failure rate is a thousand broken requests, and each one is either an exception on a user's screen or, worse, a silent default that looks like a real result.
+
+This chapter is about closing that gap from both ends. From the model's end: providers and open-source engines can now *constrain decoding* so the output must match a schema, by masking logits at every step. From your end: you still validate, because a schema-valid object can hold a wrong value, and you need a bounded repair path and an honest fallback when validation fails. Then come the parts that decide whether a structured-output feature is any good: schema design, extraction patterns, streaming, and per-field evaluation.
+
+## LLM as a typed function
+
+### The problem
+
+A raw model call has the type `string -> string`. Your pipeline wants `Document -> Invoice` or `Message -> Route`. Everything in this chapter is about narrowing that gap so the rest of your code can treat the model like any other function with a signature, a contract and documented failure modes.
+
+### The shape of the wrapper
+
+The wrapper has four jobs, and it helps to name them because each one fails differently:
+
+1. **Specify** the output type: a JSON Schema, a Pydantic model or a Zod schema. The schema is both an instruction to the model and a contract for your code.
+2. **Constrain** generation where the provider or engine allows it, so malformed JSON cannot be produced.
+3. **Validate** the parsed object against everything the schema could not express: ranges, cross-field rules, references to ids you actually supplied.
+4. **Recover** when validation fails: repair locally, re-ask once with the errors, or fall back to a safe default or a human queue, and record which path you took.
+
+```ts
+// The contract the rest of the code sees. Callers never touch raw text.
+type Result<T> =
+  | { ok: true; value: T; via: "direct" | "repaired" | "retried"; usage: Usage }
+  | { ok: false; reason: "refusal" | "truncated" | "invalid" | "provider_error"; raw: string; usage: Usage };
+
+interface Usage { inputTokens: number; outputTokens: number; latencyMs: number }
+
+async function typedCall<T>(
+  schema: { parse(x: unknown): T },     // Zod-like: throws on invalid
+  callModel: () => Promise<{ text: string; stop: string; usage: Usage }>,
+): Promise<Result<T>> {
+  const r = await callModel();
+  if (r.stop === "refusal") return { ok: false, reason: "refusal", raw: r.text, usage: r.usage };
+  if (r.stop === "max_tokens") return { ok: false, reason: "truncated", raw: r.text, usage: r.usage };
+  try {
+    return { ok: true, value: schema.parse(JSON.parse(r.text)), via: "direct", usage: r.usage };
+  } catch {
+    return { ok: false, reason: "invalid", raw: r.text, usage: r.usage };
+  }
+}
+```
+
+Notice what the return type forces on callers. They cannot get a `T` without checking `ok`, and the failure reasons are distinct because their fixes are distinct: a refusal will not go away if you ask again, a truncation needs a bigger `max_tokens` or a smaller output, and an invalid object may be fixable by a re-ask. The `via` field matters for observability: if 8 percent of your successes come through repair, you have a prompt or schema problem hiding behind a healthy success rate.
+
+A TypeScript signature is a compile-time promise; a model's output is a runtime claim. The wrapper is where the claim is checked. That is the mental model for the whole chapter: **the model proposes, your code disposes.** Constrained decoding makes the proposal well-formed, validation decides whether it is acceptable, and the fallback decides what happens when it is not.
+
+<Callout type="tip">
+
+Keep stop reasons in the wrapper's vocabulary. Every provider tells you why generation stopped (`end_turn`, `max_tokens`, `refusal` on Anthropic; `finish_reason` and a `refusal` field on OpenAI; `finishReason` on Gemini). A structured-output wrapper that ignores them will try to parse half an object. See [stop sequences, max tokens, finish reasons](/04-language-modeling-and-sampling/#stop-sequences-max-tokens-finish-reasons).
+
+</Callout>
+
+## JSON mode vs schema-enforced
+
+There are three levels of "give me JSON", and interviewers like to check that you know the difference.
+
+### Level 0: prompt-only
+
+You describe the format in the prompt and parse whatever comes back. Usually it complies, but nothing stops a preamble ("Sure! Here is the JSON:"), a Markdown fence, a trailing comma or an invented field name; every repo from 2023 has a `strip_fences` helper. Prompt-only remains the fallback when an endpoint offers nothing better or rejects your structured-output parameter. The old trick of *prefilling* the assistant turn with `{` is gone on newer Claude models, which reject prefill with a 400 ([prefill and steering](/12-prompting-fundamentals/#prefill-and-steering)).
+
+### Level 1: JSON mode
+
+JSON mode aims at *syntactically valid JSON*. It says nothing about which keys exist or what types their values have. On OpenAI it is `response_format: {"type": "json_object"}`, and the API requires the word "JSON" to appear somewhere in your messages so the model has been told what to write. On Gemini you set `responseMimeType: "application/json"` without a schema, and Google's docs call that a strong hint rather than a guarantee. Ollama's `format: "json"` is the local equivalent.
+
+Where it is enforced (Ollama and llama.cpp do it this way), JSON mode is constrained decoding with a generic JSON grammar: any object is allowed. So you can still get `{"total": "1,240.00 INR"}` when you wanted `{"total_amount": 1240.0, "currency": "INR"}`. You still need validation for everything.
+
+### Level 2: schema-enforced (structured outputs)
+
+Here you pass a JSON Schema and the decoder is constrained to that specific schema: the required keys appear, enum fields only take listed values, types match, and no extra keys show up when you set `additionalProperties: false`. As of late 2026 the major APIs all offer this, with different names and different subsets of JSON Schema:
+
+| Provider | How you ask | Notes (check the provider docs for the current subset) |
+|---|---|---|
+| Anthropic | `output_config: {format: {type: "json_schema", schema}}`; `strict: true` on a tool for its arguments | SDK helpers: `messages.parse()` with Pydantic or `zodOutputFormat`. No numeric or string-length constraints and no recursive schemas; sent raw they are a 400, while the SDK helpers move them into the field description and `parse()` checks them client-side. Per-request caps on optional and union-typed (nullable) parameters. Incompatible with citations and prefill. |
+| OpenAI | `response_format: {type: "json_schema", json_schema: {name, schema, strict: true}}` (Chat Completions) or `text.format` (Responses) | Strict mode wants every property listed as required and `additionalProperties: false`; optional fields become a union with `null`. A refusal comes back in a separate `refusal` field instead of the schema. |
+| Gemini | `responseMimeType: "application/json"` plus `responseJsonSchema` (plain JSON Schema, added late 2025) or the older `responseSchema` | `responseSchema` is an OpenAPI-style subset (uppercase type names, `nullable` instead of `anyOf` with null). `responseJsonSchema` takes standard JSON Schema but strips and ignores keywords its grammar cannot enforce (string lengths among them) instead of rejecting them. Gemini 2.5 and later keep schema key order. |
+| Open models | vLLM, SGLang, llama.cpp, Ollama (`format: <schema>`) | Grammar engines such as Outlines, XGrammar and llama.cpp's GBNF do the masking locally. |
+
+Three behaviours are shared and worth knowing cold:
+
+- **First-call latency.** The provider compiles your schema into a grammar the first time it sees it, then caches the compiled form (Anthropic and OpenAI both document this; Anthropic keeps it 24 hours from last use). The first request with a new schema is slower; generating a schema per request (say, with a dynamic enum of today's product ids) pays that cost every time, and on Anthropic changing the format also invalidates the prompt cache for that conversation.
+- **Refusal and truncation escape the schema.** If the model refuses for safety reasons, or hits `max_tokens` halfway through an object, the text you get back may not match. Schema-enforced does not mean "always parses"; it means "parses whenever generation completed normally".
+- **Valid is not correct.** The decoder can force `currency` to be one of `["INR", "USD", "EUR"]`. It cannot make the model pick the right one.
+
+<Callout type="interview">
+
+"How do you guarantee valid JSON?" The strong answer has three layers: schema-enforced decoding where available (removes syntax and shape errors), validation in code (catches values the schema cannot express), and a bounded recovery path with a logged fallback. Then add the caveat that refusals and `max_tokens` truncation still produce non-conforming output, so the wrapper checks the stop reason first.
+
+</Callout>
+
+JSON mode is still right for free-form objects no fixed schema describes (a map of user-defined keys). Otherwise prefer schema-enforced output: it removes a class of failures for free and makes your retry rate a measure of *semantic* errors, the ones you care about.
+
+## Constrained/grammar decoding
+
+This is the mechanism under levels 1 and 2, and a favourite interview question because it connects sampling theory to an everyday API flag.
+
+### Logits, then a mask
+
+At each decoding step the model produces a vector of logits, one per token in the vocabulary (often 100,000 to over 250,000 entries), and the sampler turns them into a probability distribution with softmax ([logits and softmax](/04-language-modeling-and-sampling/#logits-softmax)). Constrained decoding adds one step between the two: a **mask** that sets the logit of every token that would make the output invalid to negative infinity. After softmax those tokens have probability exactly zero, so the sampler cannot pick them, whatever the temperature.
+
+```text
+prefix so far:   {"label": "
+grammar says next must start one of:  pos | neg | neu
+
+token     logit    allowed?   masked logit   prob after softmax
+"pos"      2.1       yes         2.1            0.63
+"neg"      1.4       yes         1.4            0.31
+"neu"      -0.3      yes        -0.3            0.06
+"Positive" 2.8       no         -inf            0
+"I"        1.9       no         -inf            0
+...        ...       no         -inf            0
+```
+
+The highest raw logit belonged to `"Positive"`, which the schema forbids. The mask removes it and the remaining probability mass is renormalised over the legal tokens. That is the entire trick, and it is why a constrained model cannot emit an invalid enum value: the token never had a chance. Real providers have small exceptions worth knowing: Anthropic's docs say the capitalisation of string enum values is not guaranteed (`"Topic 3"` for `"topic 3"`), so compare enum values case-insensitively and never define two that differ only in case.
+
+### A toy implementation
+
+Here is the mechanism with a fake model, a tiny vocabulary and a "grammar" that is just a finite set of legal outputs. Real engines replace the set with an automaton, but the loop is the same.
+
+```python
+import math, random
+
+VOCAB = ['{"label": "', 'pos', 'neg', 'neu', 'Positive', '"}', 'I think', ' ']
+LEGAL = {'{"label": "pos"}', '{"label": "neg"}', '{"label": "neu"}'}
+
+def fake_logits(prefix: str) -> list[float]:
+    # A model that would love to chat and to say "Positive".
+    return [1.0, 2.1, 1.4, -0.3, 2.8, 1.5, 3.0, 0.5]
+
+def allowed(prefix: str, tok: str) -> bool:
+    cand = prefix + tok
+    return any(s.startswith(cand) for s in LEGAL)
+
+def constrained_generate(temperature: float = 1.0) -> str:
+    out = ""
+    while out not in LEGAL:
+        logits = fake_logits(out)
+        masked = [l if allowed(out, t) else -math.inf for t, l in zip(VOCAB, logits)]
+        m = max(masked)
+        weights = [math.exp((l - m) / temperature) for l in masked]  # exp(-inf) == 0.0
+        out += random.choices(VOCAB, weights=weights)[0]
+    return out
+
+print(constrained_generate())   # always one of the three legal strings
+```
+
+Run it a few hundred times: you will never see `I think` or `Positive`, and the label mix follows the masked, renormalised distribution.
+
+### How real engines make this fast
+
+The toy checks every token against every legal string at every step. That is fine for eight tokens and useless for 200,000. Production engines compile the schema once and precompute as much as possible:
+
+- **Regex and finite-state machines.** The Outlines paper (Willard and Louf, 2023, "Efficient Guided Generation for Large Language Models") showed how to turn a regular expression into a finite-state machine and precompute, for each FSM state, the set of vocabulary tokens that keep you on a valid path. Each decoding step becomes a table lookup plus a mask, instead of a scan of the vocabulary.
+- **Grammars need a stack.** JSON with nested objects and arrays is not regular: matching brackets at arbitrary depth needs a pushdown automaton. Engines such as llama.cpp (GBNF grammars), XGrammar (Dong et al., 2024) and the grammar backends in vLLM and SGLang handle context-free grammars. XGrammar's main idea is to split tokens into those whose validity depends only on the current automaton position (precomputed) and the minority that depend on the stack (checked at runtime), which keeps per-token overhead small.
+- **JSON Schema becomes a grammar.** The provider converts your schema into a grammar: object keys in a fixed order, enum values as alternations, `additionalProperties: false` as "no other keys". Features that are hard to express as a grammar (numeric ranges, string lengths, recursive definitions, conditional schemas) are exactly the ones providers tend not to support. JSONSchemaBench (Geng et al., 2025) measured how much real-world JSON Schema each engine covers, and coverage was far from complete.
+
+### The tokenisation wrinkle
+
+Tokens are multi-character strings that do not line up with grammar symbols. The mask must allow any token whose characters keep the output a valid prefix, including tokens that cross a grammar boundary (`",` closes a string and starts a separator). Engines handle this when precomputing; you mostly notice it as slightly different text from an unconstrained run, because some tokenisations the model preferred were masked.
+
+### What constraining costs
+
+- **Latency.** A one-off compile per new schema (longer for large schemas with many enums or deep nesting; providers cache it), then a per-token mask cost that is usually small next to the forward pass. Measure on your own schema and engine before promising a number.
+- **Quality, sometimes.** The mask changes the distribution. If the model "wanted" to say the invoice has no total and the schema demands a number, it is forced down a low-probability path and you get a confident number. Tam et al. (2024, "Let Me Speak Freely?") reported that strict format restrictions can reduce accuracy on reasoning tasks, with stricter formats hurting more, while classification-style tasks held up and sometimes improved. Give the model a legal "missing" (a nullable field), and for reasoning tasks either put a short explanation or evidence field *before* the answer fields, or let a reasoning model think first and constrain only the final object (Anthropic's grammar does not apply inside thinking blocks). On Claude, ask for "a short explanation", not "your step-by-step reasoning": the docs warn that a field requesting the model's reasoning can trigger a `reasoning_extraction` refusal.
+- **Determinism, never.** Constrained decoding constrains *shape*, not *content*.
+
+## Pydantic/Zod validation
+
+### One schema, three uses
+
+The best structured-output code defines the type once and derives everything else from it: the JSON Schema sent to the model, the runtime validator, and the static type the rest of the code uses. In Python that is Pydantic (`model_json_schema()` produces the JSON Schema); in TypeScript it is Zod (Zod 4 has `z.toJSONSchema()`, and the provider SDKs ship helpers such as Anthropic's `zodOutputFormat`). The alternative, a schema in the prompt text, a separate hand-written validator and a third set of TypeScript interfaces, drifts within a month.
+
+```python
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+class Currency(str, Enum):
+    INR = "INR"; USD = "USD"; EUR = "EUR"
+
+class LineItem(BaseModel):
+    description: str
+    quantity: Decimal = Field(gt=0)
+    unit_price: Decimal = Field(ge=0)
+    amount: Decimal = Field(ge=0)
+
+class Invoice(BaseModel):
+    invoice_number: str | None = Field(description="As printed. null if absent; never invent one.")
+    invoice_date: date | None
+    currency: Currency
+    gstin: str | None = Field(description="15-character GSTIN of the seller, or null.")
+    line_items: list[LineItem]
+    total_amount: Decimal = Field(ge=0)
+
+    @field_validator("gstin")
+    @classmethod
+    def gstin_shape(cls, v: str | None) -> str | None:
+        if v is not None and len(v) != 15:
+            raise ValueError("GSTIN must be 15 characters")
+        return v
+
+    @model_validator(mode="after")
+    def totals_add_up(self) -> "Invoice":
+        s = sum(i.amount for i in self.line_items)
+        if self.line_items and abs(s - self.total_amount) > Decimal("1.00"):
+            raise ValueError(f"line items sum to {s}, total_amount is {self.total_amount}")
+        return self
+
+schema_for_model = Invoice.model_json_schema()   # raw, strict modes reject it: no additionalProperties: false,
+                                                  # gt/ge kept. Pass Invoice to an SDK parse() helper instead.
+```
+
+Three kinds of check live here, and the distinction matters:
+
+1. **Shape checks** (types, required fields, enums). Constrained decoding already enforces these; repeating them is a cheap safety net for fallback paths and providers that silently drop unsupported keywords.
+2. **Field constraints the grammar cannot express** (`gt=0`, string length, a GSTIN pattern). Providers often strip these before compiling, so your validator is the only enforcement.
+3. **Cross-field and cross-source rules** (line items sum to the total; a cited `source_id` is one you supplied). No schema language handles these well, and they catch most real extraction errors.
+
+One detail in the generated schema: each `Decimal` field comes out as a number-or-string union, and on Anthropic every union (nullable fields included) counts toward a per-request cap. If you hit it, ask for amounts as printed strings and parse them in code, as the extraction section recommends.
+
+### Lax vs strict parsing
+
+Pydantic coerces by default (`"10"` becomes 10), which hides a model that has started emitting numbers as strings, often with junk like "1,240.00". Decide deliberately: lax plus a log line, or `strict=True`. Zod does not coerce by default (`z.coerce.number()` opts in), but `z.object` silently drops unknown keys; use `z.strictObject` if an extra key should be an error.
+
+### Errors as a repair prompt
+
+Both libraries return structured errors with a path. That path is exactly what a re-ask needs:
+
+```ts
+import { z } from "zod";
+
+const Route = z.object({
+  intent: z.enum(["billing", "bug", "feature_request", "other"]),
+  priority: z.number().int().min(1).max(4),
+  order_id: z.string().regex(/^ORD-\d{6}$/).nullable(),
+});
+
+function errorsForRepair(e: z.ZodError): string[] {
+  return e.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`);
+}
+
+const r = Route.safeParse({ intent: "refund", priority: 7, order_id: "8812" });
+if (!r.success) console.log(errorsForRepair(r.error));
+// [ 'intent: Invalid option: expected one of "billing"|"bug"|...',
+//   'priority: Too big: expected number to be <=4',
+//   'order_id: Invalid string: must match pattern ...' ]
+```
+
+### What the libraries do for you, and what they do not
+
+Instructor (Python) and the provider SDKs' `parse()` helpers wrap these steps: derive the schema, send it, validate, and in Instructor's case re-ask with the errors up to `max_retries` times. They do not choose your fallback, log per-field failures or know that a refusal should not be retried. Read their retry defaults: a generous one is a cost multiplier you did not choose.
+
+## Retry and repair loops
+
+### Classify the failure first
+
+"Retry on failure" is the weak answer. Different failures need different responses, and blindly re-sending the same prompt fixes only the random ones.
+
+| Failure | Typical cause | Right response |
+|---|---|---|
+| Not parseable | fences, preamble, trailing commas (prompt-only or JSON mode) | local repair: strip fences, extract the outermost object, a JSON-repair library; no model call |
+| Truncated (`max_tokens`) | output longer than the budget | raise `max_tokens`, shrink the schema, or split the task; re-asking the same thing truncates again |
+| Refusal | safety classifier or model policy | do not re-ask with the same input; route to fallback and log the category |
+| Schema-invalid | wrong field names or types (no enforcement) | re-ask once with the error list |
+| Semantically invalid | a value fails a validator or cross-check | re-ask once with the specific violation and the evidence; or escalate to a stronger model |
+| Provider error (429, 5xx, timeout) | infrastructure | retry with backoff; this is transport, not repair |
+
+### The repair ladder
+
+```python
+import json, re
+from pydantic import BaseModel, ValidationError
+
+def local_repair(text: str) -> str:
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    start, end = t.find("{"), t.rfind("}")
+    return t[start:end + 1] if start != -1 and end > start else t
+
+def extract(doc: str, model: type[BaseModel], llm, max_reasks: int = 1):
+    """llm(messages) -> (text, stop_reason, usage). Mock it in tests."""
+    messages = [{"role": "user", "content": f"Extract the fields.\n<doc>\n{doc}\n</doc>"}]
+    attempts = []
+    for attempt in range(max_reasks + 1):
+        text, stop, usage = llm(messages)
+        attempts.append({"stop": stop, "usage": usage})
+        if stop == "refusal":
+            return {"status": "refused", "attempts": attempts}
+        if stop == "max_tokens":
+            return {"status": "truncated", "attempts": attempts}
+        fixed = local_repair(text)
+        try:
+            obj = model.model_validate_json(fixed)
+            via = "retried" if attempt else ("repaired" if fixed != text.strip() else "direct")
+            return {"status": "ok", "value": obj, "via": via, "attempts": attempts}
+        except ValidationError as e:
+            errs = [f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()]
+            messages += [{"role": "assistant", "content": text},
+                         {"role": "user", "content": "Your JSON failed validation:\n- " + "\n- ".join(errs)
+                          + "\nReturn the corrected JSON only. Use null for a field that is not in the document."}]
+    return {"status": "invalid", "errors": errs, "attempts": attempts}
+```
+
+The design choices, each of which an interviewer may poke at:
+
+- **Bounded.** One re-ask is usually right. If the information is not in the document, the second answer is a different wrong guess. Measure second-attempt success; if it is low, the extra call is pure cost.
+- **Specific feedback.** "Invalid, try again" teaches nothing; `line_items.2.amount: must be >= 0` or "line items sum to 1,180, total is 1,240" gives the model something to fix.
+- **A permitted way out.** The re-ask says `null` is legal. Without it, pressure to "fix" a missing value produces a fabricated one.
+- **Change something.** If the same prompt will reproduce the failure, change the input: show the bad output, name the rule, raise the temperature (where the model still accepts sampling parameters; current Claude models do not), or escalate to a stronger model.
+- **An honest fallback.** End with a typed failure, never a plausible default. A pipeline that stores `{"score": 5, "band": "average"}` when parsing failed has made a failure indistinguishable from a real result.
+
+### What retries cost
+
+With one re-ask and a first-attempt failure rate `p`, expected calls per item are `1 + p`. The re-ask is also more expensive than the first call, because it carries the original prompt plus the bad output plus the error list. Worked example: a first call of 3,000 input and 400 output tokens; the re-ask has 3,000 + 400 + 150 = 3,550 input tokens and 400 output. At `p = 0.08`:
+
+```text
+expected input  = 3,000 + 0.08 x 3,550 = 3,284 tokens   (+9.5%)
+expected output =   400 + 0.08 x   400 =   432 tokens   (+8%)
+p95 latency: if more than 5% of items retry, p95 now includes two sequential calls.
+```
+
+Cost rises by about `p`; tail latency can double. That is why retry rate is a first-class metric, and why moving from prompt-only to schema-enforced output often pays for itself: it removes the syntax and shape share of `p` entirely.
+
+<Callout type="warn">
+
+Watch for retries hiding inside retries. The provider SDK retries 429s and 5xx (often twice by default), your adapter may retry timeouts and unparseable output, and the repair loop re-asks on validation errors. Three layers of "just one more" can turn one logical call into nine billed ones during an incident. Put one owner on each layer and log every attempt with the same request id.
+
+</Callout>
+
+## Extraction and classification patterns
+
+Structured output earns most of its keep in two task families: extraction (pull fields out of a document) and classification (assign labels from a closed set). Each has a handful of patterns that separate a demo from a system.
+
+### Extraction: null over guess, evidence over trust
+
+- **Make "absent" representable.** Every possibly-missing field is nullable, described as "null if not printed; never infer". A schema that forbids null forces a guess.
+- **Ask for evidence and check it in code.** An `evidence` string per important field (the exact source text), verified as a substring of the document. This catches the most dangerous error, a fluent invented value, in microseconds.
+- **Normalise in code.** Ask for the value as printed (`"12/03/2026"`, `"Rs 1,240.00"`) and parse dates and amounts in code where locale rules are explicit. A model guessing whether `12/03` is December or March is an error you chose.
+- **Classify, then extract.** A small document-type step (invoice, credit note, not-an-invoice) then a type-specific schema beats one giant schema of optional fields, and gives junk uploads a clean reject path.
+- **Long documents.** Extract per page or section into the same schema and merge in code with explicit, testable rules (header from page 1, line items concatenated, totals from the last page).
+
+```python
+def verify_evidence(source: str, fields: dict[str, dict]) -> list[str]:
+    """fields: {"invoice_number": {"value": "INV-881", "evidence": "Invoice No: INV-881"}, ...}"""
+    norm = lambda s: " ".join(s.split()).lower()
+    src = norm(source)
+    problems = []
+    for name, f in fields.items():
+        if f.get("value") is None:
+            continue
+        ev = f.get("evidence") or ""
+        if not ev or norm(ev) not in src:
+            problems.append(f"{name}: evidence not found in document")
+        elif norm(str(f["value"])) not in norm(ev):
+            problems.append(f"{name}: value does not appear in its own evidence")
+    return problems
+```
+
+### Classification: closed sets with an escape hatch
+
+- **Enum plus `other`.** An enum without an escape hatch forces every out-of-distribution input into the nearest wrong class. Add `other` (and log what lands there; it is your backlog of missing classes).
+- **Definitions in the schema.** Put a one-line definition of every class, with a "not this" line for the confusable pairs, in the field description. The model reads descriptions as instructions.
+- **Multi-label is an array of enums**, with an explicit rule about whether it can be empty.
+- **Rationale before label, if anything.** If you want a reason, put the `reason` field before `label` in the schema. Generation is left to right, so a reason written after the label is a justification of a choice already made.
+- **Confidence: do not trust the number the model writes.** A `confidence: 0.92` field is a generated token, not a calibrated probability. Better signals: token log-probabilities of the label (where the API exposes them, see [log-probs as signal](/04-language-modeling-and-sampling/#log-probs-as-signal)), agreement across a few samples, or a calibration table built from your labelled set.
+
+### Batching items into one call
+
+Classifying 50 short tickets in one call with an array schema is cheaper (one copy of the instructions) and faster in aggregate. The costs: one bad item can corrupt the array (misaligned ids), errors correlate across items, and one truncation loses everything after the cut. If you batch, give each item an id, require the output to echo it, and check in code that the id sets match.
+
+## Schema design (enums, nullables)
+
+The schema is a prompt the model reads token by token *and* a grammar it is held to. Design it for both.
+
+### Rules that pay off
+
+- **Closed sets are enums.** The decoder then enforces them, and a hallucinated value becomes impossible rather than something you catch later (modulo the casing caveat above). Integers too: a 1-to-4 priority is better as `enum: [1, 2, 3, 4]` than `type: integer` with a `minimum`/`maximum` your provider may strip before compiling.
+- **Nullable vs optional.** Optional means the key may be absent; nullable means it is present and may be null. OpenAI's strict mode wants every key required, so model "may be missing" as required-and-nullable. The model then decides explicitly for every field, and your code never has to tell "forgot" from "absent". Budget it, though: a nullable field is a union type, and Anthropic caps union-typed parameters (16) and optional ones (24) across all strict schemas in one request, so make only the fields that can really be absent nullable.
+- **Descriptions are instructions.** "Seller GSTIN, 15 characters, as printed; null if absent" sits next to the field as the model writes it, which beats prose in the system prompt.
+- **Ids, not free text, for references.** Give each supplied source, product or chunk an integer id and ask for ids, so code can verify the reference.
+- **Flat beats deep.** Nesting is another chance to misplace a field, and strict modes cap size: OpenAI allows up to 10 levels of nesting and 5,000 properties, and Anthropic returns "Schema is too complex for compilation" past its internal grammar limits. Past three levels, consider two calls.
+- **Units in their own fields.** `amount: 1240.0, currency: "INR"`, never `amount: "Rs 1,240"`.
+- **Order fields the way you want the model to think.** Context first, evidence before values, reasoning before verdicts. Providers generally emit keys in schema order (OpenAI and Gemini 2.5+ say so; Anthropic keeps schema order but puts required keys before optional ones), so order is a free lever on what the model has written before it commits to a verdict.
+- **Discriminated unions for "one of several shapes".** A `kind` field with a `const` per variant is easier for the model and your validator than a bag of optional fields.
+
+Keep out of the schema what neither grammar nor model does reliably: exact counts, arithmetic, uniqueness across items. Put those in validators. Avoid huge dynamic enums (thousands of SKUs): they bloat the prompt, slow grammar compilation and change every deploy. Retrieve candidates first and give the model a short enum of ids.
+
+### Schema drift
+
+A schema is an API between a prompt, a model and every consumer of the stored objects; renaming `total` to `total_amount` silently breaks dashboards and old rows. Version it like an API: `schema_version` in every stored object, additive changes by default, a migration for breaking ones, and an eval run on every schema change, because a renamed or re-described field changes model behaviour. Drift also happens without you, when a provider changes its supported subset or a model upgrade changes how a field gets filled. Per-field metrics are how you notice.
+
+## Streaming partial structures
+
+### Why stream an object at all
+
+Streaming exists for perceived latency ([TTFT](/10-inference-mechanics/#ttft-tpot-itl-throughput)). A background extraction job gains nothing: it needs the whole object to validate. It matters when a user is watching: a form filling field by field, plan steps appearing as written, a reply field shown while metadata is still generating.
+
+### The mechanism
+
+The stream delivers text deltas of a JSON document. At any moment you hold a *prefix* of valid JSON, which `JSON.parse` rejects. A partial parser closes what is open (an unterminated string, missing brackets) and parses the result, giving a best-effort object that grows over time:
+
+```python
+import json
+
+def owed(s: str) -> tuple[str, bool]:
+    """Closing brackets a JSON prefix still owes, and whether it ends inside a string."""
+    stack, in_str, esc = [], False, False
+    for ch in s:
+        if in_str:
+            if esc: esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"': in_str = False
+        elif ch == '"': in_str = True
+        elif ch in "{[": stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack: stack.pop()
+    return "".join(reversed(stack)), in_str
+
+def parse_partial(prefix: str):
+    """Best-effort parse of a JSON prefix. Returns None if nothing usable yet."""
+    cand = prefix
+    for _ in range(4):                      # trim a dangling key or literal, then retry
+        closers, in_str = owed(cand)
+        body = cand + '"' if in_str else cand.rstrip().rstrip(",:")
+        try:
+            return json.loads(body + closers)
+        except json.JSONDecodeError:
+            cut = max(cand.rfind(","), cand.rfind("{"), cand.rfind("["))
+            if cut < 0: return None
+            cand = cand[: cut + (1 if cand[cut] in "{[" else 0)]
+    return None
+
+for p in ['{"title": "Rent', '{"title": "Rent", "items": [{"amt": 12', '{"title": "Rent", "items": [{"amt": 1200}], "to']:
+    print(parse_partial(p))
+```
+
+Libraries do this for you: `pydantic_core.from_json(..., allow_partial=True)`, the partial-JSON parsers inside the provider SDKs' streaming helpers, and object-streaming helpers in frameworks such as the Vercel AI SDK.
+
+### The traps
+
+- **A partial object is not validated.** `12` on its way to `1200` is not a value. Display partial *strings*; act only on fields that are complete (a later key has started, or the stream ended).
+- **Validate at the end, always,** through the same validator and repair path. If validation fails after the user saw the text, you need a "that was wrong" UX ([error and refusal UX](/34-product-ux-and-feedback/#error-and-refusal-ux)).
+- **Order fields for streaming.** If the displayed text is the last field, the user waits for all the metadata first.
+- **Re-parsing the whole prefix on every delta is quadratic.** Parse every N deltas, or use an incremental parser.
+
+## Structured output vs tool calling
+
+A tool call is structured output the model emits *to ask your code to do something*: the arguments object fills a schema, and with strict mode on it is produced by the same constrained decoding. The difference is the round trip, not the JSON. [Chapter 21](/21-tool-use/#call-protocol) covers the call protocol, tool choice modes and argument validation; here is the decision in one place.
+
+| Use structured output when | Use a tool call when |
+|---|---|
+| The object *is* the answer: an extraction, a label, a typed plan, a grade | The model needs information or an action *before* it can finish |
+| One call, no side effects | Your code must run something and send the result back |
+| You always want exactly this shape | The model should decide whether, and which, function to call |
+
+Before native structured outputs, the standard way to get JSON was to define one tool, *force* the model to call it and read the arguments. Some newer models (Anthropic's Opus 5.5 and Sonnet 5.5, for example) reject forced tool choice with a 400, so use native structured outputs instead ([tool choice modes](/21-tool-use/#tool-choice-modes)). Dex Horthy's "12-Factor Agents" (2025) puts the link well: tools are structured outputs that your deterministic code decides how to execute, and an agent loop is a structured-output call in a `while` loop with a `switch` on the result.
+
+## Evaluating structured output
+
+"It returns valid JSON" is a property of the decoder. Whether the feature works is a property of the values, measured field by field on labelled data. This section is the structured-output slice of [chapter 19](/19-evals-methodology/#exact-functional-reference-metrics) and [tool-call and structured evals](/20-evals-judges-and-ci/#tool-call-and-structured-evals).
+
+### Three levels of metric
+
+1. **Format metrics** (cheap, always on, from production logs): schema-valid rate on the first attempt, repair rate, re-ask rate, refusal rate, truncation rate. These tell you whether the plumbing works.
+2. **Field metrics** (need labels): per-field accuracy against a gold set, with a comparison rule per field.
+3. **Record metrics** (need labels): the share of documents where *every* field is right, or every *critical* field. This is what an accuracy SLA is usually about, and it is much lower than the average field accuracy: ten independent fields at 98 percent each give about 0.98^10 ≈ 82 percent of fully correct records.
+
+### Comparing a field
+
+Each field type needs its own equality rule, decided before you look at results:
+
+- **Exact after normalisation** for ids, enums, dates (parse both to ISO), amounts (Decimal, tolerance of 0.01 or 1 rupee as the business says).
+- **Fuzzy** for free-text names: normalised string similarity above a threshold, or an LLM judge for genuinely semantic fields, validated against human labels.
+- **Set comparison** for lists (line items, tags): match items, then precision and recall over matched items.
+
+### The null matrix
+
+Nullable fields need a confusion matrix, because the two kinds of error have very different costs:
+
+```text
+                     gold has a value          gold is null
+pred has a value     correct / wrong value     HALLUCINATION (false positive)
+pred is null         MISS (false negative)     correct abstain
+```
+
+Report, per field: accuracy when both are non-null, hallucination rate (predicted a value where none exists) and miss rate. For most extraction tasks a hallucinated GSTIN is far worse than a missing one, which you can route to review. If you only report "field accuracy" you will reward a model that guesses.
+
+```python
+from collections import defaultdict
+
+def field_report(golds: list[dict], preds: list[dict], eq) -> dict:
+    """eq: {field_name: callable(gold, pred) -> bool}"""
+    c = defaultdict(lambda: defaultdict(int))
+    for g, p in zip(golds, preds):
+        for f, same in eq.items():
+            gv, pv = g.get(f), p.get(f)
+            if gv is None and pv is None: c[f]["abstain_ok"] += 1
+            elif gv is None:              c[f]["hallucinated"] += 1
+            elif pv is None:              c[f]["missed"] += 1
+            elif same(gv, pv):            c[f]["correct"] += 1
+            else:                         c[f]["wrong_value"] += 1
+    return {f: {**v, "n": sum(v.values()),
+                "accuracy": (v["correct"] + v["abstain_ok"]) / max(1, sum(v.values()))}
+            for f, v in c.items()}
+```
+
+### Sample sizes and slices
+
+With 50 labelled documents, a field at 90 percent has a 95 percent confidence interval of roughly plus or minus 8 points (normal approximation: 1.96 × √(0.9 × 0.1 / 50) ≈ 0.083). That is enough to catch a broken field, not to tell 92 from 94 percent. Grow the set where decisions are close, and slice by what varies in production: document source, language, scan quality, layout template. Averages hide the vendor whose invoices fail every time.
+
+### In production
+
+Labels are scarce after launch, so use proxies: validator failures per field, the rate at which reviewers edit each field (the best signal you will get), evidence-check failures, and drift in enum distributions. Log validation failures *by field path*: "`invoice_date` fails on one vendor's template" is actionable; "4 percent of calls fail validation" is not.
+
+<Production>
+
+**Failure modes.** The worst is valid JSON with wrong values: it passes every format check and lands in your database looking real. Then: hallucinated enum values on paths without enforcement (fallbacks, older models), invented values for fields that should be null, misaligned items in batched arrays, truncated objects, refusals arriving as text, and schema drift, where a renamed field or a model upgrade silently changes what consumers read. In code review, hunt for `except: return DEFAULT` around a parse: it turns failures into fake results.
+
+**Cost.** Expected cost is roughly `(1 + p) ×` base with one re-ask, and the re-ask carries the bad output and errors as extra input. Escalating to a larger model multiplies that item's cost by the price ratio. Key names and evidence fields cost output tokens on every call; measure whether they pay. Schema-enforced output also adds input tokens: Anthropic injects a system prompt describing the format. Batch APIs (roughly half price at the major providers; check the current price page) suit offline extraction.
+
+**Latency.** Schema compilation on first use (cached; per-request dynamic schemas pay it every time), a small per-token masking cost, and retries in series, which set your p95 and p99. Streaming gives early pixels, not early *validated* values.
+
+**Observability.** Log per call: schema name and version, model, stop reason, path taken (direct, repaired, re-asked, fallback), validation errors by field path, tokens per attempt, and one request id across retries. Dashboard first-attempt valid rate, re-ask and fallback rates, and per-field reviewer edit rate. Alert on changes: a jump in `other` or in a field's null rate usually means an upstream change.
+
+**Security.** Model JSON is untrusted input, like a form post, and more so when the source document is attacker-controlled. A field can carry SQL, a shell fragment, a `../` path, an internal URL, or Markdown that exfiltrates data when rendered: use parameterised queries, never interpolate into shell commands, allow-list URLs and paths, escape on render. Injection inside a document can steer values (`"approved": true`); no extracted field should grant permissions or money without a deterministic check or a human ([indirect injection](/33-security-prompt-injection/#indirect-injection)).
+
+</Production>
+
+<Interview>
+
+<Q q="How do you guarantee valid JSON from an LLM?">
+
+- Separate *syntactically valid*, *schema-valid* and *correct*. Only the first two can be guaranteed; the third is measured.
+- Use schema-enforced output (Anthropic `output_config.format`, OpenAI `json_schema` with `strict`, Gemini `responseJsonSchema`, or a grammar engine locally). It removes syntax and shape errors because invalid tokens are masked during decoding.
+- JSON mode alone guarantees parseable JSON, not your keys or types.
+- Check the stop reason before parsing: `max_tokens` truncation and refusals still produce non-conforming text.
+- Validate with Pydantic or Zod for what the grammar cannot express (ranges, cross-field sums, references to supplied ids), then one bounded re-ask with the error list, then a typed failure or human queue.
+- Number to quote: expected calls = `1 + p` per item with one re-ask; track first-attempt valid rate and re-ask rate.
+- **The trap:** "tell it to return only JSON and retry until it parses", or claiming structured outputs make the values correct.
+
+</Q>
+
+<Q q="How does constrained decoding work?">
+
+- At each step the model emits logits over the whole vocabulary; a mask sets every token that would break the grammar to negative infinity before softmax, so its probability is exactly zero.
+- The schema is compiled into an automaton: an FSM for regular patterns (Outlines, Willard and Louf 2023), a pushdown automaton for nested JSON (llama.cpp GBNF, XGrammar).
+- Speed comes from precomputing, per automaton state, which tokens are legal, so each step is a lookup instead of a vocabulary scan; XGrammar precomputes the context-independent tokens and checks only the stack-dependent ones at runtime.
+- Costs: one-off compile per schema (providers cache it), small per-token overhead, and multi-character tokens that cross grammar boundaries need care.
+- It changes the distribution: forcing a value where the model would have declined yields confident wrong values, and strict formats can hurt reasoning on some tasks (Tam et al. 2024). Mitigate with nullable fields and reasoning-before-answer ordering.
+- **The trap:** "it validates the output and retries" (that is a repair loop, not constrained decoding), or "it makes the model deterministic".
+
+</Q>
+
+<Q q="Design a document-extraction pipeline for 1M invoices/month, with accuracy SLAs.">
+
+- **Scope and SLOs.** 1M a month is about 33,000 a day, roughly 0.4 per second on average with business-hour peaks perhaps 5 to 10 times higher. Agree the SLA per *critical* field (total, GSTIN, invoice number, date), for example 99 percent on auto-accepted records, plus a turnaround (hours, not seconds), which permits batch processing.
+- **Architecture.** Ingest to object storage, then a queue. OCR or native PDF text, then a cheap document-type classifier (invoice, credit note, not-an-invoice), then type-specific extraction with a Pydantic schema under schema-enforced decoding, with per-field evidence.
+- **Validation.** Evidence substring checks, line items sum to the total, GSTIN checksum, date sanity, vendor matched against the master list. One re-ask with the violations, then route to human review.
+- **Confidence routing.** Auto-accept only when every critical field passes the deterministic checks; everything else goes to a review UI that shows the evidence. Budget the queue: 5 percent review at 1 minute each is 50,000 minutes, about 830 hours a month.
+- **Cost.** Per document `in × p_in + out × p_out`. Illustratively, 5,500 input and 400 output tokens at $1 and $5 per million is $0.0075 a document, about $7,500 a month before retries; Batch APIs roughly halve it. Use real prices from the current price page.
+- **Evals and observability.** A labelled set stratified by vendor and template; per-field accuracy with the null matrix; record-level all-critical-fields-correct; reviewer edits feed back into the set. Log validator failures by field and vendor; alert on drift.
+- **Security.** Invoices are attacker-controlled input: injection can steer fields, so no auto-payment without deterministic checks; parameterised writes.
+- **The trap:** one big prompt, average field accuracy as the SLA, and no review path.
+
+</Q>
+
+<Q q="How do you evaluate field-level extraction accuracy?">
+
+- Build a labelled gold set (start with 50 to 200 documents, stratified by source and layout), with a written comparison rule per field: exact after normalisation, numeric tolerance, fuzzy match, set match for lists.
+- Report per field: accuracy, hallucination rate (value predicted where gold is null) and miss rate (null predicted where gold has a value). They have different costs.
+- Report record-level accuracy too: ten fields at 98 percent give about 82 percent fully correct records.
+- Slice by vendor, language and scan quality; give confidence intervals (50 docs at 90 percent is roughly plus or minus 8 points).
+- Separately track format metrics: first-attempt valid rate, re-ask and fallback rates.
+- In production, reviewer edit rate per field is the best label proxy.
+- **The trap:** one overall accuracy number, or counting null-vs-null as "not applicable" and dropping it, which hides hallucinations.
+
+</Q>
+
+<Q q="Does forcing JSON output make the model worse at the task?">
+
+- It can. Constrained decoding renormalises over legal tokens, so if the model's preferred continuation is illegal it takes a less likely path.
+- Evidence: Tam et al. (2024) found strict format restrictions reduced accuracy on some reasoning tasks while classification held up or improved.
+- Mitigations: put a short explanation or evidence field before the answer fields (keys are generated in order; on Claude, a field that asks for step-by-step reasoning can draw a `reasoning_extraction` refusal); let a reasoning model think before the constrained final object; make "unknown" legal with nullable fields or an `other` enum.
+- Measure it on your eval set: constrained vs unconstrained-plus-parse, same prompt.
+- **The trap:** "no, it only affects formatting", or avoiding structured output altogether and parsing free text.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+Build a typed extractor with a repair loop and per-field metrics in **Answer Grader** (`~/answer-grader`), where the vision step (`backend/vision.py`) already extracts `question`, `marks` and `word_limit` from answer sheets with the schema written only as an example in the prompt. Everything runs offline with **Ollama** (a small instruct model such as `qwen2.5:3b`, which Scheme Assistant already uses locally) using Ollama's `format` parameter for schema-constrained decoding, plus a mock LLM for the tests.
+
+1. **Data.** Collect 50 question headers as text, the part of a transcription that carries the question and its "(150 words) 10" style markers. Include Hindi-only and bilingual ones and a few with no marks or word limit printed. Label each by hand in `eval/question_header_gold.jsonl`: `question`, `marks`, `word_limit` (nullable integers), and `is_question` (false for junk).
+2. **Schema.** Write a Pydantic model `QuestionHeader` in the backend with nullable `marks` and `word_limit`, a field description that says "null if not printed; never infer from answer length", an `evidence` string per numeric field, and validators: `marks` in an allowed set (an enum, not a range), `word_limit` in an allowed set, and evidence that is a substring of the input.
+3. **Constrained call.** Send `QuestionHeader.model_json_schema()` as Ollama's `format`, at temperature 0, and parse with `model_validate_json`.
+4. **Repair loop.** Implement the ladder from this chapter: local repair, one re-ask with the Pydantic error paths, then a typed failure. Never return a default object. Unit-test it with a mock LLM function that returns, in turn, fenced JSON, an out-of-set `marks`, fabricated evidence and a refusal, and assert the path taken for each.
+5. **Metrics.** Write `eval/score_question_header.py` that prints, per field, accuracy, hallucination rate and miss rate (the null matrix), record-level accuracy, and first-attempt valid, re-ask and failure rates.
+6. **One experiment.** Run it twice: with the schema as it is, and with the evidence fields removed. Record both tables in a short note next to the script.
+
+**Definition of done:** `pytest` passes for the repair-loop tests with the mock LLM; the scoring script runs end to end on the 50 labelled headers with the local model and prints the per-field table; the note states which configuration has the lower hallucination rate on `marks` and `word_limit`, with the counts.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Chat Insights has the full ladder, and you can walk an interviewer through it file by file.** `backend/src/lc/services/llm/schema.js` defines `REPLY_JSON_SCHEMA` (six required fields, `additionalProperties: false`) and a shared `validateReply`. `anthropic.js` sends it as `output_config.format`, re-sends with a JSON-only system line if the API rejects `output_config`, and throws on a `refusal` stop reason. `parse.js` tries a direct parse, then a balanced-brace scan, and records `parse_via`. `chatService.js` runs the deterministic guard (`domain/guard.js`), re-asks exactly once with "REVISION REQUIRED" and the violation list (with a different angle and a higher temperature when the failure was a verbatim repeat; the temperature only reaches Gemini, since `anthropic.js` never sends sampling parameters), and falls back to a rung-aware template, recording `guard.action` and `degraded`.
+- **Name Chat Insights's schema gap honestly.** `rung` is `type: integer`, so its 1 to 4 range is only checked after parsing. Anthropic's grammar does not support `minimum`/`maximum`, so `enum: [1, 2, 3, 4]` is the change that lets the decoder enforce it. The legacy path in `backend/src/services/llm.js` still scrapes JSON between the first `[` and the last `]` and returns `[]` silently on failure: the "before" picture.
+- **Memory Agent shows schema-as-single-source in TypeScript.** `src/planner.ts` defines the `Plan` Zod schema whose `.describe()` strings are the model's instructions, calls `messages.parse` with `zodOutputFormat(Plan)`, throws when `parsed_output` is null, and `src/agent.ts` falls back to `fallbackPlan` (search) on any non-auth failure. `src/claims.ts` is an extraction pass with `source_id` as an integer reference you can resolve in code, the "ids, not free text" rule.
+- **Answer Grader is your JSON-mode-vs-schema story, and your best fallback story.** `backend/llm.py` (`generate_json`) uses OpenAI and OpenRouter `response_format: {"type": "json_object"}`, Gemini's JSON MIME type, then `_strip_fences` and `json.loads`, returning `None` on a parse failure: valid JSON, no schema. `backend/vision.py` keeps the schema in the prompt (with good nullable `marks`/`word_limit` and an `is_answer_sheet` gate) but validates by hand. `backend/evaluation.py` raises `EvaluationUnavailable` on unparseable output instead of storing a fake 5/10: a production bug you found and fixed, which is a strong interview anecdote. `backend/model_answer.py` retries once with the word-count miss stated in numbers and keeps the better attempt.
+- **Scheme Assistant shows constrained decoding across providers.** `src/app/core/llm.py` hand-writes a Gemini `responseSchema` (with a comment on the OpenAPI subset: no `$ref`, `nullable` instead of `anyOf`), passes the Pydantic model's JSON Schema as Ollama's `format` for local runs, parses with `model_validate_json` at temperature 0, and has an optional one-field `repair` call when the gate rejects a reply. Worth saying in an interview: Gemini now also takes plain JSON Schema through `responseJsonSchema`, which would let the Gemini path send the same Pydantic schema as the Ollama path instead of a hand-written copy.
+- **Gaps to close.** None of the repos measures per-field extraction accuracy against labels (the Apply-it builds it in Answer Grader), none streams partial structures (Answer Grader waits for the whole response, which is fine for a background job), and none logs validation failures by field path in a form you could dashboard.
+
+</YourProject>

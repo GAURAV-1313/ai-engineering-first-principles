@@ -1,0 +1,13 @@
+---
+import { slugify } from '../plugins/rehype-sections.mjs';
+import { inlineMd } from '../lib/inline-md';
+interface Props { q: string; reported?: boolean }
+const { q, reported = false } = Astro.props;
+---
+<details class="q" data-q-key={slugify(q).slice(0, 80)}>
+  <summary class="q-sum"><span class="q-n"></span><span set:html={inlineMd(q)} />{reported ? <span class="q-tag" title="Reported in real interviews or practitioner write-ups">reported</span> : <span></span>}</summary>
+  <div class="q-body">
+    <slot />
+    <label class="q-check"><input type="checkbox" data-q-known /> I can answer this without notes</label>
+  </div>
+</details>

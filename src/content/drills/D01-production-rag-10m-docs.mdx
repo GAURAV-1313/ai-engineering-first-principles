@@ -1,0 +1,143 @@
+---
+id: "D01"
+title: "Production RAG over 10M documents at 1K QPS"
+prompt: "Design a question-answering system over 10 million internal documents that serves 1,000 queries per second at peak, with cited answers. Walk me through the architecture, the numbers and how you know it works."
+sections: ["15.09", "15.10", "16.03", "16.09", "17.04", "17.11", "31.03"]
+minutes: 45
+---
+
+The most reported LLM design prompt. The interviewer wants scoping before drawing, hybrid retrieval, reranking and an abstain path without prompting, and index and token sizing on the whiteboard. The trap is "vector DB plus GPT" with no numbers.
+
+## Clarify and scope
+
+Spend five minutes asking, then write the assumptions where the interviewer can see them.
+
+- **What are the documents?** Formats, scans, length, languages, tables. Assume 2,000 tokens on average, mostly text PDFs and HTML, English plus some Hindi.
+- **Who asks, and what may they see?** Assume employees with document-level ACLs. This shapes the index: permissions are enforced inside retrieval, not after generation.
+- **How fresh?** Assume about 1% of documents change per day and a new version must be answerable within 15 minutes.
+- **Is 1K QPS peak or average?** Assume 1K peak and 400 average. That changes the daily token bill by 2.5×.
+- **What does "correct" mean?** Answers must cite the passages they use, and the system must say "I could not find this" rather than guess.
+- **SLOs.** p95 time to first token around 1.5 s, streaming after that. Availability 99.9%.
+
+Out of scope for v1: multi-hop research, actions, chat memory beyond condensing the last turn.
+
+## Baseline architecture
+
+Two pipelines share storage. The offline path turns documents into searchable chunks; the online path turns a question into a cited answer inside the latency budget.
+
+```text
+OFFLINE (event driven)
+ doc change ─► queue ─► worker: fetch+hash ─► parse/OCR ─► chunk (structure-aware)
+                         ─► enrich (title/heading prefix) ─► embed (pinned model id)
+                         ─► upsert by content hash ─► [chunk store | ANN index | BM25 index]
+
+ONLINE (per query, p95 TTFT ~1.5 s)
+ question ─► auth + rate limit ─► route (small talk / out of scope / RAG)
+          ─► condense with last turn ─► embed query
+          ─► ┌ dense top-50 (HNSW, ACL filter in query) ┐
+             └ BM25 top-50   (ACL filter in query)     ┘ ─► RRF fuse
+          ─► cross-encoder rerank 40 → 6 ─► abstain gate (score floor)
+          ─► prompt: static rules (cached) + numbered passages + question
+          ─► LLM, structured {claims:[{text, passage_ids}]} ─► stream
+          ─► verify citations and numbers ─► answer + sources ─► trace
+```
+
+Each box earns its place. The router keeps greetings off the retrieval path. Condensing makes "and for contractors?" standalone, since the retriever cannot see history. BM25 catches policy numbers and product codes that vectors blur; RRF fuses by rank, sidestepping incompatible score scales. The reranker reads query and passage together, precise but only affordable on a few dozen candidates. The abstain gate skips the LLM call when nothing relevant came back, and verification drops claims citing passages never shown. The [RAG pipelines chapter](/17-rag-pipelines/#architecture-end-to-end) has this path as runnable Python.
+
+## Key choices and trade-offs
+
+**Chunking.** Structure-aware chunks of roughly 300 to 500 tokens, split on headings and sections, tables kept whole, each chunk prefixed with document title and heading path. Index small, hand the model the parent section when a chunk is too thin. See [chunking](/17-rag-pipelines/#chunking).
+
+**Embedding model.** A multilingual model around 1,024 dimensions, chosen by recall on our labelled queries, not a leaderboard. Store the model id on every chunk: two models can emit same-width vectors, and mixing them fails silently. A model change is a full re-embed into a new index behind an alias.
+
+**Vector index.** HNSW for low-latency high recall, with int8 or binary-quantized vectors in RAM and full-precision vectors on SSD to rescore the top 100. IVF-PQ if RAM is the constraint and lower recall is acceptable. Name requirements, not a vendor: filtered search, upserts and deletes, shards and replicas.
+
+**Filtering.** ACL and document status filters must run inside the ANN search. Post-filtering a top-50 can leave nothing for a user who can see little, and the ANN never looks further. Use filtered search, or partition when tenants are few and large.
+
+**Hybrid is the default, but measure it.** BM25 usually rescues identifier queries; on some corpora it hurts. Keep the fusion weight in config and let eval recall decide.
+
+**Generator.** A mid-size model, schema-enforced output, temperature 0, with easy queries routed to a smaller model. No fine-tuning: RAG holds the facts.
+
+<Callout type="interview">
+Name the order of failure when an answer is wrong: did the right chunk get retrieved (recall), did it survive reranking into the prompt, did the model use it, and was the source itself current? Debug in that order, from the trace, before touching the prompt.
+</Callout>
+
+## Evals
+
+Build the eval set before tuning anything.
+
+- **Golden set.** 300 to 500 real questions from logs or pilot users, stratified by team, language and type, 10 to 15% with no answer in the corpus. Label chunks pooled blind from several retrieval variants.
+- **Retrieval metrics.** Recall@50 for the first stage, hit@6 and nDCG@6 after reranking. Recall is the ceiling: a reranker cannot recover what was never retrieved.
+- **Generation metrics.** Faithfulness, citation precision, correctness against a reference, and abstain precision and recall on the no-answer slice. Code checks first; an LLM judge from another model family for the rest, calibrated on about 100 human labels.
+- **Gates.** Any change to chunking, embeddings, fusion, reranker, prompt or model reruns the suite in CI and blocks on regression beyond noise (run twice to see the noise).
+- **Online.** Judge-score 1% of production traces; track thumbs-down, abstain and no-citation rates daily.
+
+## Guardrails and fallbacks
+
+- **Permissions** enforced in the query, never by asking the model to hide things.
+- **Abstain gate.** Best rerank score below a floor calibrated on the no-answer slice: say "not found" and show the closest documents.
+- **Citation and number check.** Drop any claim whose ids are not in the passages shown; flag numbers that do not appear in the cited text.
+- **Indexed text is untrusted.** Wrap passages as data, give the generator no tools, and escape output so injected links or images cannot exfiltrate anything.
+- **Degradation ladder.** Reranker down: fused results, stricter floor. LLM down: second provider, then top documents with no generated answer. Vector index down: BM25 only.
+
+## Observability and cost
+
+One trace per query, one span per stage. Log chunk ids and scores, prompt version, model id, tokens in, out and cached, and the verification result. Dashboards: per-stage p95, abstain rate, verification drop rate, tokens per query, cost per 1K queries, index lag, and error rate per provider.
+
+Generation dominates the bill, not the index. Levers in order: fewer passages (n), prompt caching of the static prefix, routing easy questions to a small model, and an exact answer cache for popular questions (ACL in the cache key).
+
+## The numbers
+
+**Index size.**
+
+```text
+tokens        10M docs × 2,000            = 20B tokens
+chunks        2,000 / (400 − 50 overlap)  ≈ 6 per doc → 60M chunks
+vectors fp32  60M × 1,024 dims × 4 B      ≈ 246 GB
+vectors int8  60M × 1,024 × 1 B           ≈ 61 GB
+binary        60M × 1,024 bits / 8        ≈ 7.7 GB
+HNSW links    M=16 → ~32 neighbours × 4 B at layer 0 + upper layers
+              ≈ 140 B per vector × 60M    ≈ 8.4 GB
+chunk text    60M × 400 tokens × ~4 B     ≈ 96 GB (disk / doc store)
+```
+
+With int8 in RAM plus graph, about 70 GB; split into 4 shards of about 18 GB. Every query fans out to every shard. If one replica sustains R QPS at target recall (measure it, do not guess), replicas per shard = 1,000 × headroom / R.
+
+**Ingestion.** Daily churn is 1% of 10M = 100K docs ≈ 600K chunks ≈ 7 chunks per second averaged over a day: trivial. The initial build is 60M / T seconds per GPU, where T is measured embedding throughput. At an illustrative 1,000 chunks/s that is 60,000 s, about 17 hours on one GPU, so parallelise.
+
+**Reranker compute.** 40 pairs × 500 tokens = 20K tokens per query. Forward FLOPs ≈ 2 × params × tokens. For a small 33M-parameter cross-encoder: 2 × 33M × 20K ≈ 1.3 TFLOP per query, so 1.3 PFLOP/s at 1K QPS. That is a handful of GPUs at realistic utilisation; a 0.6B reranker needs roughly 18× more. This is why the reranker size is a cost decision.
+
+**Tokens per request.** 600 (system rules) + 6 × 475 (passages) + 150 (question and history) ≈ 3,600 input; about 250 output.
+
+**Cost per 1K requests** (prices in dollars per million tokens, check current prices):
+
+```text
+cost / 1K requests = 3.6 × P_in + 0.25 × P_out
+with prompt caching of the 600-token prefix at fraction c of P_in:
+                   = (3.0 + 0.6 × c) × P_in + 0.25 × P_out
+with answer cache hit rate h: multiply everything by (1 − h)
+daily volume at 400 avg QPS = 400 × 86,400 ≈ 34.6M requests
+```
+
+**Throughput limits.** At 1K QPS peak the generator sees 3.6M input tokens and 250K output tokens per second. On an API, check that your rate-limit tier covers about 216M input tokens per minute. Self-hosted, replicas = 250,000 / (measured output tokens per second per replica at your latency target).
+
+**Latency budget (p95 targets to measure against).** Route and auth 10 ms, condense 0 to 200 ms (only for follow-ups, small model), query embed 20 to 50 ms, both search legs in parallel 30 to 60 ms, fetch chunk text 10 to 20 ms, rerank 50 to 100 ms, prefill of 3.6K tokens a few hundred ms. TTFT lands around 0.5 to 1 s, inside the 1.5 s target with room for a slow provider.
+
+## Follow-ups they will ask
+
+- **"Offline recall is fine but users complain."** Label which stage failed in the complaint traces, and re-sample the golden set from logs if production queries look different.
+- **"A document is deleted?"** Tombstone it so retrieval filters it at once, then delete by document id from all three stores; count deletes in index lag.
+- **"Why not a 1M-token context?"** Nothing fits at 10M documents, and you would pay for every token on every call; long context complements RAG for reading a few retrieved documents whole.
+- **"How do you switch embedding models?"** Re-embed the full corpus into a new index, run the eval suite on both, then switch an alias; never mix vectors from two models.
+- **"What breaks first at 10× traffic?"** Generation rate limits and cost, then reranker GPUs; the vector index scales by adding replicas.
+- **"Conflicting documents?"** Store version, date and authority as metadata, prefer the latest authoritative source, and have the model surface the conflict with both citations.
+
+## How to bring in your own work
+
+You have worked on this pipeline at small scale, partly as your own code and partly as a teammate's. Keep the two apart, then say what changes at 10M.
+
+- **Your own piece of Scheme Assistant: the filtered-ANN fix.** Scheme Assistant is a two-person project, and its core RAG (chunker, fusion, reranker, abstain gate, citation verifier, retrieval eval) is mostly your teammate's code. The part that is yours fits this drill directly. The migration `migrations/versions/20261014_0006_chunk_retrievable_hnsw.py` (lines 3 to 11) records two measured failures: HNSW applied the status filter after its scan, so a top-40 came back with 16 to 40 rows, and duplicate superseded copies made an active clause unreachable until `ef_search` was about 200. The fix was a partial HNSW index over retrievable chunks only, plus pgvector's iterative scan set per transaction (`src/app/core/retrieval.py` lines 195 to 206). That is the "filter inside the ANN search" point above, learned the hard way.
+- **The team pipeline, which you should know well enough to defend.** Present it as "our pipeline", and say who wrote what if asked. Clause-level chunking from legal numbering, never from token counts (`src/app/ingest/chunker.py`). A tsvector leg and a pgvector leg fused by RRF (`rrf_fuse`, `src/app/core/retrieval.py` lines 650 to 660). An LLM listwise reranker or a local `bge-reranker-v2-m3` cross-encoder (`src/app/core/rerank.py`), with the reranker off in production. An abstain gate before the model call (`src/app/core/answer_query.py` lines 318 to 328). Every cited chunk id checked against the retrieved set (`src/app/core/generate.py` lines 746 to 758). Hit@k measured with and without the reranker (`scripts/eval_retrieval.py`).
+- **Answer Grader shows the measurement habit.** `backend/retrieval.py` lines 351 to 355 record that RRF fusion with BM25 lowered nDCG@5 from 0.842 to 0.70 to 0.79 on a question-to-question corpus, so the code stayed dense. Use it for the "hybrid is the default, but measure it" line. `scripts/eval_retrieval.py` computes nDCG@5 over labels pooled blind from all variants. Lines 162 to 163 do brute-force cosine over about 1,500 vectors: right at that size, and an opener for when you would move to HNSW.
+- **Drift and no-answer.** Answer Grader checks vector width (`backend/retrieval.py` lines 147 to 152) but cannot catch a same-width model swap, while Scheme Assistant's ingestion pins the model id per chunk (`src/app/ingest/embed.py`, teammate's code): tell that contrast. Answer Grader also raises `RetrievalUnavailable` rather than returning an empty list (lines 28 to 36), separating "nothing relevant" from "could not look".
+- **Honest gaps.** You have not run an index near 60M vectors, sharded a vector store, load-tested to 1K QPS, or made a cross-encoder the production default, and the RAG repos have no OpenTelemetry tracing or prompt caching (Answer Grader records no cached tokens, `backend/llm.py` lines 296 to 300). Present the scale numbers as arithmetic you would validate with a load test.

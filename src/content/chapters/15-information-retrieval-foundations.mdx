@@ -1,0 +1,646 @@
+---
+id: "15"
+title: "Information Retrieval Foundations"
+summary: "Build a retriever from an inverted index up: derive BM25 and its parameters, know when dense, late-interaction and learned-sparse retrieval win, fuse and rerank them, and measure every stage with recall@k, MRR and nDCG you can compute by hand."
+readingTime: "36 min"
+---
+
+Every RAG answer is capped by what retrieval hands the model. If the answering clause is not in the top 8, no prompt will fix it, and the model often answers anyway from a near-miss. The most useful skill on a RAG team is saying *why* a document ranked 14th instead of 2nd, and which change would move it.
+
+Search engineers have worked on that question since the 1960s, and their vocabulary (posting lists, IDF, length normalisation, pooling, nDCG) is what interviewers expect. Embeddings did not replace it. They added one more retriever to a pipeline older than the transformer: cheap, high-recall candidate generation, then a precise and expensive ranker, then measurement against human judgments.
+
+This chapter builds that pipeline from the bottom: an inverted index, BM25 derived and computed by hand, dense retrieval and where it loses, fusion with RRF, cross-encoder reranking, and P@k, recall@k, MRR and nDCG on paper. Embedding geometry itself is in [Embeddings and Vector Space](/03-embeddings-and-vector-space/#bi-encoders-and-sentence-bert), ANN indexes are in [Vector Search and Indexing](/16-vector-search-and-indexing/#hnsw), and wiring retrieval into an answer is in [RAG Pipelines](/17-rag-pipelines/#architecture-end-to-end).
+
+## Queries, documents, relevance
+
+Three nouns, each hiding a decision.
+
+A **query** is what the user typed, which is rarely what they meant. "125 din" and "how many days of work am I guaranteed" are the same information need written two ways. An **information need** is the thing in the user's head; the query is a lossy encoding of it. Retrieval is judged against the need, not the string.
+
+A **document** is whatever unit you index and return. In RAG it is usually a chunk: a clause, a paragraph, a FAQ answer. Too big, and one relevant sentence is diluted by 900 irrelevant tokens. Too small, and the chunk loses the heading that said which scheme it belongs to ([chunking](/17-rag-pipelines/#chunking)).
+
+**Relevance** is a judgment by a person about a (query, document) pair, not a property of a document. It can be binary or graded (0 = unrelated, 1 = on topic, 2 = answers it). Grades matter because "same topic" and "contains the answer" are very different outcomes for RAG.
+
+A retriever is a function `score(q, d)` plus a way to find the top k without scoring all N. Everything below is a choice of score, a structure that avoids the full scan, or a way to check the result.
+
+```text
+query ─► analyze ─► candidate generation (cheap, high recall, k = 20..1000)
+                       ├─ lexical: inverted index + BM25
+                       └─ dense:   ANN over embeddings
+                    ─► fuse (RRF) ─► filter (ACL, status)
+                    ─► rerank (cross-encoder, k → n) ─► top n to the LLM
+measured at each arrow: recall@k for candidates, nDCG@n / MRR for the final order
+```
+
+Early stages must be cheap per document because they see millions; later stages may be expensive because they see tens. **Recall is set early, precision late.** A reranker cannot promote what candidate generation never returned.
+
+**How it fails in production.** Teams tune the answer prompt for weeks when the gold chunk sits at rank 30 and only 8 are shown. Log retrieved ids and scores per query from day one, so "retrieval missed" is distinguishable from "the model ignored a good passage".
+
+## Inverted index
+
+Scoring every document for every query is O(N) per query. At 10M chunks and 100 queries per second that is a billion score computations per second, for documents that almost all share zero words with the query. The **inverted index** exists to skip them.
+
+Instead of document → words, store word → documents. For each term, the **posting list** holds the ids of documents that contain it, usually with the term frequency (tf) and optionally the positions. A query touches only the posting lists of its own terms.
+
+```python
+from collections import defaultdict, Counter
+import math, heapq
+
+class InvertedIndex:
+    def __init__(self, k1: float = 1.2, b: float = 0.75):
+        self.postings: dict[str, list[tuple[int, int]]] = defaultdict(list)  # term -> [(doc, tf)]
+        self.doc_len: dict[int, int] = {}
+        self.k1, self.b = k1, b
+
+    def add(self, doc_id: int, tokens: list[str]) -> None:
+        self.doc_len[doc_id] = len(tokens)
+        for term, tf in Counter(tokens).items():
+            self.postings[term].append((doc_id, tf))
+
+    def idf(self, term: str) -> float:
+        N, n = len(self.doc_len), len(self.postings.get(term, []))
+        return math.log(1 + (N - n + 0.5) / (n + 0.5))
+
+    def search(self, tokens: list[str], k: int = 10) -> list[tuple[float, int]]:
+        avgdl = sum(self.doc_len.values()) / len(self.doc_len)
+        acc: dict[int, float] = defaultdict(float)      # term-at-a-time accumulators
+        for term in set(tokens):
+            w = self.idf(term)
+            for doc, tf in self.postings.get(term, []):
+                norm = self.k1 * (1 - self.b + self.b * self.doc_len[doc] / avgdl)
+                acc[doc] += w * tf * (self.k1 + 1) / (tf + norm)
+        return heapq.nlargest(k, ((s, d) for d, s in acc.items()))
+```
+
+That is a working BM25 engine (formula two sections down). Real engines add speed and compactness.
+
+**Posting lists are compressed.** Doc ids are stored sorted, as gaps (`[3, 7, 21]` becomes `[3, 4, 14]`), and small gaps are packed into a byte or less with variable-byte or bit-packing codecs. Rough sizing for 10M chunks with about 120 distinct terms each: 1.2B postings at roughly 1 to 2 bytes each is a few GB, plus positions if you need phrase queries. A dense index of the same corpus at 1,024 float32 dimensions is 10M × 4 KB = 41 GB before any ANN graph.
+
+**Cost per query is the sum of posting-list lengths.** A rare term ("PMGSY") has a list of a few hundred; "the" has one as long as the corpus. Hence stopwords, and **dynamic pruning** (WAND, Broder et al. 2003; Block-Max WAND, Ding and Suel 2011), which stores each list's maximum score contribution and skips documents that cannot reach the current top-k threshold.
+
+**Indexes are built in immutable segments.** Lucene (under Elasticsearch, OpenSearch and Solr) writes small segments, merges them in the background, and marks deletes in a bitmap. An update is a delete plus an add, and new documents become searchable after a refresh (Elasticsearch defaults to one second, or 5 s on Serverless, and shards with no recent searches wait for the next search to refresh). Postgres full-text search (a `tsvector` column with a GIN index) and SQLite FTS5 are inverted indexes too.
+
+**How it fails in production.** Superseded documents still match until a status filter excludes them. Or the index is built with one tokenizer and queried with another, so "PM-KISAN" is indexed as two tokens and searched as one.
+
+## TF-IDF
+
+Matching words is not enough. A query "job card lost" matches thousands of documents on "card", and the one that matters is the one that also says "lost". Two intuitions fix this.
+
+**Term frequency (tf).** A document that mentions a query term more is more likely to be about it. **Inverse document frequency (idf)**, from Karen Spärck Jones (1972): a term that appears in few documents is more informative than one that appears in many. The classic form is
+
+```text
+idf(t) = log(N / df(t))         N = documents, df(t) = documents containing t
+tfidf(t, d) = tf(t, d) × idf(t)
+score(q, d) = Σ over t in q of tfidf(t, d)      (or cosine between tf-idf vectors)
+```
+
+Worked numbers. N = 10,000 chunks; df(job) = 2,000, df(card) = 800, df(lost) = 50. Using natural log: idf(job) = ln 5 = 1.61, idf(card) = ln 12.5 = 2.53, idf(lost) = ln 200 = 5.30. Rare words dominate: "lost" is worth over three times "job".
+
+Now three documents (average length 100 tokens):
+
+| doc | length | tf(job) | tf(card) | tf(lost) | raw tf-idf |
+|---|---|---|---|---|---|
+| A: general job-card page | 100 | 3 | 3 | 0 | 3(1.61) + 3(2.53) = 12.41 |
+| B: FAQ "if your job card is lost" | 50 | 1 | 1 | 1 | 1.61 + 2.53 + 5.30 = 9.43 |
+| C: 400-token operations manual | 400 | 10 | 8 | 1 | 16.09 + 20.21 + 5.30 = 41.60 |
+
+Raw tf-idf ranks the long manual first by a factor of four, and the FAQ that actually answers the question last. Two flaws cause it:
+
+1. **tf grows linearly.** The tenth mention of "job" is not ten times the evidence of the first. The usual patch is sublinear tf, `1 + log(tf)`, which takes C down to 18.39 but still leaves it first.
+2. **Long documents win by size.** They contain more words, so they match more terms more often. The vector-space fix is cosine normalisation, which divides by document vector length, but that over-penalises long documents that really are relevant.
+
+TF-IDF is still useful for keyword extraction and as a baseline. Jaccard word overlap is a cruder cousin with no idf, so "the" and "PMGSY" count the same. For ranking, both flaws have a principled fix: BM25.
+
+## BM25
+
+BM25 ("Best Match 25", from the Okapi system at City University London, first run at TREC-3 by Robertson and colleagues in 1994) is still the default ranking function in Lucene, Elasticsearch, OpenSearch and SQLite FTS5. It is the baseline every new retriever is compared against, and on out-of-domain data it is often hard to beat (BEIR, Thakur et al. 2021).
+
+```text
+                         tf(t,d) · (k1 + 1)
+score(q,d) = Σ  idf(t) · ─────────────────────────────────────
+            t∈q          tf(t,d) + k1 · (1 − b + b · |d| / avgdl)
+
+idf(t) = ln( 1 + (N − n(t) + 0.5) / (n(t) + 0.5) )
+k1 ≈ 1.2 (range 1.2–2.0), b ≈ 0.75
+```
+
+### Piece 1: idf from the probabilistic model
+
+The probabilistic relevance framework (Robertson and Spärck Jones 1976; summarised in Robertson and Zaragoza 2009, "The Probabilistic Relevance Framework: BM25 and Beyond") ranks documents by the odds that they are relevant. Assume terms occur independently, and assume that with no relevance information almost every document is non-relevant. The weight of a term then reduces to the log of (documents without it / documents with it), with 0.5 added to every count so that a term in zero or all documents does not produce a division by zero. That is `ln((N − n + 0.5)/(n + 0.5))`. It goes negative for terms in more than half the corpus, which would make matching "the" *lower* the score. Lucene adds 1 inside the log so the weight stays positive, as above.
+
+### Piece 2: saturation from the eliteness model
+
+Why `tf(k1+1)/(tf + k1)` and not `tf`? The 2-Poisson idea says a document is either "about" a term (elite for it) or not, and term counts follow a different Poisson distribution in each case. What we want is the probability of eliteness given the count. That curve rises fast and flattens. The exact formula has parameters you cannot estimate, so BM25 uses the simplest function with the same shape: zero at tf = 0, rising, and approaching a ceiling of k1 + 1.
+
+```text
+k1 = 1.2:  tf        1     2     3     5     10    20    100
+           weight  1.00  1.38  1.57  1.77  1.96  2.08  2.17   (ceiling 2.2)
+```
+
+**k1 sets how fast it saturates.** With k1 = 0, the term weight is the same for tf = 1 and tf = 100, so presence alone counts (a binary model). As k1 grows, behaviour approaches raw tf. Around 1.2 to 2.0 is the range used in practice: the first few mentions matter, and the twentieth adds almost nothing. That is flaw 1 fixed.
+
+### Piece 3: length normalisation
+
+A long document has a higher tf for every term just by being long. BM25 divides that out *softly*. It replaces k1 with `k1 · (1 − b + b · |d|/avgdl)`, so a document twice the average length needs roughly twice the tf to earn the same weight.
+
+**b sets how much length matters.** With b = 0 there is no normalisation. With b = 1 there is full normalisation, so a long document is treated as many short ones concatenated. The default of 0.75 assumes long documents are partly verbose and partly cover more ground. That is flaw 2 fixed, with a dial.
+
+### The same three documents, by hand
+
+N = 10,000, k1 = 1.2, b = 0.75, avgdl = 100. BM25 idf: job 1.609, card 2.525, lost 5.288.
+
+```text
+length factor K = k1 · (1 − b + b·|d|/avgdl)
+A: |d|=100 → K = 1.2 · 1.00  = 1.20
+B: |d|=50  → K = 1.2 · 0.625 = 0.75
+C: |d|=400 → K = 1.2 · 3.25  = 3.90
+
+term weight = idf · tf·2.2 / (tf + K)
+A: job 1.609·(6.6/4.2)=2.53   card 2.525·(6.6/4.2)=3.97    lost 0              total  6.50
+B: job 1.609·(2.2/1.75)=2.02  card 2.525·(2.2/1.75)=3.17   lost 5.288·1.257=6.65  total 11.85
+C: job 1.609·(22/13.9)=2.55   card 2.525·(17.6/11.9)=3.73  lost 5.288·(2.2/4.9)=2.37 total 8.66
+```
+
+The ranking flips to B, C, A. The FAQ wins because it is short and contains the rare term. C's ten mentions of "job" earn barely more than A's three (2.55 against 2.53). C's single "lost" is discounted because one mention in 400 tokens is weaker evidence than one in 50. Rerun with b = 0 and C scores 13.28 and beats B (9.42). Rerun with b = 1 and B rises to 12.96 while C falls to 7.87. **b is the knob for "do long documents deserve their extra matches"**, and on a chunked RAG corpus, where chunk lengths are fairly uniform, it matters less than on whole documents.
+
+### Tuning and variants
+
+Tune k1 and b only with a labelled set and a small grid (k1 in \{0.9, 1.2, 1.5, 2.0\}, b in \{0.3, 0.5, 0.75, 0.9\}). **BM25F** weights fields (heading above body), combined *before* saturation so a term in both does not count twice.
+
+Not every "full-text search" is BM25. Postgres `ts_rank` and `ts_rank_cd` use no corpus statistics: no idf, no avgdl normalisation. Extensions such as ParadeDB's `pg_search` add real BM25. SQLite FTS5's `bm25()` hard-codes k1 = 1.2 and b = 0.75 (only per-column weights are tunable) and returns *lower-is-better* values, so you sort it ascending.
+
+**How it fails in production.** BM25 does not know that "goat" and "बकरी" are the same, or that "can I build a check dam on my land" is answered by "works on private land of eligible households". It fails on paraphrase and cross-lingual queries, which is where dense retrieval earns its place.
+
+## Analyzers
+
+BM25 scores tokens, so whatever turns text into tokens decides what can ever match. That pipeline is the **analyzer**, and the same one (or a compatible one) must run at index time and at query time.
+
+```text
+raw text ─► char filters ─► tokenizer ─► token filters ──────────────────────► terms
+            (strip HTML,    (split on    (lowercase, ASCII/Unicode folding,
+             normalise       whitespace,  stopwords, stemming or lemmatising,
+             Unicode)        punctuation, synonyms, word-delimiter, n-grams)
+                             script rules)
+```
+
+Each stage trades recall against precision:
+
+- **Lowercasing and folding** let "Aadhaar" match "aadhaar". They also merge "US" with "us".
+- **Stemming** maps "applying", "applied" and "applications" toward one stem (the Porter stemmer, 1980, is the classic). It raises recall and causes over-stemming: Porter sends both "university" and "universe" to "univers". Lemmatisation uses a dictionary and is more careful, but slower and language-specific.
+- **Stopwords** shrink the index and speed up queries, and break phrases like "to be or not to be" if the list is over-eager. Many setups keep them and let idf discount them.
+- **Synonyms** at query time ("job card" ↔ "जॉब कार्ड" ↔ "rozgar card") are the cheapest cross-lingual fix, and the easiest to make too broad.
+- **Identifiers** are where default tokenizers hurt most. "PM-KISAN", "80C", "v2.3.1" and "Form 6A" may be split, joined or dropped. Emit both the parts and the whole, or index a separate keyword field for codes.
+
+Unicode normalisation is a real problem for Indic text. In Scheme Assistant, stored text was mostly in decomposed nukta form ("ड" + U+093C), so a precomposed "सड़क" matched nothing until the query was normalised. That char-filter bug shows up as "retrieval is poor in Hindi", not as an error.
+
+```python
+import unicodedata, re
+STOP = {"के", "का", "की", "है", "में", "the", "of", "a"}
+
+def analyze(text: str) -> list[str]:
+    text = unicodedata.normalize("NFC", text)                 # one form for nukta and accents
+    text = re.sub(r"[\u200c\u200d]", "", text)    # zero-width (non-)joiners split words
+    toks = re.findall(r"[\w\u0900-\u097f]+(?:[-.]\w+)*", text.lower())  # Devanagari marks; keep "pm-kisan", "2.3.1"
+    out = []
+    for t in toks:
+        if t in STOP:
+            continue
+        out.append(t)
+        if "-" in t or "." in t:                              # also emit the parts of identifiers
+            out.extend(p for p in re.split(r"[-.]", t) if p)
+    return out
+```
+
+**How it fails in production.** Someone adds a stemmer without re-indexing, so query terms and indexed terms no longer agree. Version the analyzer like an embedding model id, rebuild on change, and unit-test it on a table of codes, mixed scripts and transliterations.
+
+## Dense retrieval (DPR)
+
+Lexical retrieval fails when the query and the answer share no words. Dense retrieval encodes the query and each document into vectors with a learned model and ranks by inner product, so "how many days of work am I guaranteed" can land near a clause that says "not less than one hundred and twenty-five days".
+
+Dense Passage Retrieval (Karpukhin et al. 2020) made this work for open-domain QA. The recipe:
+
+- **Two encoders**, one for questions and one for passages (both BERT-base). Each outputs its [CLS] vector (768 dimensions). Score = dot product.
+- **Contrastive training** on (question, positive passage) pairs. Each question's negatives are the other questions' positives in the same batch (**in-batch negatives**, so a batch of B gives B − 1 negatives for free), plus one **hard negative** per question: a passage BM25 ranked highly that does not contain the answer.
+- **Offline indexing.** Every passage is encoded once and stored in an ANN index (FAISS in the paper). A query costs one encoder pass plus one ANN search.
+
+On several open-domain QA datasets, DPR beat a Lucene BM25 baseline by roughly 9 to 19 points absolute in top-20 passage accuracy, which is why "dense" became the RAG default. Modern embedding models (E5, BGE, hosted APIs) descend from this setup ([contrastive training](/03-embeddings-and-vector-space/#contrastive-training)).
+
+Know the limits, because interviewers ask for them:
+
+1. **One vector per passage is a bottleneck.** A clause with four sub-points is squeezed into 768 or 1,024 numbers, so a query about sub-point (c) matches the passage's average meaning.
+2. **Exact tokens are weak.** Identifiers, numbers and rare names ("section 80C" vs "80D") carry little signal. Two clauses differing only in a number look nearly identical.
+3. **Domain shift.** BEIR (Thakur et al. 2021) showed dense retrievers often losing to BM25 on a new domain. Legal and Hindi government text are new domains for most models.
+4. **No "no match".** A nearest neighbour always exists, so a nonsense query still gets k results with scores in a narrow band ([scores are ranks](/03-embeddings-and-vector-space/#cosine-dot-l2)).
+
+So dense wins on paraphrase, synonymy, cross-lingual and natural-language queries. BM25 wins on identifiers, rare terms, unseen vocabulary and queries that reuse the document's words, and it is cheaper and explainable.
+
+**How it fails in production.** A user pastes an error code or clause number, and dense returns five passages "about clauses" with confident-looking scores. If users ever type identifiers, you need a lexical leg.
+
+## Late interaction (ColBERT)
+
+There is a middle ground between one vector per passage (fast, lossy) and a cross-encoder reading query and passage together (precise, unindexable). **ColBERT** (Khattab and Zaharia 2020) keeps **one vector per token**.
+
+Each passage token becomes a small vector (128 dimensions in the paper), computed offline. At query time each query token is encoded too, and the score is **MaxSim**: for each query token, take its best match among the passage's tokens, then sum.
+
+```python
+import numpy as np
+
+def maxsim(Q: np.ndarray, D: np.ndarray) -> float:
+    """Q: (q_tokens, dim), D: (d_tokens, dim), rows L2-normalised."""
+    sims = Q @ D.T                     # every query token against every passage token
+    return float(sims.max(axis=1).sum())
+
+# "check dam on private land": "check", "dam", "private", "land" each find their best
+# partner in the passage, so a passage covering all four outscores one that only
+# matches the overall topic, which is what a single pooled vector cannot express.
+```
+
+"Late" means query and passage are encoded independently (passages precomputed, like a bi-encoder) and interact only at the end through cheap dot products, not in every layer as in a cross-encoder.
+
+The cost is storage. Arithmetic for 10M passages of 100 tokens:
+
+```text
+token vectors   = 10M × 100                     = 1B
+uncompressed    = 1B × 128 dims × 2 bytes (fp16) ≈ 256 GB
+single-vector   = 10M × 768 × 4 bytes            ≈ 31 GB
+```
+
+ColBERTv2 (Santhanam et al. 2022) cuts this with residual compression: a centroid id plus 1 or 2 bits per dimension, roughly 20 to 36 bytes per token vector, so the example shrinks to tens of GB. PLAID made search over it faster.
+
+Reach for it when single-vector retrieval clearly loses on multi-aspect queries and a cross-encoder over the top 100 is too slow. It also works as a cheap reranker. For most RAG systems at a few million chunks, hybrid plus a cross-encoder is simpler to operate.
+
+**How it fails in production.** Index size surprises the team after the pilot, and long passages are truncated at the encoder limit so their late tokens are never indexed.
+
+## Learned sparse (SPLADE)
+
+Dense models understand meaning but need an ANN index and lose exact tokens. BM25 handles exact tokens and runs on a cheap inverted index, but knows no synonyms. **Learned sparse retrieval** asks a transformer to output a *sparse, vocabulary-sized* vector that an inverted index can serve, so you get learned term weights and expansion while keeping the BM25 infrastructure.
+
+SPLADE (Formal et al. 2021) runs the text through a BERT-style model with its masked-language-model head. For every input position, that head gives a logit over the whole WordPiece vocabulary (30,522 entries for BERT). SPLADE turns these into one weight per vocabulary term:
+
+```text
+w_j = max over positions i of  log(1 + ReLU(logit_ij))      (SPLADE v2 uses max pooling)
+score(q, d) = Σ_j  w_j(q) · w_j(d)                           (sparse dot product)
+```
+
+Two things happen. **Re-weighting:** "lost" gets a high weight and "the" a low one, learned from relevance data rather than counted from df. **Expansion:** the document "if your job card is lost" also gets weight on "missing", "replacement" and "duplicate", vocabulary that never appeared in it. A regulariser during training (the FLOPS loss) pushes most weights to exactly zero, so the vectors stay sparse enough for posting lists.
+
+Earlier steps on the same road: DeepCT (Dai and Callan 2019) learned weights for existing terms, and doc2query (Nogueira et al. 2019) appended generated questions to each document before BM25 indexing, a cheap trick you can still use.
+
+Learned sparse retrieval is interpretable (print which terms matched), runs on any engine that accepts weighted terms, and does well out of domain. It costs a model pass per document and per query, longer posting lists because of expansion, and vocabulary tied to the tokenizer: a mostly-English WordPiece vocabulary splits Hindi into fragments, so check multilingual variants.
+
+**How it fails in production.** Expansion adds terms the author never wrote and surfaces a document for a query it does not answer. Log the top contributing terms per hit and the bad expansions become visible.
+
+## Hybrid search and RRF
+
+Dense and lexical retrieval fail on different queries. Dense misses identifiers; BM25 misses paraphrases. Running both and merging the lists is **hybrid search**, and it is the most common production retrieval setup.
+
+Adding the scores does not work. BM25 scores are unbounded and grow with query length; cosine scores from many embedding models sit in a narrow band like 0.55 to 0.85. One leg dominates by accident, and per-query min-max normalisation is fragile to outliers.
+
+**Reciprocal Rank Fusion** (Cormack, Clarke and Büttcher 2009) ignores scores and uses only ranks:
+
+```text
+RRF(d) = Σ over legs L of  1 / (k + rank_L(d))        k = 60 by convention; missing from a leg → 0
+```
+
+Worked example. BM25 returns `[d3, d1, d7, d2]` and dense returns `[d1, d5, d3, d8]`.
+
+```text
+d1: 1/(60+2) + 1/(60+1) = 0.01613 + 0.01639 = 0.03252   ← found by both
+d3: 1/(60+1) + 1/(60+3) = 0.01639 + 0.01587 = 0.03227   ← found by both
+d5: 1/(60+2)                                = 0.01613
+d7: 1/(60+3)                                = 0.01587
+d2, d8: 1/(60+4)                            = 0.01563
+fused: d1, d3, d5, d7, d2/d8
+```
+
+Documents found by both legs float to the top. Notice what k does. With k = 60, rank 1 against rank 10 is 1/61 against 1/70, a ratio of only 1.15, so RRF is a gentle, consensus-favouring merge. A document at rank 5 in both legs (2/65 = 0.0308) beats one at rank 1 in a single leg (1/61 = 0.0164). With k = 1, the same ratio is 1/2 against 1/11, or 5.5, so top ranks dominate. **Lower k trusts each leg's top result more. Higher k rewards agreement.**
+
+```python
+def rrf(legs: list[list[str]], k: int = 60, weights: list[float] | None = None) -> list[tuple[str, float]]:
+    weights = weights or [1.0] * len(legs)
+    scores: dict[str, float] = {}
+    for w, hits in zip(weights, legs):
+        for rank, doc in enumerate(hits, 1):
+            scores[doc] = scores.get(doc, 0.0) + w / (k + rank)
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+```
+
+RRF is the default because it needs no training, calibration or labels, and survives a leg changing its score scale. With labelled data, a tuned convex combination of normalised scores can beat it, and RRF turned out more sensitive to k than its reputation suggests (Bruch, Gai and Ingber 2022). **Weighted RRF** down-weights a leg that is usually noise.
+
+Three production details matter more than the formula:
+
+- **Each leg's depth sets recall.** RRF can only fuse what each leg returned. If the right clause is at dense rank 35 and you fetch 20 per leg, fusion never sees it. Scheme Assistant measured exactly this: 20 per leg worked at 735 chunks, but at about 2,400 chunks hit@3 fell from 0.94 to 0.81, and 40 per leg with 30 reranked restored it.
+- **Within-leg boosts are flattened.** A lexical leg that adds +1000 for an exact phrase match only moves that chunk to lexical rank 1. After RRF it is worth 1/61, the same as any other rank-1 hit. If an exact match must win, pin it after fusion, do not hope the boost survives.
+- **Hybrid is a hypothesis, not a law.** If one leg is mostly noise for your queries, it still gets an equal vote. Answer Grader tried BM25 fused with dense at full, 0.5 and 0.3 weight, and relevance fell every time (nDCG@5 from 0.842 to between 0.70 and 0.79). Its queries are exam questions matched against other exam questions, the embedding already carries the key terms, and BM25 rewarded generic words like "theory" and "measures". It stayed dense.
+
+**How it fails in production.** A team adds a lexical leg as "best practice", sees wins on identifier queries, and never notices paraphrase queries got worse. Evaluate per query type.
+
+## Cross-encoder re-ranking
+
+A bi-encoder encodes the query without ever seeing the document. That is what makes it indexable, and it is also its ceiling: it cannot notice that a passage mentions the right scheme but the wrong state, or that it says "not eligible" where the query asks about eligibility. A **cross-encoder** feeds query and passage through one transformer together, so every query token attends to every passage token in every layer, and a small head outputs one relevance score.
+
+```text
+[CLS] how many days of guaranteed work [SEP] 6.2 Every household shall be entitled to
+not less than one hundred and twenty-five days ... [SEP]  ─► transformer ─► linear ─► 7.8
+```
+
+monoBERT (Nogueira and Cho 2019) fine-tuned BERT as a binary classifier on MS MARCO (query, passage) pairs and, reranking BM25's top 1,000, gave a large jump over the BM25 order. Today's rerankers (bge-reranker, MS MARCO MiniLM cross-encoders, hosted rerank APIs) are the same architecture with better data.
+
+Cost is why it comes second. Nothing can be precomputed, so K candidates cost K forward passes: impossible over 10M documents, tens to a few hundred milliseconds over 20 to 100 on a GPU (measure yours). The GPU arithmetic is in [reranker cost](/17-rag-pipelines/#re-ranking).
+
+```python
+def rerank(query: str, cands: list[dict], model, n: int = 8, max_chars: int = 1500) -> list[dict]:
+    """model.predict takes [(query, passage)] and returns one logit per pair."""
+    pairs = [(query, f"{c['heading']}\n{c['body']}"[:max_chars]) for c in cands]
+    for c, s in zip(cands, model.predict(pairs)):
+        c["rerank_score"] = float(s)          # keep it separate from the retrieval score
+    return sorted(cands, key=lambda c: -c["rerank_score"])[:n]
+
+# offline stand-in: from sentence_transformers import CrossEncoder
+# model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")   # small, English
+```
+
+What to know about using one:
+
+- **Its score is the best signal for an abstain gate**, because it measures relevance directly where an RRF score encodes only rank. Calibrate it on labels and never add it to cosine or BM25 ([abstain gate](/17-rag-pipelines/#no-answer-handling)).
+- **Rerank what the LLM will read**: heading and parent context, not a bare sub-clause. Inputs past the limit (often 512 tokens) are silently truncated.
+- **An LLM can rerank listwise** (20 passages in, scores out under a JSON schema). Better on reasoning-heavy relevance, but slower, dearer, order-sensitive, and it ships all candidate text to a provider.
+
+The trade-off to name: a reranker raises precision at the top (nDCG@5, MRR) so fewer passages reach the LLM, at a latency cost. It cannot raise candidate recall: if recall@50 is 0.80, that is its ceiling.
+
+**How it fails in production.** Pairs are scored one at a time instead of batched, and p99 reaches seconds under load. Or a listwise reranker turns 1-second retrieval into 10 seconds, and the team turns it off without measuring the quality cost.
+
+## Metrics (P@k, R@k, MRR, nDCG)
+
+Interviewers often ask you to compute these on a whiteboard.
+
+- **Precision@k (P@k):** relevant results in the top k, divided by k.
+- **Recall@k (R@k):** relevant results in the top k, divided by all relevant documents for the query. Needs that total, which is the hard part (next section).
+- **Hit@k (success@k):** 1 if any relevant document is in the top k. With one gold chunk per query, recall@k equals hit@k. The usual first RAG metric.
+- **MRR (mean reciprocal rank):** 1 / rank of the first relevant result (0 if none), averaged over queries. Good for factoids where one hit is enough.
+- **nDCG@k (normalised discounted cumulative gain, Järvelin and Kekäläinen 2002):** uses graded relevance and discounts by position.
+
+```text
+DCG@k  = Σ_{i=1..k}  gain(rel_i) / log2(i + 1)        gain = 2^rel − 1  (or just rel)
+nDCG@k = DCG@k / IDCG@k                               IDCG = DCG of the ideal ordering
+                                                       of ALL judged documents for the query
+```
+
+### A worked example
+
+A query has three judged-relevant documents: dA (grade 2, answers it), dB and dC (grade 1, on topic). The system returns, in its top 5: `[x, dA, y, dC, z]`. dB is at rank 9.
+
+```text
+P@5    = 2 relevant / 5                       = 0.40
+R@5    = 2 found / 3 relevant                 = 0.667
+Hit@5  = 1
+RR     = 1 / 2 (first relevant at rank 2)     = 0.50
+
+gains (2^rel − 1):  rank 2 → 3,  rank 4 → 1
+DCG@5  = 3/log2(3) + 1/log2(5)  = 1.893 + 0.431 = 2.323
+ideal  = [2, 1, 1] → gains 3, 1, 1
+IDCG@5 = 3/log2(2) + 1/log2(3) + 1/log2(4) = 3 + 0.631 + 0.5 = 4.131
+nDCG@5 = 2.323 / 4.131 = 0.562
+```
+
+Two details trip people up. First, **IDCG uses every judged relevant document**, not only the ones the system retrieved. If you build the ideal from the system's own top 5 (`[2, 1, 0, 0, 0]`), you get 0.640 and reward the system for missing dB. Second, the two gain conventions give different numbers (linear gain gives 0.541 here). Say which one you used, and compare systems only on the same convention.
+
+MRR is the mean: first hits at ranks 2, 1 and "none" give (0.5 + 1 + 0) / 3 = 0.50.
+
+```python
+import math
+
+def metrics_at_k(ranked: list[str], grades: dict[str, int], k: int) -> dict[str, float]:
+    """ranked: system output ids; grades: id -> 0/1/2 for every judged doc of this query."""
+    rel = [grades.get(d, 0) for d in ranked[:k]]
+    n_rel = sum(1 for g in grades.values() if g > 0)
+    first = next((i for i, g in enumerate(rel, 1) if g > 0), None)
+    dcg = lambda gs: sum((2 ** g - 1) / math.log2(i + 2) for i, g in enumerate(gs[:k]))
+    ideal = dcg(sorted(grades.values(), reverse=True))
+    return {
+        "P": sum(g > 0 for g in rel) / k,
+        "R": sum(g > 0 for g in rel) / n_rel if n_rel else 0.0,
+        "hit": float(first is not None),
+        "RR": 1 / first if first else 0.0,
+        "nDCG": dcg(rel) / ideal if ideal else 0.0,
+    }
+```
+
+### Which metric for which stage
+
+Measure **candidate generation with recall@K** at the depth the reranker sees (K = 20 to 100), and **the final order with nDCG@n or MRR** at the number of passages the LLM reads (n = 3 to 10). A reranker should leave recall@K unchanged and raise nDCG@n. A change that raises nDCG@5 but lowers recall@50 made the pool worse and got lucky at the top.
+
+### Noise
+
+With 50 queries and a hit rate of 0.80, the standard error is √(0.8 × 0.2 / 50) ≈ 0.057, a 95% interval of about ±0.11. A 3-point difference on 50 queries is not evidence alone. Compare paired (per-query wins and losses, or a bootstrap) and look for consistent direction across settings ([sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)).
+
+**How it fails in production.** The eval set is 40 easy developer-written questions scoring above 0.9, while real users ask in Hinglish with typos. Stratify by query type and language.
+
+## Relevance judgments
+
+Every metric above depends on labels: for each query, which documents are relevant and how much. Getting them is most of the work, and the mistakes made here are invisible in the metric.
+
+**Pooling.** You cannot label 10M chunks per query. TREC's answer is to merge the top k from every system being compared into one **pool** and judge only that; anything outside counts as non-relevant. It breaks when you later add a system that finds documents nobody judged: they count as misses and the new system looks worse than it is. Re-pool when you add a variant.
+
+**Blind judging.** The labeller must not know which system found a candidate, or your own variant gets the benefit of the doubt. Sort the pool by id, hide the source, then label.
+
+**Graded scales with written guidelines.** Define each grade with an example before labelling (2 = answers it, 1 = same topic and useful, 0 = unrelated). Have a second person label 20 to 30% and compute Cohen's kappa; low agreement means a vague guideline ([annotation guidelines](/19-evals-methodology/#human-annotation-guidelines)).
+
+**Sources of queries.** Real queries from logs beat invented ones, which reuse the document's words and flatter BM25. Stratify by type (identifier, paraphrase, multi-part, cross-lingual) and include unanswerable questions, since "correctly finds nothing" needs measuring too.
+
+### Without labels
+
+Each option has a known bias:
+
+- **LLM-as-judge relevance** on your 0/1/2 rubric. Thomas et al. (2023) found carefully prompted LLM labels as accurate as human labellers and used them at Bing scale. Validate on 50 to 100 human-labelled pairs first ([validating judges](/20-evals-judges-and-ci/#validating-judges-tpr-tnr-vs-humans)).
+- **Synthetic queries from chunks**, with that chunk as gold. Cheap recall@k at scale, but the questions copy the chunk's wording (favouring BM25) and assume one gold chunk.
+- **Implicit signals:** cited passages, clicked sources, thumbs, abstain rate. Noisy and biased toward what was shown, but free.
+- **Top-10 overlap between old and new retriever** on live traffic says how much changed, not whether it improved: a tripwire.
+
+**How it fails in production.** Labels go stale: a re-chunk changes the gold chunk's id and a hit becomes a "miss". Label by a stable key (document plus clause path), not a chunk id or substring test.
+
+## Query rewriting
+
+The query the user typed is often a poor search query: a follow-up ("and for widows?"), the wrong language for the corpus, misspelled, or vague. **Query rewriting** transforms it before retrieval. The main forms, from cheapest:
+
+- **Normalisation and spelling.** Unicode normalisation, transliteration ("rozgar" → "रोजगार"), spelling correction against the corpus vocabulary. Deterministic and testable.
+- **Synonym or glossary expansion.** Add "unemployment allowance" for "berozgari bhatta". Raises lexical recall; too broad, it adds noise.
+- **Pseudo-relevance feedback.** Add frequent terms from the first pass's top documents and retrieve again (Rocchio 1971; RM3). It helps when the top results are good and causes query drift when they are not.
+- **Conversational condensing.** Rewrite "what about widows?" plus recent turns into a standalone question. Required for multi-turn RAG, because the retriever has no memory.
+- **Translation** into the corpus language, or both versions fused.
+- **Generative expansion** (HyDE, Gao et al. 2022; multi-query plus RRF) is in [HyDE and expansion](/18-advanced-and-agentic-rag/#hyde-and-expansion), and decomposition in [multi-hop](/18-advanced-and-agentic-rag/#query-decomposition-and-multi-hop).
+
+```python
+def condense(history: list[tuple[str, str]], message: str, llm) -> str:
+    """Turn a follow-up into a standalone search query. Falls back to the original."""
+    if not history:
+        return message
+    turns = "\n".join(f"{role}: {text}" for role, text in history[-4:])
+    prompt = ("Rewrite the last user message as one standalone question in the same language, "
+              "keeping names, schemes and facts the user stated. Output only the question.\n\n"
+              f"{turns}\nuser: {message}")
+    try:
+        out = llm(prompt).strip()
+        return out if 0 < len(out) < 400 else message
+    except Exception:
+        return message
+
+mock_llm = lambda p: "Is a widow eligible for the PMAY-G housing grant?"   # offline stand-in
+```
+
+The costs are latency and drift. An LLM rewrite adds a model call before retrieval can start, and it can change the question: drop a constraint, pick the wrong referent, "correct" a valid identifier. Keep the original query as one fusion leg so a bad rewrite cannot remove what it would have found, and log both versions on every request. Cheaper still: **rewrite on failure**, only when the first pass is empty or abstains, so queries that work pay nothing.
+
+**How it fails in production.** The rewriter runs above temperature 0 and the same follow-up retrieves different documents on different days. Pin temperature, cache rewrites by (history hash, message), and trace them.
+
+## Metadata filtering and ACLs
+
+Constraints like this tenant, documents the user may see, or current version only are **metadata filters**. The question is where to apply them.
+
+**Post-filtering** retrieves the top k, then drops what fails. It starves results: if 2% of the corpus passes and k = 10, you keep 0.2 results on average, and expecting 10 survivors needs k ≈ 10 / 0.02 = 500. For ACLs it is also a leak: whatever sits between retrieval and the filter (a cache, a hosted reranker, a debug log) has seen documents the user may not read.
+
+**Pre-filtering** applies the predicate inside the search, so a filtered-out document never takes a top-k slot or leaves the database: a `WHERE` clause in each SQL leg, a filter clause in a search engine, a filtered ANN search in a vector index. That last one can lose recall at high selectivity; fixes are in [multi-tenancy and filtering](/16-vector-search-and-indexing/#multi-tenancy-and-filtering).
+
+```sql
+-- both legs carry the same hard filters; the user's groups come from the auth layer, never the prompt
+SELECT c.id, ts_rank_cd(c.search_vector, q) AS score
+FROM   chunks c JOIN documents d ON d.id = c.document_id, to_tsquery('simple', :tsq) q
+WHERE  c.tenant_id = :tenant_id
+  AND  d.status = 'active'
+  AND  d.allowed_groups && :user_groups      -- array overlap: deny unless a group matches
+  AND  c.search_vector @@ q
+ORDER  BY score DESC
+LIMIT  :k;
+```
+
+How to model permissions:
+
+- **Tenant isolation** is the safest boundary: an index or partition per tenant, or a mandatory `tenant_id` predicate in the one data-access function every leg uses.
+- **Document ACLs** copy the source system's principals onto every chunk at ingestion and match them against the user's at query time. Deny by default.
+- **ACL sync lag** is the hard part: a user removed from a group keeps access until the next sync. Re-sync permissions more often than content, and for sensitive data re-check the final top n against the source.
+- **Caches** must be keyed by permission set, not only query text.
+
+**Hard filter or soft boost?** Preferences ("current version", "the student's exam paper") can be soft boosts, so a strong match outside the preferred set still beats a weak one inside it. Answer Grader measured this: putting the student's paper first regardless of similarity dropped nDCG@5 to 0.817, because a 0.85 near-paraphrase from another paper lost to 0.61 same-paper answers, while a small similarity penalty (0.03 for another GS paper, 0.08 for an Optional) reached about 0.86. Permissions are always hard filters; preferences usually should not be.
+
+**How it fails in production.** Retrieval enforces ACLs, but the citation preview or an export reads chunks by id unchecked. Every id-to-text path enforces permissions, and the LLM is never the boundary: "do not reveal documents the user cannot see" in a prompt is not access control ([permission-aware RAG](/18-advanced-and-agentic-rag/#permission-aware-rag)).
+
+<Production>
+
+**Failure modes.**
+
+- Dense-only retrieval missing exact identifiers, codes and section numbers ("80C", "Form 6A", clause 3.2.a). It needs a lexical leg, or at least a keyword field for codes.
+- Hybrid adopted without measurement, where a noisy lexical leg drags paraphrase queries down. Evaluate per query type.
+- Per-leg depth too shallow for corpus growth: the gold chunk drops out of the fused pool, and hit@3 falls with no code change.
+- ACL leaks through post-filtering, shared caches keyed only by query text, or side paths that read chunks by id. Analyzer or tokenizer changed without re-indexing.
+
+**Cost.**
+
+- Reranker cost is K forward passes per query: GPU time self-hosted ([arithmetic](/17-rag-pipelines/#re-ranking)), per-call pricing hosted (check the price page). An LLM listwise reranker over 30 passages × about 400 tokens is 12K input tokens per query before the answer call.
+- An LLM query rewrite is one more call per query; rewrite-on-failure pays it only on misses.
+- Storage per 10M chunks: lexical a few GB, single-vector dense about 41 GB (1,024 float32), uncompressed ColBERT hundreds of GB.
+
+**Latency.**
+
+- BM25 over a few million chunks takes milliseconds to tens of milliseconds. A query embedding call is tens of milliseconds locally and more over a network. Start it in parallel with the lexical leg.
+- A cross-encoder rerank adds roughly 50 to 300 ms (approximate; measure at your K, passage length and hardware), and much more if pairs are not batched. An LLM listwise reranker can add seconds: Scheme Assistant's Cloud Run retrieval took 13 to 14 s with a Gemini rerank of 30 passages, while pgvector itself took 0.3 s.
+- Set a timeout on the reranker. On timeout, fall back to the fused order with a stricter abstain policy.
+
+**Observability.**
+
+- Log per query: original and rewritten query, each leg's top K ids with ranks and scores, fused order, reranker scores, the final n, filters and tenant. Without this you cannot tell a retrieval miss from a generation miss.
+- Track median top-1 rerank score, share of queries whose legs' top 10 do not overlap, abstain rate, and recall@K on a fixed labelled set in CI.
+
+**Security.**
+
+- Enforce the user's permissions inside retrieval, before the reranker, the cache or the LLM sees any text. Deny by default, and take principals from the auth layer, never from the prompt or the query string.
+- Anyone who can write into the corpus can plant text that ranks for common queries and carries instructions ([indirect injection](/33-security-prompt-injection/#indirect-injection)). Track provenance per chunk and treat retrieved text as data.
+- Hosted rerankers and query rewriters receive user queries and candidate text, which is a data-residency question for government or health data.
+
+</Production>
+
+<Interview>
+
+<Q q="BM25 vs dense retrieval: when does each win?">
+
+- **BM25 wins** on exact tokens: identifiers, codes, section numbers, rare names, new vocabulary the embedding model never saw, and queries that reuse the document's words. It is cheap, needs no GPU, is explainable term by term, and is robust out of domain (BEIR, 2021).
+- **Dense wins** on paraphrase, synonymy, natural-language questions and cross-lingual queries, because it matches meaning rather than strings. DPR (2020) beat BM25 by roughly 9 to 19 points in top-20 accuracy on open-domain QA.
+- **Dense loses** on exact numbers and codes (two clauses differing only in a number look identical), on domain shift, and it always returns k neighbours even for nonsense queries.
+- The answer in practice: run both, fuse, and measure per query type on your own labelled set. Sometimes one leg is just noise (Answer Grader measured hybrid lowering nDCG@5).
+- **The trap:** "dense is newer so it is better", or "always use hybrid", with no mention of query types or measurement.
+
+</Q>
+
+<Q q="Why use hybrid search, and how does RRF work?">
+
+- The legs fail on different queries (identifiers vs paraphrases), so their union has higher recall than either alone, provided both are reasonable on your data.
+- Raw scores cannot be added: BM25 is unbounded and depends on query length, while cosine sits in a narrow band. Min-max normalisation is fragile to outliers.
+- RRF: score(d) = Σ 1/(k + rank) over legs, with k = 60. It uses only ranks, so it needs no calibration and no labels (Cormack et al. 2009).
+- Work an example: a document at rank 5 in both legs scores 2/65 ≈ 0.031, while one at rank 1 in only one leg scores 1/61 ≈ 0.016. RRF rewards agreement. Lower k gives each leg's top results more weight.
+- Each leg's depth caps recall. Within-leg boosts are flattened to a rank. With labels, a weighted RRF or a tuned convex combination can do better.
+- **The trap:** "normalise both scores to 0 to 1 and average them", or not knowing what k does.
+
+</Q>
+
+<Q q="How do you measure retrieval quality without labels?">
+
+- Frame it as a bootstrap: the goal is 50 to 200 real queries, pooled from all systems and labelled blind.
+- **LLM-as-judge** grading of (query, passage) pairs with a written rubric, validated against 50 to 100 human labels before it is trusted, using a different model from the one under test.
+- **Synthetic queries** generated from chunks, with that chunk as gold, give recall@k at scale. Their bias: they copy the chunk's wording, which favours BM25, and they assume a single gold chunk.
+- **Implicit signals:** which passages the answer cited, clicks on sources, thumbs, abstain rate, and reformulations (the user asking again).
+- **Change detection:** top-k overlap between old and new retrievers, drift in top-1 rerank score. These say something changed, not that it improved.
+- **The trap:** "use RAGAS" or "ask GPT-4 if it is good" with no validation of the judge and no plan to get human labels.
+
+</Q>
+
+<Q q="Where in the pipeline do you enforce document permissions?">
+
+- Inside retrieval, as a pre-filter in every leg's query (a `WHERE` clause or a filter clause in the search engine), using principals from the auth layer. Never in the prompt.
+- Post-filtering is wrong twice. It starves results (at 2% selectivity, k = 10 keeps 0.2 results on average), and text has already passed through caches, rerankers and logs before the filter.
+- Model ACLs as tenant isolation (partition or mandatory predicate) plus per-document principals copied at ingestion. Deny by default.
+- Handle sync lag: re-sync permissions more often than content, and for sensitive data re-check the final top n against the source system.
+- Key caches by the permission set. Enforce on every id-to-text path (citations, previews, exports). Note that filtered ANN search can lose recall at high selectivity, and partitioning per tenant is the usual fix.
+- **The trap:** "tell the LLM not to reveal documents the user cannot access", or filtering after generation.
+
+</Q>
+
+<Q q="Explain BM25's k1 and b. What happens at the extremes?">
+
+- Write the formula: Σ idf(t) · tf(k1+1) / (tf + k1(1 − b + b·|d|/avgdl)).
+- k1 controls tf saturation. At k1 = 0, a term counts only by its presence (binary). As k1 grows, behaviour approaches linear tf. At 1.2, the weights for tf = 1, 3 and 10 are 1.0, 1.57 and 1.96, with a ceiling of 2.2.
+- b controls length normalisation. At b = 0 there is none, so long documents win by size. At b = 1 there is full normalisation. The default 0.75 sits in between.
+- idf = ln(1 + (N − n + 0.5)/(n + 0.5)) comes from the probabilistic relevance model. The +1 keeps very common terms from going negative.
+- Tune only with labels on a small grid; on uniform-length chunks b matters less.
+- **The trap:** describing BM25 as "TF-IDF with some tweaks" and being unable to say what either parameter does.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Build the four-stage retrieval benchmark on Scheme Assistant's corpus: BM25, dense, RRF, and RRF plus a cross-encoder, scored on 50 labelled queries.** Do it in `~/scheme-assistant` as `scripts/ir_bench.py`. It runs fully offline with `sentence-transformers`: `BAAI/bge-m3` or `intfloat/multilingual-e5-small` for dense, and `BAAI/bge-reranker-v2-m3` (already `LocalReranker`'s default in `src/app/core/rerank.py`) as the cross-encoder. Use the small English `cross-encoder/ms-marco-MiniLM-L-6-v2` only as a speed comparison. No paid API.
+
+1. **Corpus.** Reuse `artifacts/chunks_sample.jsonl` from the [chapter 3 exercise](/03-embeddings-and-vector-space/#choosing-a-model-mteb-dims-cost-latency), or export about 2,000 retrievable chunks (id, title, clause path, heading, body, language) read-only.
+2. **BM25 leg.** This chapter's `InvertedIndex` and `analyze`, over `heading + body` with the heading repeated for double weight.
+3. **Dense leg.** Encode once to `artifacts/dense.npy`, normalise, exact matrix-vector search.
+4. **Fusion and rerank.** RRF with k = 60 over the top 40 per leg. Then rerank the fused top 30 with the cross-encoder on `heading + body` and keep 8.
+5. **Labels.** Write 50 queries (Hindi, English, Hinglish, identifier lookups, paraphrases, and 5 unanswerable ones). Pool the top 10 of all four stages, sort by chunk id, hide the source, and grade 0/1/2 by `(document, clause_path)`. Save to `artifacts/ir_labels.json`.
+6. **Report.** For each stage print recall@10, nDCG@10 (exponential gain, IDCG from all judged documents), MRR@10 and ms per query, overall and per language and query type. Add a row for RRF with k = 10 and k = 100, and for weighted RRF at 0.5 on the weaker leg.
+
+**Done when:**
+
+- One command prints a table with four stages × four metrics, plus the per-stratum breakdown.
+- The labels file holds 50 queries with a docstring describing the pooling and blind grading.
+- You can state, with numbers, which leg wins on identifiers and which on paraphrases, what the reranker adds to nDCG@10 versus recall@10, and what it costs in ms per query on your CPU.
+- **Stretch, in `~/answer-grader`:** add a cross-encoder over the top 20 as a fourth variant, re-pool `scripts/eval_retrieval.py` so the new variant's candidates get labelled, and report nDCG@5 next to `dense`, `similarity` and `paper`.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Answer Grader is your "hybrid is not automatic" story, with numbers.** The comment above `RETRIEVAL_MODE` in `backend/retrieval.py` records that BM25 fused with the embedding by RRF (at full, 0.5 and 0.3 weight, and re-ordering only the dense top 20/30) lowered nDCG@5 from 0.842 to 0.70–0.79. The reason given is that question-to-question embeddings already carry the key terms, and BM25 rewarded words like "theory" and "measures". The same comment is your filter-vs-boost answer: hard paper tiers fell to 0.817, while a soft penalty (`PAPER_PENALTY = (0.0, 0.03, 0.08)`) reached about 0.86, and every setting in a range beat the plain ranking. Be honest that this rests on 26 queries, so the +0.02 is within noise. The consistent direction across settings is the stronger evidence.
+- **Answer Grader's `scripts/eval_retrieval.py` is a textbook evaluation**: real student questions, a blind pool (every variant's top 5, sorted by id), 0/1/2 grades with written definitions, and `ndcg5` with 2^g − 1 gain whose ideal comes from every labelled candidate. It runs by hand, not in CI. If asked about `_rerank` in `retrieval.py`, say it is not a reranker: it adds at most 0.05 × word-overlap Jaccard to cosine over 20 candidates, its docstring says to replace it with a cross-encoder, and it now runs only under `RETRIEVAL_MODE=dense`. It keeps the raw cosine separate, so thresholds never see the blended number.
+- **Scheme Assistant is the full hybrid pipeline, mostly Chiman's code** (`retrieval.py`, `rerank.py`, `answer_query.py`, `eval_retrieval.py`); say so, then explain the design. Its lexical leg is a generated `tsvector` (heading weight A, body weight B) on a GIN index, ranked with `ts_rank_cd` plus a +1000 phrase bonus. That is not BM25 (no idf or length normalisation against the corpus), and after RRF the bonus only means "lexical rank 1". `lexical_tsquery` does the analyzer's job by hand for Devanagari: nukta and zero-width normalisation, stopwords, and prefix terms (`'दिन':*`). `rrf_fuse` uses k = 60, untuned. `retrieve()` defaults to 20 per leg, rerank 20, keep 8, `score_floor = 0.0`. `Services` in `answer_query.py` raises this to 40/30/8 after hit@3 fell from 0.94 to 0.81 at about 2,400 chunks. Tenant and document status filters sit in each leg's `WHERE` clause, which is pre-filtering done right.
+- **Scheme Assistant's reranker story is a measured latency trade-off** (Chiman's call, recorded in the tracker). `rerank.py` has a `LocalReranker` (`BAAI/bge-reranker-v2-m3` cross-encoder) and a Gemini listwise reranker under a JSON schema. Production runs `APP_RERANKER=none` (`scripts/deploy_cloud_run.sh`) because retrieval with the Gemini rerank of 30 passages took 13–14 s. The tracker (2026-10-06) records the cost as hit@1 0.75 → about 0.69 on the seed set, with hit@3 unchanged. Since the score floor is 0, the system abstains only when there are no hits. The gaps: `scripts/eval_retrieval.py` lists 17 cases but skips the `lambda c: True` placeholder, so it scores 16 (each a predicate, mostly substring tests) for hit@1/@3/@k, with no MRR or nDCG. Its own docstring says the 50-question golden set with clause paths is still to be written. The Apply-it above builds it.
+- **Contrast and gaps.** Memory Agent's `src/memory.ts` ranks with SQLite FTS5 `ORDER BY bm25(turns_fts)` and no embeddings, fair for recall by day and keyword. Chat Insights's search is unranked `LIKE '%term%'`. None of your repos runs a cross-encoder in production, learned sparse or ColBERT, or ACLs finer than a tenant.
+
+</YourProject>

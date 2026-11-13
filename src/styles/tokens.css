@@ -1,0 +1,33 @@
+/* Design tokens for "AI Engineering from First Principles, annotated".
+   Annotated-edition look: warm paper, ink, one ember accent. Written for this repo. */
+:root {
+  --font-prose: 'Source Serif 4 Variable', 'Source Serif 4', Georgia, serif;
+  --font-ui: 'Geist Variable', 'Geist', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --text-2xs: 0.6875rem; --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.125rem; --text-xl: 1.3125rem; --text-2xl: 1.75rem; --text-3xl: clamp(2rem, 1.4rem + 2vw, 2.75rem);
+  --leading-snug: 1.4; --leading-prose: 1.65;
+  --tracking-wide: 0.06em; --tracking-caps: 0.1em;
+
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px;
+  --space-6: 32px; --space-7: 48px; --space-8: 64px; --space-9: 96px;
+
+  --measure: 42rem; --rail: 15rem; --radius: 6px; --radius-lg: 10px;
+
+  --bg: #fbfaf7; --surface: #f3f1ec; --surface-2: #e9e6df;
+  --ink: #1d1c1a; --ink-2: #4a4843; --ink-3: #6c6962;
+  --line: #e4e1da; --line-2: #d3cfc6;
+  --accent: #c1391c; --accent-ink: #ffffff; --accent-bg: #f8e9e4;
+  --warn: #875c00; --code-bg: #1e1e1c; --code-ink: #e8e6e1;
+  --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  color-scheme: light;
+}
+:root[data-theme='dark'] {
+  --bg: #121211; --surface: #1a1a18; --surface-2: #24241f;
+  --ink: #ecebe7; --ink-2: #b9b6ae; --ink-3: #8a877f;
+  --line: #2a2a26; --line-2: #3a3933;
+  --accent: #ff7a4d; --accent-ink: #1a0d07; --accent-bg: #2e1a12;
+  --warn: #d9a93a; --code-bg: #1a1a17; --code-ink: #e8e6e1;
+  color-scheme: dark;
+}

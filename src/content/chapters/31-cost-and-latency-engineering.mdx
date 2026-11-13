@@ -1,0 +1,763 @@
+---
+id: "31"
+title: "Cost and Latency Engineering"
+summary: "Find out where every rupee and millisecond of an LLM feature goes, then cut both with caching, routing, batching, effort tuning, trimming and budgets, while proving on your eval set that quality held."
+readingTime: "36 min"
+---
+
+Two messages arrive in the same week. Finance says the LLM bill tripled and nobody can say which feature did it. Support says users find the chatbot "slow" and close the tab before the answer appears. Neither is solved by a better prompt. Both are solved by measurement, then a short list of levers that production teams pull in roughly the same order.
+
+[Chapter 10](/10-inference-mechanics/) explained the machine: prefill sets time to first token, decode sets the streaming speed, cached prefixes skip prefill. [Chapter 11](/11-serving-and-model-economics/) explained the price page, cost per task and the gateway. This chapter is the applied playbook on top: where the money and the milliseconds go, which lever is free and which trades quality, and how you prove the trade was safe.
+
+Every price below is illustrative and every number is arithmetic you can redo; for real prices, check the provider's current price page. The order matters: measure first, take the free wins (caching, batch, trimming), then the trades gated by your eval set (routing, small models, effort), then the controls that stop one bad day from becoming a bad month (budgets, rate limits, alerts).
+
+## Unit economics per task/user
+
+The provider bills per call. Your business earns per user per month. Between the two sits the **task**: one evaluated essay, one answered question, one resolved ticket. A task is several calls, some of which fail and get retried. [Cost-per-task modelling](/11-serving-and-model-economics/#cost-per-task-modelling) gives the formula; here is how you use it to answer "do we make money on this user?".
+
+```text
+cost_per_attempt  = Σ calls in the task (uncached_in × p_in + cache_read × p_read
+                     + cache_write × p_write + (output + thinking) × p_out) / 1e6
+cost_per_success  = cost_per_attempt × (1 + retry_rate) / success_rate
+cost_per_user_mo  = tasks_per_user_mo × cost_per_success
+model_margin      = (price_per_user_mo − cost_per_user_mo) / price_per_user_mo
+```
+
+### Worked example: an answer evaluator
+
+Take a pipeline shaped like Answer Grader: a vision call that reads the handwritten answer, a model-answer generation, an evaluation, a claim check and a Hindi translation. Illustrative token counts and illustrative prices of $1 in and $4 out per million tokens:
+
+| Call | Input | Output |
+|---|---|---|
+| Vision extraction | 3,000 | 800 |
+| Model answer | 6,000 | 1,500 |
+| Evaluation | 8,000 | 1,200 |
+| Claim check | 2,500 | 300 |
+| Translation | 1,500 | 1,500 |
+| **Total** | **21,000** | **5,300** |
+
+Input costs `21,000 × 1 / 1e6 = $0.021`, output `5,300 × 4 / 1e6 = $0.0212`, so about $0.042 per attempt. With a 10% retry rate and a 95% success rate, `0.0422 × 1.1 / 0.95 ≈ $0.049` per successful evaluation. At an assumed ₹87 to the dollar that is about ₹4.25.
+
+Now the user side. A typical student does 40 evaluations a month: `40 × 4.25 = ₹170`. On an illustrative ₹299 plan, model cost is 57% of revenue, a 43% margin before servers, payments and people. The student at the 95th percentile does 150 evaluations: `150 × 4.25 ≈ ₹638`, more than twice what they pay. **The average user is not the user who loses you money.** Plot cost per user as a distribution and price (or cap) plans for the tail.
+
+```python
+import math
+from collections import defaultdict
+import statistics as st
+
+def unit_economics(ledger, plan_price_inr, usd_inr=87.0):
+    """ledger rows: {user, feature, task_id, usd, ok}. One row per model call."""
+    per_task = defaultdict(lambda: {"usd": 0.0, "ok": False, "user": None, "feature": None})
+    for r in ledger:
+        t = per_task[r["task_id"]]
+        t["usd"] += r["usd"]; t["ok"] |= r["ok"]; t["user"] = r["user"]; t["feature"] = r["feature"]
+    per_user = defaultdict(float)
+    for t in per_task.values():
+        per_user[t["user"]] += t["usd"] * usd_inr          # failed tasks still cost money
+    costs = sorted(per_user.values())
+    p95 = costs[max(0, math.ceil(0.95 * len(costs)) - 1)]   # nearest-rank percentile
+    losing = sum(c > plan_price_inr for c in costs)
+    ok = [t for t in per_task.values() if t["ok"]]
+    return {"cost_per_success_inr": sum(t["usd"] for t in per_task.values()) * usd_inr / max(1, len(ok)),
+            "median_user_inr": st.median(costs), "p95_user_inr": p95,
+            "users_above_plan_price": losing}
+```
+
+Notice the numerator of cost per success: all spend, including failed tasks. A pipeline that fails 20% of the time after the expensive vision call is billed for those failures. Answer Grader's `backend/auth.py` names exactly this: a failed run does not spend the student's quota, "but it is not free to us either", which is why it caps attempts.
+
+What goes wrong: estimates from a hand-kept price table drift from the invoice (Memory Agent's `DESIGN.md` records its estimates running at least 2× high against the console), and hidden calls (a judge, a discarded speculative call) never reach the ledger. Reconcile against the provider's usage export monthly.
+
+## Token budget accounting
+
+Before you cut anything, know where the tokens and milliseconds go. "The prompt is long" is not a diagnosis; a per-component budget is.
+
+### Where the tokens go
+
+A typical RAG chat request, with illustrative counts and illustrative prices of $3 in and $15 out per million:
+
+| Component | Tokens | Cost | Share |
+|---|---|---|---|
+| System prompt | 1,200 | $0.0036 | 7% |
+| Tool definitions | 800 | $0.0024 | 5% |
+| History (last turns) | 2,000 | $0.0060 | 12% |
+| Retrieved passages (5 × 600) | 3,000 | $0.0090 | 18% |
+| User message | 100 | $0.0003 | 1% |
+| Visible output | 400 | $0.0060 | 12% |
+| Thinking tokens | 1,500 | $0.0225 | 45% |
+| **Total** | 7,100 in, 1,900 out | **$0.0498** | |
+
+The hidden thinking tokens are the largest line, because [thinking bills as output](/11-serving-and-model-economics/#pricing-input-output-cached-thinking). Caching the 2,000-token static prefix at roughly a tenth of the input price saves `2,000 × 3 × 0.9 / 1e6 ≈ $0.0054`, about 11% of this call; the effort setting is the bigger lever here. Without the table you would optimize the wrong thing.
+
+### Read the usage fields correctly
+
+Every provider returns usage on every call, and they disagree on what "input" means; most cost dashboards go wrong here.
+
+- **Anthropic**: `input_tokens` is only the *uncached* part. Cache reads and writes are reported beside it in `cache_read_input_tokens` and `cache_creation_input_tokens`. Total prompt size is the sum of all three. Thinking is billed inside `output_tokens` (newer responses break it out in `output_tokens_details.thinking_tokens`).
+- **OpenAI**: the total *includes* cached tokens. In the Responses API, `input_tokens` contains the reads in `input_tokens_details.cached_tokens` and, on newer models that charge for writes, `cache_write_tokens` beside it; Chat Completions uses `prompt_tokens` and `prompt_tokens_details.cached_tokens`. Reasoning tokens sit inside the output count.
+- **Gemini**: `promptTokenCount` includes `cachedContentTokenCount`; tool-use prompt tokens come separately; `candidatesTokenCount` excludes thinking, which comes as `thoughtsTokenCount`. Answer Grader's `backend/llm.py` found this the hard way: counting only candidates "under-reported spend on every thinking model".
+
+Normalize once, at the gateway, into one shape:
+
+```python
+def normalize(provider: str, u: dict) -> dict:
+    """One shape for every provider: uncached input, cache read, cache write, billable output."""
+    if provider == "anthropic":
+        return {"uncached": u["input_tokens"],                      # already EXCLUDES cache reads
+                "cache_read": u.get("cache_read_input_tokens", 0),
+                "cache_write": u.get("cache_creation_input_tokens", 0),
+                "output": u["output_tokens"]}                       # thinking included
+    if provider == "openai":                      # Responses API names; Chat Completions: prompt_/completion_
+        total = u.get("input_tokens", u.get("prompt_tokens", 0))           # INCLUDES cached tokens
+        d = u.get("input_tokens_details") or u.get("prompt_tokens_details") or {}
+        read, write = d.get("cached_tokens", 0), d.get("cache_write_tokens", 0)
+        return {"uncached": total - read - write, "cache_read": read, "cache_write": write,
+                "output": u.get("output_tokens", u.get("completion_tokens", 0))}   # reasoning included
+    if provider == "gemini":                                        # check field docs per SDK version
+        cached = u.get("cachedContentTokenCount", 0)
+        return {"uncached": u["promptTokenCount"] + u.get("toolUsePromptTokenCount", 0) - cached,
+                "cache_read": cached, "cache_write": 0,
+                "output": u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0)}
+    raise ValueError(provider)
+
+def call_usd(n, p_in, p_out, read_mult=0.1, write_mult=1.25):    # multipliers: roughly, check docs
+    return (n["uncached"] * p_in + n["cache_read"] * p_in * read_mult
+            + n["cache_write"] * p_in * write_mult + n["output"] * p_out) / 1e6
+```
+
+For Anthropic the correct cost is therefore `input + ~0.1 × cacheRead + write premium × cacheCreation` (the read multiplier is roughly a tenth by default; the current docs list 0.05× for Opus and Sonnet 5.5 and lower still on a few models, so take it from the price page per model). The common bug is to treat `input_tokens` as the total and subtract the discount from it. Memory Agent does exactly that at `src/agent.ts` line 232: `result.usage.input - result.usage.cacheRead * 0.9`. Say a warm turn has `input_tokens` 3,000 and `cache_read_input_tokens` 4,000. The right billable equivalent is `3,000 + 0.1 × 4,000 = 3,400` input tokens (3,200 at the 0.05× read rate of the 5.5 models Memory Agent uses). Memory Agent computes `3,000 − 3,600 = −600`, which `cost$` clamps to zero with `Math.max(0, inTok)`: the input side of a warm turn is reported as free. The estimate is wrong in the direction that hides spend.
+
+### Count before you send
+
+Budgets need the count before the call (how many passages fit, when to compact, what to reject). Use the provider's token-counting endpoint (Anthropic `messages/count_tokens`, Gemini `countTokens`) or a local tokenizer. Character limits are a weak proxy, weakest for Indian languages: Devanagari usually costs [more tokens per character](/02-tokenization/#failure-modes-arithmetic-spelling-non-english-cost) than English, so Scheme Assistant's `prompt_total_chars = 20000` cap in `src/app/config.py` spends a different token budget for a Hindi question than for an English one.
+
+### The latency budget
+
+Do the same for milliseconds. Say the product promise is "the answer starts within 2 seconds at p95" for a RAG chatbot:
+
+```text
+stage                         p95 budget
+gateway, auth, rate limit         20 ms
+query rewrite (small model)      300 ms
+embed query                      100 ms
+hybrid search                     80 ms
+rerank                           150 ms
+prompt assembly                   10 ms
+LLM time to first token          900 ms   (queue + prefill of ~7K tokens)
+---------------------------------------
+sum                            1,560 ms   -> 440 ms headroom
+```
+
+Percentiles do not add (summed p95s usually overstate the p95 of the sum, a safe bias). And the stage that dominates **end-to-end** latency is usually none of these. End to end is `TTFT + TPOT × (output tokens − 1)` ([the metrics](/10-inference-mechanics/#ttft-tpot-itl-throughput)). At an illustrative 20 ms per output token, a 400-token answer streams for 8 seconds after the first token, and a 1,200-token answer at the tail takes 24. **Tail latency in LLM systems mostly comes from long outputs and long thinking**, not slow servers. That is why `max_tokens`, answer-length instructions and effort settings are latency controls.
+
+## Prompt caching
+
+The mechanism is in [prefix caching](/10-inference-mechanics/#prefix-prompt-caching): the provider keeps the KV cache of a prompt prefix, so a later request that starts with the same tokens skips their prefill. You pay a fraction of the input price for the cached part and get a lower TTFT. This section is about designing for it.
+
+### The rules that decide your hit rate
+
+1. **It matches an exact prefix.** Any byte that changes invalidates everything after it. On Anthropic the render order is tools, then system, then messages, so the tool list and the system prompt are the front of the prefix.
+2. **Static first, dynamic last.** Put the frozen system prompt, sorted tool definitions and fixed examples first; then semi-static content (a document under discussion, a session's retrieved set); then the per-request message. A date, a user name or a request id inside the system prompt makes every request a miss. [Cache-aware layout](/27-context-engineering/#cache-aware-layout) develops this for agents.
+3. **There is a minimum length.** Prefixes below a model-dependent minimum (from a few hundred to a few thousand tokens; check the docs for your model) are silently not cached. No error, just zero cache reads.
+4. **Entries expire.** Anthropic's default lifetime is about five minutes, refreshed on every read, with a one-hour option at a higher write price. Traffic that arrives more often than the TTL keeps the entry warm on its own.
+5. **Caches are scoped to the model, and some parameters invalidate parts of them.** Switching models means a cold cache. On Anthropic, changing the thinking mode always invalidates the cached messages and changing the top-level effort can too (on some models the tools and system as well); the docs say to treat either change as a full miss, so pin both per route instead of varying them per request.
+6. **Automatic or marked.** OpenAI caches prompts above about 1,024 tokens by default (newer models also accept explicit breakpoints); Anthropic needs `cache_control` on a block or one top-level `cache_control` that places the breakpoint for you, up to four breakpoints per request.
+
+### Does it pay? The break-even
+
+Anthropic charges a premium to write an entry (roughly 1.25× the input price for the five-minute TTL and roughly 2× for one hour) and roughly 0.1× to read one (less on some models); OpenAI's newest models now price writes the same way, while older OpenAI models charge nothing extra to write. For a prefix of P tokens used n times within the TTL:
+
+```text
+cached cost   = 1.25 P + 0.1 P × (n − 1)
+uncached cost = n P
+n = 1:   1.25 P  vs  1 P     -> caching loses 25% (a prefix used once)
+n = 2:   1.35 P  vs  2 P     -> already saves 32%
+n = 10:  2.15 P  vs 10 P     -> saves 78.5%
+```
+
+A breakpoint loses money only on prefixes written and never read. So the metric to watch is the **cache hit rate**, on input tokens:
+
+```text
+Anthropic:  hit rate = cache_read / (input_tokens + cache_read + cache_creation)
+OpenAI:     hit rate = cached_tokens / input_tokens       (prompt_tokens in Chat Completions)
+```
+
+```python
+def cache_report(calls):
+    """calls: normalized usage dicts (see normalize()). Returns hit rate and the saving vs no cache."""
+    read = sum(c["cache_read"] for c in calls)
+    write = sum(c["cache_write"] for c in calls)
+    total_in = sum(c["uncached"] + c["cache_read"] + c["cache_write"] for c in calls)
+    hit = read / total_in if total_in else 0.0
+    # input-token equivalents actually billed vs what the same prompts cost uncached
+    billed = sum(c["uncached"] for c in calls) + 0.1 * read + 1.25 * write
+    return {"hit_rate": round(hit, 3), "input_saving": round(1 - billed / total_in, 3) if total_in else 0,
+            "writes_per_read": round(write / read, 2) if read else None}
+```
+
+A `writes_per_read` near or above 1 says you are paying the premium without the reads: the breakpoint is on something that changes, or traffic is too sparse for the TTL.
+
+### Silent invalidators
+
+When the hit rate is near zero, the cause is almost always one of these: a timestamp or "today is ..." line in the system prompt; JSON serialized with unstable key order; tool definitions assembled in a different order per request (sort by name); a per-user line near the top; switching models within a conversation (a cascade does this by design); a thinking or effort change between requests; a fallback path that appends a line to the system prompt; a sliding history window that drops the oldest message each turn (see [context trimming](#context-trimming)). The diagnostic is mechanical: diff two consecutive request bodies; the first difference inside the intended shared prefix is the bug.
+
+### The latency side
+
+A hit also skips prefill for the cached tokens, so TTFT drops roughly in proportion to the cached share ([prefill sets TTFT](/10-inference-mechanics/#prefill-vs-decode)): with a 6,000-token static prefix and a 1,000-token dynamic part, warm requests prefill a seventh of the tokens.
+
+<Callout type="warn">
+
+Chat Insights's prompt builder says its system text is "static per language so providers can cache it", and `mapUsage` records cache reads and writes. But the Anthropic body sends `system` as a plain string with no `cache_control`, so the cache fields stay empty. Designing for the cache and opting in are separate steps: check the usage field, not the intention.
+
+</Callout>
+
+## Semantic and exact caching
+
+Prompt caching reuses the *computation* of a prefix; the model still generates a fresh answer. A **response cache** skips the call entirely and returns a stored answer. It comes in two kinds with very different risk.
+
+### Exact caching
+
+Key on a hash of everything that determines the answer, and return the stored response on a match. It is safe when the same input really should produce the same output: classification, extraction, translation, a summary of a fixed document, an evaluation of an identical submission, a text-to-speech rendering of a fixed string.
+
+```python
+import hashlib, json, time, unicodedata
+
+def norm(text: str) -> str:
+    # NFC matters for Indic scripts: the same word can arrive as different code-point sequences
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+class ExactCache:
+    def __init__(self, ttl_s: int):
+        self.ttl, self.store = ttl_s, {}
+
+    def key(self, *, feature, model, prompt_version, params, inputs, scope):
+        blob = json.dumps({"f": feature, "m": model, "pv": prompt_version, "p": params,
+                           "i": {k: norm(v) if isinstance(v, str) else v for k, v in inputs.items()},
+                           "s": scope}, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def get(self, k):
+        hit = self.store.get(k)
+        return hit[1] if hit and hit[0] > time.time() else None
+
+    def put(self, k, value):
+        self.store[k] = (time.time() + self.ttl, value)
+```
+
+The key holds model and prompt version, and `params` should carry the data version (the corpus snapshot), so a deploy or re-index invalidates old entries automatically; `scope` is the tenant or user when the answer depends on who asks. You cannot get "the same answer twice" from deterministic sampling either: temperature 0 is not exactly deterministic on batched inference ([batch invariance](/04-language-modeling-and-sampling/#determinism-seeds-batch-invariance)), and current Claude models reject non-default sampling parameters altogether. A response cache is the only reliable way to return an identical answer.
+
+A hash lookup is nearly free, so any real hit rate pays. Scheme Assistant's speech endpoint (`src/app_api/speech.py`) is a clean example: an LRU of generated audio keyed on SHA-256 of language, speed flag and text, so an answer read aloud twice is billed once, with an `X-Tts-Cache` hit or miss header.
+
+### Semantic caching
+
+A semantic cache embeds the incoming query, finds the nearest stored query, and returns its answer if the similarity is above a threshold. It catches paraphrases ("what is the fee for PM-Kisan?" and "PM-Kisan fee kitna hai?") that an exact cache misses. It is also the one cost lever that can make your product confidently wrong.
+
+**When it is dangerous:**
+
+- **Small words, big meaning.** "Can I cancel my order?" and "Can I not cancel my order?" embed almost identically; so do "income below 2 lakh" and "below 5 lakh". Embeddings capture topic, not polarity or numbers.
+- **Personal answers.** "What is my balance?" from two users is one string with two correct answers; a shared cache leaks data across users.
+- **Freshness.** "Latest price of X" changes; Memory Agent, whose job is re-checking prices against the live web, has no response cache, and a semantic one would defeat its purpose.
+- **Context dependence.** "And for widows?" means something different after each previous turn; cache only condensed standalone questions.
+
+**Safe use**: scope by tenant (and user for anything personal), cache only generic, stable features, require numbers and negations to match, calibrate the threshold, expire on data change.
+
+```python
+import re, time
+NUM = re.compile(r"\d+(?:[.,]\d+)?")
+NEG = re.compile(r"\b(?:not|no|never|without)\b|n't|नहीं|मत", re.I)
+
+class SemanticCache:
+    def __init__(self, embed, threshold: float):
+        self.embed, self.t, self.rows = embed, threshold, []   # rows: (scope, vec, query, answer, expiry)
+
+    def get(self, scope: str, query: str):
+        v = self.embed(query)                                 # unit-normalized vector
+        cands = [(float(v @ vec), q0, ans) for s, vec, q0, ans, exp in self.rows
+                 if s == scope and exp > time.time()]
+        if not cands:
+            return None
+        sim, q0, ans = max(cands)
+        if sim < self.t:
+            return None
+        if NUM.findall(q0) != NUM.findall(query) or bool(NEG.search(q0)) != bool(NEG.search(query)):
+            return None                                       # same topic, different meaning
+        return ans
+
+    def put(self, scope, query, answer, ttl_s):
+        self.rows.append((scope, self.embed(query), query, answer, time.time() + ttl_s))
+```
+
+### Calibrate the threshold on the right population
+
+Pick the threshold from labelled pairs: real incoming queries against stored queries, labelled "same question" or "different". Measure the **false-hit rate** (different questions served a cached answer) at each threshold and choose the lowest threshold whose false-hit rate you can live with. The expected value is `hit_rate × cost_saved − false_hit_rate × cost_of_a_wrong_answer`, and for a government-scheme assistant the cost of a wrong answer is not measured in rupees.
+
+Answer Grader's `scripts/calibrate_reuse_threshold.py` documents the trap in its own docstring. It calibrates a similarity threshold for "the student asked this same question". An earlier version compared stored rows against stored rows, which share trailing metadata, so identical questions scored 1.0 and the populations looked cleanly separated; the threshold it endorsed recognized only 56% of real matches in production. The fix was to embed the query text as it arrives at runtime and compare it with stored vectors. Same lesson for a semantic cache: calibrate on what the cache will actually see.
+
+## Routing and cascades
+
+[Chapter 11](/11-serving-and-model-economics/#routing-and-cascades) gives the definitions and the arithmetic: routing decides before the call, a cascade decides after it, and a cascade costs `c_small + c_verify + (1 − a) × c_large`. Here is the playbook for building one that does not quietly lower quality.
+
+### Build the router from your eval table
+
+Run the same eval set through the small and the large model, keep per-case pass or fail for both, and record whatever signal the router will use (a classifier score, the planner's intent label, a rule). Then choose the threshold that minimizes cost subject to a quality floor:
+
+```python
+def pick_threshold(rows, c_small, c_large, max_drop=0.01):
+    """rows: (router_score, small_passed, large_passed) for the same eval cases.
+    Higher score = router thinks the case is easy. Returns (threshold, cost per request)."""
+    n = len(rows)
+    base_quality = sum(r[2] for r in rows) / n               # everything on the large model
+    best = (float("inf"), c_large)                           # never route small
+    for t in sorted({r[0] for r in rows}):
+        easy = [r for r in rows if r[0] >= t]
+        quality = (sum(r[1] for r in easy) + sum(r[2] for r in rows if r[0] < t)) / n
+        cost = (len(easy) * c_small + (n - len(easy)) * c_large) / n
+        if quality >= base_quality - max_drop and cost < best[1]:
+            best = (t, cost)
+    return best
+```
+
+With 100 eval cases a gap of a few points is within noise ([sample sizes](/19-evals-methodology/#noise-statistics-sample-sizes)), so confirm the chosen threshold on a larger set, and report quality **per route**: an aggregate can hide a collapsed route.
+
+Memory Agent's `DECISIONS.md` (decision 2) did this by hand, same scenarios and judge per writer: Opus everywhere passed 7/10 at a 10.5 s median, Sonnet 7/10 at 6.9 s, Haiku 6/10 at 5.3 s while failing all three re-checks, and the routed setup (Haiku for chat, Sonnet for search, Opus for re-checks) passed 7 to 8 of 10 at about 6.6 to 6.9 s. `src/agent.ts` lines 173 to 175 implement it from the Haiku planner's intent.
+
+### Cheap signals first
+
+An LLM router is itself a call (about 2 seconds for Memory Agent's planner). Put a rules fast path in front for obvious cases: `src/fastpath.ts` skips the planner only when the whole message is a greeting, thanks or "what can you do?", so "hey, what does Notion cost?" still goes to the planner. Keep fast paths near-perfect in precision, and test them.
+
+### Costs that the cascade formula hides
+
+- **Latency on escalation.** An escalated request pays the cheap call plus the strong one. If 30% escalate, p95 latency can get worse while average cost falls.
+- **The cache.** Caches are scoped to the model. A cascade that tries model A then model B pays for two cold prefixes, and a router that switches models mid-conversation breaks the cache for the history. Before building a cascade, measure the simpler option: the strong model at a lower effort setting ([reasoning-effort tuning](#reasoning-effort-tuning)), which keeps one model and one cache.
+- **Verifier drift.** Watch the escalation rate. A sudden drop usually means the verifier broke (always says "fine"), not that traffic got easier.
+
+## Small/distilled models
+
+The cheapest call is to a much smaller model that is good enough for a narrow job. Most pipelines hide several: classify the intent, detect the language, extract fields, decide whether retrieval is needed, rewrite the query, check a citation, summarize a tool result. None of these needs a frontier model, and each runs on every request.
+
+**When a small model is enough**: the output space is small (a label, a short JSON object, a yes/no), the input is short, and you can check the output (schema validation, a known label set). **When it is not**: open-ended generation where quality is the product, multi-step reasoning, rare cases the small model has never seen.
+
+The ladder, cheapest first:
+
+1. **No model.** Rules, regexes, a lookup table. Scheme Assistant's scope pre-filter (`src/app/core/scope.py`) and small-talk classifier answer some messages before any retrieval or LLM call.
+2. **An embedding plus a classical classifier.** Logistic regression on sentence embeddings is a strong intent classifier given a few hundred labelled examples.
+3. **A small hosted model.** Memory Agent's `fastModel` in `src/config.ts` is the planner and the post-turn claim extractor; only the writer uses bigger models.
+4. **A distilled model.** Label a few thousand real inputs with the large model, check a sample by hand, fine-tune a small open model on them ([distillation](/09-fine-tuning-in-practice/#distillation)). "Distilling Step-by-Step" (Hsieh et al., 2023) trained small models on a large model's rationales as extra supervision; a 770M-parameter T5 beat the 540B PaLM it learned from on one benchmark, with less training data than plain fine-tuning needed.
+
+Distillation pays after `D / (c_L − c_S)` calls, where `D` is the one-off cost of labelling, training and evaluation. With 5,000 labels at an illustrative $0.01, $60 of training and eval, and $0.004 vs $0.0004 per call, that is `110 / 0.0036 ≈ 30,600` calls: days, at a high volume of a narrow task.
+
+The risks are drift and the long tail: trained on last quarter's traffic, the small model fails silently on new kinds of input. Keep a shadow sample on the large model, compare weekly, and retrain on disagreements.
+
+## Batch APIs
+
+Much LLM work has nobody waiting for it: eval runs, backfills, re-scoring a corpus, nightly summaries, synthetic data. Providers sell asynchronous **batch APIs** for this: you submit a file of requests, results arrive later (commonly most within an hour, with a deadline around 24 hours), at roughly half the normal price, against a separate rate-limit pool so a backfill cannot starve live traffic. On Anthropic the batch discount applies to every token, cache reads and writes included, so it stacks with caching. Check the current docs for the exact discount, window and size limits.
+
+The rule: **anything that can wait an hour goes through the batch path.** The engineering is in the plumbing.
+
+```python
+PROMPT_VERSION = "eval-v7"
+
+def build_batch(rows, model, system):
+    return [{"custom_id": f"{r['id']}__{PROMPT_VERSION}",       # join key; [A-Za-z0-9_-], at most 64 chars
+             "params": {"model": model, "max_tokens": 1024, "system": system,
+                        "messages": [{"role": "user", "content": r["text"]}]}}
+            for r in rows]
+
+def reconcile(rows, results):
+    by_id = {res["custom_id"]: res for res in results}
+    done, retry = [], []
+    for r in rows:
+        res = by_id.get(f"{r['id']}__{PROMPT_VERSION}")
+        if res and res["result"]["type"] == "succeeded":
+            done.append((r["id"], res["result"]["message"]))
+        else:
+            retry.append(r)          # errored, expired, canceled or missing: resubmit, do not drop
+    return done, retry
+```
+
+Join by id, never by position (results can come back in any order; Anthropic restricts `custom_id` to letters, digits, `_` and `-`, so a colon separator is rejected); reconcile per request (expired or errored rows go into the next batch, never silently lost); put the prompt version in the custom id so a re-run never mixes old and new answers.
+
+Arithmetic for a nightly eval: 300 cases × 3 repeats × 2 candidate prompts = 1,800 calls a night. At an illustrative $0.02 per call that is $36 a night synchronously, about $18 batched, roughly $540 a month saved for a one-afternoon change. None of Gaurav's repos uses a batch API today. The natural first candidates are offline grading passes, such as Memory Agent's eval judge; Scheme Assistant's critic run drives the live API turn by turn, so only a separate judging pass over its saved transcripts could move to batch.
+
+The trade-off: no latency guarantee, so a CI gate that waits on a batch can wait hours. Use batch for the nightly full suite and a small synchronous smoke set for the pre-merge check ([evals in CI](/20-evals-judges-and-ci/#evals-in-ci)).
+
+## Streaming and perceived latency
+
+Users experience how long they stare at nothing, and whether the wait looks like progress. Two systems with the same 8-second total feel completely different if one shows the first words at 0.8 s and the other shows everything at 8 s.
+
+**Streaming** sends tokens as they are decoded, so perceived latency becomes TTFT rather than the full generation time. It costs nothing extra in tokens. The plumbing is server-sent events (SSE) from your backend to the browser ([streaming over SSE](/32-deployment-and-llmops/#streaming-over-sse-websockets)), forwarding the provider's text deltas, and measuring TTFT where the user sees it:
+
+```ts
+type Ev = { type: "status" | "text" | "done"; text?: string; meta?: object };
+
+async function* mockLLM(prompt: string): AsyncGenerator<string> {        // stands in for a provider stream
+  await new Promise((r) => setTimeout(r, 600));                           // queue + prefill
+  for (const w of "Here is the short answer, then the details.".split(" ")) {
+    await new Promise((r) => setTimeout(r, 25));                          // decode, per token
+    yield w + " ";
+  }
+}
+
+export async function streamTurn(prompt: string, send: (e: Ev) => void) {
+  const t0 = performance.now();
+  let ttft: number | null = null, tokens = 0;
+  send({ type: "status", text: "Searching the scheme documents…" });     // progress before tokens exist
+  for await (const delta of mockLLM(prompt)) {
+    if (ttft === null) ttft = performance.now() - t0;
+    tokens++;
+    send({ type: "text", text: delta });
+  }
+  const total = performance.now() - t0;
+  send({ type: "done", meta: { ttftMs: ttft, totalMs: total, tpotMs: ttft ? (total - ttft) / Math.max(1, tokens - 1) : null } });
+}
+```
+
+### Making the wait feel shorter
+
+- **Show progress before tokens exist** with status events ([progress UX](/34-product-ux-and-feedback/#streaming-and-progress-ux)).
+- **Answer first, explain after**, so the useful part arrives in the first tokens.
+- **Parse structured output incrementally**; partial JSON is not valid JSON ([streaming partial structures](/13-structured-output/#streaming-partial-structures)).
+
+### When you cannot stream
+
+Streaming assumes every token is safe to show the moment it exists. Two projects in Gaurav's repos found cases where it is not.
+
+- **Verify-then-show.** Scheme Assistant's SSE stream (`src/app_api/chat.py`) carries events, not tokens: the answer must pass citation verification before the citizen sees it, so it is sent complete. That trades TTFT for correctness on purpose, with heartbeats meanwhile. If you need verification and fast first output, verify per sentence or per claim and stream verified chunks.
+- **The model buffers.** Memory Agent's `DECISIONS.md` (decision 3) records timing probes: after a server-side search, its thinking-model writers sent nothing until the answer was complete (Opus's whole answer arrived within 0.3 s, 8.9 s in); only Haiku with thinking off streamed, first text at 1.0 s. The fix was product, not infrastructure: stream each search query and result as status events, and route chat turns to the model that truly streams.
+
+### Cutting the real tail
+
+Agents and pipelines have no one reading the stream; total time is the metric, dominated by output length. The levers: a `max_tokens` that fits the task (too low truncates and causes retries), length instructions, lower effort, a smaller model where the eval allows. Some providers sell a faster decoding mode at a premium per token: worth it only where seconds are worth money.
+
+## Parallel calls
+
+Independent steps run one after another cost the **sum** of their durations; run concurrently, the **maximum**. Token cost is unchanged: the most reliable latency win that does not touch quality.
+
+Draw the dependency graph and find the critical path:
+
+```text
+sequential:  vision 4s -> model answer 6s -> claim check 2s -> evaluation 5s -> translate 3s  = 20 s
+dependencies: claim check needs the model answer; evaluation needs only the vision output;
+              translation needs only the model answer
+parallel:    vision 4s -> [ model answer 6s -> (claim check 2s || translate 3s) ]  || evaluation 5s
+             critical path = 4 + 6 + 3 = 13 s
+```
+
+Answer Grader does a version of this in `backend/pipeline.py`: the claim check and the evaluation run in a `ThreadPoolExecutor(max_workers=2)`, each thread with a copy of the request's context so both write to the same per-run cost ledger, and the Hindi translation is submitted while the evaluation runs. In Scheme Assistant (teammate code in `src/app/core/retrieval.py`), the dense leg's query-embedding request starts as a background task before the lexical SQL runs, so the two overlap.
+
+```python
+import asyncio
+
+async def bounded_gather(coros, limit: int):
+    sem = asyncio.Semaphore(limit)                 # stay under the provider's concurrency/TPM limits
+    async def run(c):
+        async with sem:
+            return await c
+    return await asyncio.gather(*(run(c) for c in coros), return_exceptions=True)
+
+async def hedged(call, hedge_after_s: float):
+    """Tail-latency hedge: if the first attempt is slower than ~p95, start a second and take the winner."""
+    first = asyncio.create_task(call())
+    done, _ = await asyncio.wait({first}, timeout=hedge_after_s)
+    if done:
+        return first.result()
+    second = asyncio.create_task(call())
+    done, pending = await asyncio.wait({first, second}, return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()                                 # cancelled streams may still be billed for tokens so far
+    return done.pop().result()
+```
+
+Parallelism multiplies your instantaneous token rate, so bound it with a semaphore and the client-side token bucket from [rate limits](/11-serving-and-model-economics/#rate-limits-quotas-batch-apis). A hedge at the p95 delay duplicates about 5% of calls: a lower p99 for roughly 5% more spend.
+
+### Speculative work
+
+The aggressive version starts work before you know you need it. Memory Agent's speculative writer (`src/fastpath.ts`, `src/gate.ts`) runs the search writer alongside the planner, holds its events behind a gate, and releases them only if the planner returns a plain search with the default budget; otherwise it aborts unseen. It is built, tested with a fake client, and off by default (`SPECULATIVE_WRITER`), because a discarded call still costs tokens and the speculative writer does not see the planner's notes. The arithmetic for when to turn it on:
+
+```text
+time saved per turn   = p_keep × planner_latency            (about 2 s in Memory Agent)
+extra cost per turn   = (1 − p_keep) × cost of the partial discarded call
+turn it on when the eval says quality is unchanged and the time is worth that cost
+```
+
+A review of its first version found two real bugs (a failed speculation replayed, then answered again; a fallback writer with no deadline): speculation is concurrency plus cancellation, and both need tests.
+
+## Reasoning-effort tuning
+
+Reasoning models spend hidden thinking tokens before the answer, billed as output. On many routes this is the largest line on the bill, as the token table above showed, and it is also latency: thinking tokens are decoded one at a time like any other output. Most APIs now expose a dial instead of a hard budget: an **effort** level (OpenAI's `reasoning_effort`, Anthropic's `output_config.effort`), or a thinking-token budget (Gemini's `thinking_budget`; Gemini 3 and later take a `thinking_level` instead). On the newest Claude models thinking is adaptive and effort is the only control; fixed thinking budgets are rejected there. See [thinking budgets and effort levels](/08-reasoning-models/#thinking-budgets-and-effort-levels) for what the dial does inside the model.
+
+Answer Grader's `backend/llm.py` records the motivating incident in a comment: uncapped, a model answer plus evaluation on Gemini spent about 10,300 output tokens against about 2,400 on gpt-4o for the same work, "making Gemini dearer per evaluation despite its lower price". The fix was `GEMINI_THINKING_BUDGET`, plus counting `thoughtsTokenCount` in the ledger so the cost was visible at all. Scheme Assistant's config defaults the Gemini thinking budget to 0.
+
+The method is a sweep, per route, on the eval set:
+
+```python
+import math
+
+def effort_sweep(cases, run, grade, levels=("low", "medium", "high"), noise=0.03):
+    """run(case, effort) -> (answer, usd, seconds). Pick the cheapest level within noise of the best."""
+    table = []
+    for lvl in levels:
+        res = [run(c, lvl) for c in cases]
+        passed = sum(grade(c, a) for c, (a, _, _) in zip(cases, res)) / len(cases)
+        usd = sum(r[1] for r in res) / len(cases)
+        p95 = sorted(r[2] for r in res)[max(0, math.ceil(0.95 * len(res)) - 1)]
+        table.append({"effort": lvl, "pass": passed, "usd": usd, "p95_s": p95})
+    best = max(t["pass"] for t in table)
+    choice = min((t for t in table if t["pass"] >= best - noise), key=lambda t: t["usd"])
+    return choice, table
+```
+
+What usually comes out: chat, classification, extraction and short answers hold quality at low effort; multi-step reasoning, code and re-checks of earlier claims need more. Memory Agent encodes exactly this per route: `effort` is `"medium"` for re-checks and `"low"` for everything else (`src/agent.ts` line 175).
+
+Pin effort per route (changing it between requests can invalidate the prompt cache on Anthropic), re-run the sweep on every model upgrade (levels and defaults get recalibrated), and log thinking tokens separately so a regression reads "thinking per request doubled", not a mystery on the invoice.
+
+## Context trimming
+
+Input tokens drive cost and, through prefill, TTFT. Every token in the context should earn its place. [Context engineering](/27-context-engineering/) covers the quality side (context rot, just-in-time retrieval); here is the budget side.
+
+The levers, roughly in order of payoff:
+
+- **Retrieved passages.** Tune [top-k](/17-rag-pipelines/#top-k-tuning) on your eval; a reranker that lets you send 4 passages instead of 12 often pays for itself.
+- **History.** Keep recent turns verbatim, [compact](/27-context-engineering/#compaction) older ones, or condense into a standalone question as Scheme Assistant's `src/app_api/context.py` does.
+- **Tool results.** Return the fields the model needs, not the raw payload ([tool-result trimming](/27-context-engineering/#tool-result-trimming)).
+- **Instructions.** Delete system-prompt rules your eval says do nothing.
+- **Compression.** LLMLingua (Jiang et al., 2023) uses a small language model to drop low-information tokens, reporting up to 20× compression with little loss on its benchmarks; check faithfulness on yours first.
+
+Assemble the context against a token budget, in priority order:
+
+```python
+def assemble(system, question, history, passages, count, budget, keep_turns=4, block=6, hist_share=0.4):
+    """count(text) -> tokens. Drops the least useful material first; returns (parts, tokens used)."""
+    old, recent = history[:-keep_turns], history[-keep_turns:]
+    cap = budget * hist_share
+    # old history is dropped in BLOCKS from the front, not one turn per request,
+    # so the start of the messages (the cached prefix) stays the same for many turns
+    while old and sum(map(count, old + recent)) > cap:
+        old = old[block:]
+    turns = old + recent
+    while turns and sum(map(count, turns)) > cap:          # recent turns alone too long
+        turns = turns[1:]
+    used = count(system) + count(question) + sum(map(count, turns))
+    ctx = []
+    for p in passages:                                      # already sorted by reranker score
+        if used + count(p) > budget:
+            break
+        ctx.append(p); used += count(p)
+    return [system, *turns, *ctx, question], used
+```
+
+The block rule in that sketch is the interaction most people miss: **trimming and caching fight**. A sliding window that drops the oldest message every turn changes the start of the messages prefix every turn, so the cache never hits past the system prompt. Dropping history in large blocks (or compacting at thresholds) keeps the prefix stable for many turns between rewrites.
+
+The risk of trimming is quality: the passage you cut was the one with the answer, the turn you summarized held the user's constraint. Every trimming change is an eval run. Gaurav's repos show the range: Answer Grader uses only the first 1,500 characters of each of the top five reference answers when matching facts (`backend/pipeline.py`), Chat Insights caps the message at 2,000 characters, code at 150 lines, history at 10 turns and anchors at 3 (`backend/src/lc/services/contextBuilder.js`), and Scheme Assistant (teammate code) added its character caps after long guideline sections pushed single prompts to 13K tokens and 17 s. All are character or line limits; none counts tokens before the call.
+
+## Agent budgets and runaway control
+
+A single call has a bounded cost: `max_tokens` caps it. An agent loop does not. Each step re-sends the whole history, so cost grows faster than the number of steps. With a fixed prefix S and each step adding d tokens of tool calls and results, the input tokens over n steps are:
+
+```text
+input over n steps = Σ_{i=1..n} (S + (i − 1) × d) = n × S + d × n(n−1)/2
+
+S = 3,000, d = 1,500:
+  n = 5   ->  15,000 + 15,000  =  30,000 tokens
+  n = 30  ->  90,000 + 652,500 = 742,500 tokens   (6× the steps, about 25× the tokens)
+```
+
+Prompt caching softens this (each step's input is mostly the previous step's prefix, read at a fraction of the price) but keeps the quadratic shape, and output and thinking are never cached. The [agent loop chapter](/22-agent-loop/#stop-conditions-and-budgets) covers stop conditions; here are the money controls.
+
+```python
+import time
+
+class BudgetExceeded(Exception): ...
+
+class Budget:
+    def __init__(self, max_steps=12, max_usd=0.50, deadline_s=60, max_tokens=400_000):
+        self.max_steps, self.max_usd, self.max_tokens = max_steps, max_usd, max_tokens
+        self.deadline = time.monotonic() + deadline_s
+        self.steps = self.usd = self.tokens = 0
+
+    def charge(self, usd: float, tokens: int):
+        self.steps += 1; self.usd += usd; self.tokens += tokens
+        if self.steps >= self.max_steps:   raise BudgetExceeded("steps")
+        if self.usd >= self.max_usd:       raise BudgetExceeded("usd")
+        if self.tokens >= self.max_tokens: raise BudgetExceeded("tokens")
+        if time.monotonic() > self.deadline: raise BudgetExceeded("deadline")
+
+# in the loop: after every model call, budget.charge(call_usd(norm, p_in, p_out), total_tokens)
+# on BudgetExceeded: stop tools, ask the model for a best-effort answer from what it has, log the reason
+```
+
+Budgets belong at four levels, and Gaurav's repos have an example of each:
+
+1. **Per call**: `max_tokens`, a timeout, a cap on server-tool uses (Memory Agent's web search `max_uses`).
+2. **Per task**: Memory Agent caps searches per turn (6, scaled up to at most 10 for multi-product questions), writer rounds (3) and the turn (`TURN_DEADLINE_MS`, 45 s); Chat Insights retries a failed call once, never on a refusal.
+3. **Per user per period**: Chat Insights's chat service increments a per-user daily hint counter atomically and returns 429 past the cap (60 by default); Answer Grader's `ATTEMPT_CEILING_MULTIPLIER` stops a reliably failing upload from burning vision calls.
+4. **Per job**: Scheme Assistant's critic harness (`scripts/critic_api.py`) prices every Gemini response into a ledger and refuses calls past a rupee cap (`CRITIC_CAP_INR`, default 380); Memory Agent's eval runner stops starting scenarios at `--budget`.
+
+Stop gracefully: return the best partial answer and say what is unfinished, not a 500.
+
+### Denial of wallet
+
+An LLM endpoint is an endpoint that spends your money per request. Without limits, one scripted client, one buggy retry loop in your own frontend or one prompt that sends an agent in circles can produce a month's bill in an afternoon. This is a security problem, not only a cost one ("unbounded consumption" is on the [OWASP LLM Top 10](/33-security-prompt-injection/#owasp-llm-top-10-and-red-teaming)). The controls: authentication before any paid call, per-user and per-IP rate limits, per-tenant daily spend caps, input size limits (reject a 500K-token paste before it reaches the model), output caps, and spend alerts per key. Memory Agent's server has no rate limit on its paid endpoint: the gap to close first.
+
+## Self-host break-even
+
+[API vs self-hosted](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights) has the full formula and a worked 10M-requests-a-day example. The one-paragraph version: API cost is variable (per token), self-hosting is mostly fixed (per GPU-hour, sized for peak, plus people), so self-hosting wins only at high, steady volume, and only if an open model you can serve passes the same eval.
+
+The operational lens this chapter adds is **utilization**. A self-hosted GPU's cost per token is `GPU $/hour ÷ (tokens/s actually served × 3,600)`, so the real question is what fraction of its capacity you keep busy:
+
+```python
+def breakeven_utilization(gpu_usd_hr, peak_tok_s_per_gpu, api_usd_per_m_out):
+    """Fraction of a GPU's sustained throughput you must keep busy for it to beat the API price."""
+    full_util_cost_per_m = gpu_usd_hr / (peak_tok_s_per_gpu * 3600) * 1e6
+    return full_util_cost_per_m / api_usd_per_m_out
+
+# illustrative: $2.50/hr GPU, 1,000 tok/s under load, vs an API at $0.40 and at $15 per M output
+print(round(breakeven_utilization(2.5, 1000, 0.40), 2))   # ~1.74: cannot beat a cheap API even at 100%
+print(round(breakeven_utilization(2.5, 1000, 15.0), 3))   # ~0.046: beats a frontier API above ~5% busy
+```
+
+That ignores people, spares and input tokens, but shows the shape. The frequent right answer is **hybrid**: self-host the narrow, high-volume or residency-bound pieces (embeddings, a reranker, a classifier, a distilled extractor) and keep generation on an API. Scheme Assistant's model notes take that position: BGE-M3 and `bge-reranker-v2-m3` were chosen as self-hostable to satisfy data residency, while the generator sits behind a config flag.
+
+## Dashboards and alerts
+
+A cost and latency dashboard is cheap if every call already goes through one place that records usage (the gateway from [chapter 11](/11-serving-and-model-economics/#gateways-and-multi-provider-abstraction)), and the metric definitions are in [observability](/30-observability/#quality-latency-cost-error-metrics).
+
+**The panels**, each sliceable by feature, tenant, model and prompt version:
+
+- Spend per hour and day; cost per successful task (p50, p95); cost per user per month.
+- Tokens per request by type; prompt and response cache hit rates; semantic false-hit rate.
+- Route shares, escalation rate, batch share of tokens.
+- TTFT, TPOT and end-to-end at p50/p95/p99; p95 output length.
+- Budget-cap hits by type and provider 429s.
+
+**The alerts** (few, actionable):
+
+1. **Spend anomaly**: this hour's spend against the median of the same hour over the last seven days. Hourly, not monthly: a runaway found on the invoice is a month late.
+2. **Tenant concentration**: one tenant or one key above a set share of the hour's spend. This is how a runaway tenant or a leaked key shows up first.
+3. **Cache hit rate drop**: a deploy that moved a dynamic value into the prefix shows up as a cliff the same hour.
+4. **Latency SLO burn**: p95 TTFT above target for the burn window, not single spikes.
+5. **Reconciliation gap**: estimated spend vs the provider's usage export differs by more than a set percentage.
+
+```python
+import statistics as st
+
+def spend_alerts(hour_spend, same_hour_last_7d, by_tenant, factor=3.0, tenant_share=0.4):
+    alerts = []
+    baseline = st.median(same_hour_last_7d) if same_hour_last_7d else 0.0
+    if baseline and hour_spend > factor * baseline:
+        alerts.append(f"spend {hour_spend:.2f} is {hour_spend / baseline:.1f}x the 7-day same-hour median")
+    total = sum(by_tenant.values()) or 1.0
+    for tenant, usd in by_tenant.items():
+        if usd / total > tenant_share and usd > 1.0:          # ignore tiny absolute amounts
+            alerts.append(f"tenant {tenant} is {usd / total:.0%} of this hour's spend")
+    return alerts
+```
+
+None of Gaurav's repos has this yet. Chat Insights's `backend/src/lc/scripts/llm_timing.js` prints p50/p95 latency and usage, run by hand; Answer Grader saves per-step cost on every evaluation; Memory Agent shows cost per turn. The raw material exists; the hourly view and the alerts do not.
+
+<Production>
+
+**Failure modes.** A semantic cache answering a question with a different number, negation or user (scoped keys, number and negation checks, a calibrated threshold). One runaway tenant, agent loop or leaked key (budgets, per-tenant caps, hourly alerts). A cache hit rate that fell to zero when a deploy put a timestamp in the prefix. Estimates that drift from the invoice because a usage field was misread or thinking tokens were not counted. An escalation rate that dropped because the verifier broke.
+
+**Cost.** This chapter is the "C" for every other chapter. Measure cost per successful task (p50, p95) by feature, tenant and user; take the free wins first, then the eval-gated trades; reconcile with the usage export monthly.
+
+**Latency.** p95 and p99, not the mean. The tail comes mostly from long outputs and long thinking: sensible `max_tokens`, answer-first prompts, lower effort. Parallelize independent calls, stream with progress events, cache static prefixes. Cascades and hedges reshape the tail; re-measure after enabling them.
+
+**Observability.** One ledger row per call: feature, tenant, model, prompt version, uncached input, cache read and write, output, thinking, cost and its source, TTFT, total time, route, budget events. The five alerts from the last section.
+
+**Security.** Denial-of-wallet is an attack: authenticate before any paid call, rate-limit per user and IP, cap spend per tenant per day, reject oversized inputs, put a spend cap and alert on every key. Never share a response cache across users for personal answers; a prompt cache shared across tenants is a timing side channel ([prefix caching](/10-inference-mechanics/#prefix-prompt-caching)).
+
+</Production>
+
+<Interview>
+
+<Q q="Our LLM bill tripled. Walk me through cutting it by 50% without hurting quality.">
+
+- Measure first: spend by feature, tenant, model and token type (uncached, cached, output, thinking). Find what changed: traffic, a model swap, thinking, a broken cache, one tenant.
+- Lock quality first: an eval set per affected feature, so every change below is a before/after with numbers.
+- Free wins: fix prompt caching (static first, measure hit rate, find the invalidator), exact-cache deterministic calls, move every job that can wait to the batch API (roughly half price), trim retrieved context, history and tool results.
+- Trades, each gated by the eval: lower effort on routes that do not need it (thinking is often the largest line), small or distilled models for classification and extraction, routing by difficulty from the eval table.
+- Controls: per-task budgets, per-tenant caps, hourly anomaly alerts so it does not happen again.
+- Numbers: cached prefix reads at roughly 0.1× the input price; batch roughly 50% off; effort can move output tokens by multiples.
+- **The trap:** "switch to a cheaper model" before knowing where the money goes, with no eval to prove quality held.
+
+</Q>
+
+<Q q="How does prompt caching work, and how do you design for it?">
+
+- The provider keeps the KV cache of a prompt prefix; a request that starts with the same tokens skips their prefill. Cheaper input (roughly a tenth on cached reads, a premium on writes) and lower TTFT.
+- It matches an exact prefix: any changed byte invalidates everything after it. Order is tools, system, messages on Anthropic.
+- Design: frozen system prompt, sorted tools, fixed examples first; semi-static documents next; per-request content last. No timestamps or user names up front. Pin model, thinking and effort per route.
+- Break-even: with a 1.25× write and 0.1× read, two uses within the TTL already save about 32%; ten save about 78%.
+- Measure hit rate from usage fields: Anthropic `cache_read / (input + cache_read + cache_creation)` because `input_tokens` excludes cached tokens; OpenAI `cached_tokens / input_tokens` because its total includes them.
+- **The trap:** adding the marker and assuming it works, or computing cost as `input − 0.9 × cache_read` on a field that already excludes the cache.
+
+</Q>
+
+<Q q="When is semantic caching dangerous?">
+
+- When near-identical text has different meaning: negation, numbers, dates, entity names. Embeddings capture topic, not polarity.
+- When the answer is personal or stateful: the same question from two users must not share an answer; scope keys by tenant and user.
+- When the answer goes stale: prices, availability, anything "latest".
+- When the question depends on conversation context: cache only condensed standalone questions.
+- Mitigation: cache only generic, stable features; require numbers and negations to match; calibrate the threshold on real incoming queries vs stored ones and track false-hit rate; TTL and invalidation on data change.
+- **The trap:** picking a 0.9 cosine threshold from a blog and measuring only hit rate.
+
+</Q>
+
+<Q q="Reduce p95 latency of a RAG chatbot from 6s to 2s.">
+
+- Clarify: 2 s to first token or end to end? With streaming, perceived latency is TTFT.
+- Break the 6 s into stages from traces at p95 and set a per-stage budget.
+- Parallelize independent stages (embedding while lexical search runs); rewrite queries only when needed, with a rules fast path for obvious cases.
+- Cut prefill: cache the static prefix, send fewer and shorter passages after a reranker, compact history.
+- Cut decode: answer-first prompting, sensible `max_tokens`, lower effort, a smaller model for simple intents after an eval.
+- Stream tokens and progress events; hedge the tail call at the p95 delay (about 5% extra cost).
+- Numbers: 400 output tokens at 20 ms each is 8 s, so end to end at 2 s is impossible without shorter answers; TTFT at 2 s is realistic.
+- **The trap:** "use a faster GPU" or "add caching" without stage-level measurements, or quoting the mean.
+
+</Q>
+
+<Q q="How would you estimate the monthly LLM cost of a feature before launch?">
+
+- List the calls per task and their token shapes (system, tools, history, retrieved, output, thinking) from a prototype's usage logs, not guesses.
+- Cost per attempt from the price formula; cost per success with retry and success rates.
+- Multiply by tasks per user and users, and model the distribution: price for p95 users, not the mean.
+- Add hidden calls (judges, retries, speculation) and a margin for price drift.
+- **The trap:** one average request times traffic, ignoring thinking tokens, retries and heavy users.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** a before/after cost and latency report for one real pipeline, with quality held constant on its eval set, entirely offline.
+
+**Where:** Answer Grader (`~/answer-grader`), which already has a per-run cost ledger (`record_usage` and `ledger_summary` in `backend/llm.py`) and a parallel step in `backend/pipeline.py`. Memory Agent (`~/memory-agent`) works too if you prefer TypeScript.
+
+**Model (no paid API):** Ollama's OpenAI-compatible endpoint (`qwen2.5:3b` as the cheap tier, `qwen2.5:7b` as the strong one), or a mock LLM that returns canned outputs with realistic usage fields (cached and thinking tokens included) and a delay per output token. Illustrative prices live in config with a "last checked" date.
+
+**Steps**
+
+1. Normalize usage: add a `normalize()` like this chapter's, record uncached input, cache read, cache write, output and thinking per call, and add `feature`, `route` and `prompt_version` to every ledger row. Write a test that an Anthropic-shaped usage with cache reads never produces a lower cost than its uncached tokens alone.
+2. Baseline: run 30 to 50 eval cases. Record cost per successful task (p50, p95), tokens per component, and per-stage latency (TTFT and total) with timestamps around each call.
+3. Lever 1, caching: reorder prompts so static text comes first; add an exact response cache keyed on question, references version, model and prompt version for the model-answer step. Report the response cache hit rate on a run where 20% of submissions repeat a question.
+4. Lever 2: route the claim check and translation to the cheap tier; on the mock, sweep an effort setting that scales thinking tokens.
+5. Lever 3: build the nightly eval as a batch file with `custom_id`s and reconcile unordered, partly failed results.
+6. Lever 4: a per-run dollar cap and a per-user daily cap, with tests.
+7. Re-run the eval after each lever; keep it only if quality is within noise of the baseline.
+
+**Definition of done:** `docs/cost_latency_report.md` with a table (rows: baseline and each lever; columns: pass rate, cost per success p50/p95, input/output/thinking tokens, p95 TTFT, p95 total), one sentence per lever on why it helped or not, and every number reproducible with one command and no network access beyond localhost.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent is your routing and latency story, with numbers.** `DECISIONS.md` decision 2 picks the writer per turn type from an eval table (routed 7 to 8/10 at 6.6 to 6.9 s against Opus everywhere at 7/10 and 10.5 s); `src/agent.ts` lines 173 to 175 route by the Haiku planner's intent and set effort to medium only for re-checks; `src/fastpath.ts` skips the planner for small talk; the speculative writer behind `src/gate.ts` is built, tested and off until a paid eval justifies its discarded-call cost. Decision 3 is your streaming story: thinking models buffered after a search, so you streamed search progress instead.
+- **Memory Agent also has a cost bug you can explain.** `src/answer.ts` line 95 caches `ANSWER_SYSTEM` with `cache_control`, but `src/agent.ts` line 232 prices the writer as `input − 0.9 × cacheRead`. Anthropic's `input_tokens` already excludes cache reads, so the right form is `input + cacheRead × (that model's read rate: 0.1× by default, 0.05× on the 5.5 models per the current docs) + cacheCreation × write premium`; as written, warm turns are underpriced (clamped to zero by `Math.max(0, inTok)` in `cost$` when reads are large), cache writes are not recorded, and the planner is a fixed 600/150-token guess. Fixing it, and adding a hit-rate metric, is a concrete "how do you know caching worked?" answer.
+- **Answer Grader is your unit-economics and effort story.** `backend/llm.py` writes one ledger row per call (provider-reported cost preferred, price table as fallback, `cost_source` and unpriced calls counted), and `backend/pipeline.py` saves the per-step total on every evaluation and runs the claim check and evaluation in parallel threads that share the ledger. The `GEMINI_THINKING_BUDGET` comment (about 10,300 vs 2,400 output tokens) is a real case of thinking tokens making a cheaper model dearer. Gaps: no cached-token accounting and no response cache, so a question already evaluated for one student regenerates its model answer for the next.
+- **Chat Insights is your caching and abuse-control story.** The prompt builder keeps the system text static per language "so providers can cache it", yet the Anthropic body has no `cache_control`: a one-line fix you can name. `chatService.js` enforces an atomic per-user daily hint cap (60 by default, 429 past it); there is no semantic cache (sensible for personalised hints) and no cascade, one model per deployment from config.
+- **Scheme Assistant: claim only what is yours.** Yours: the critic harness's metered ledger with a rupee cap (`scripts/critic_api.py`) and the TTS exact cache (`src/app_api/speech.py`). Teammates': the query-vector LRU cache, the embedding-overlaps-SQL trick and the prompt character caps.
+- **Honest gaps:** no batch API, semantic cache, pre-call token counting, hourly cost dashboard or spend alert anywhere, and no rate limit on Memory Agent's paid endpoint. The Apply it closes most of these.
+
+</YourProject>

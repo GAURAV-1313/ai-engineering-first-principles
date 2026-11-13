@@ -1,0 +1,464 @@
+---
+id: "02"
+title: "Text as Numbers: Tokenization"
+summary: "Understand how text becomes the integer tokens a model reads, build a byte-level BPE tokenizer by hand, and turn that into production skills: measuring Hindi and code token inflation on your own traffic, counting tokens before a call, catching chat-template and special-token bugs, and estimating what a feature will cost."
+readingTime: "23 min"
+---
+
+A Hindi user and an English user ask your assistant the same question and get answers that say the same thing. Do the two requests cost the same? Usually not, and the gap can be several times over. The Hindi answer may also take several times longer to stream, hit `max_tokens` halfway through a JSON object, and overflow a prompt budget that looked safe in characters. None of that is the model being "worse at Hindi". It is the step before the model: tokenization.
+
+A model never sees text. It sees a list of integers, each an index into a fixed vocabulary. The tokenizer decides how a string becomes that list, and that choice sets your bill (providers charge per token), your latency (one forward pass per generated token), how much fits in the context window, and several odd behaviours blamed on "the model": miscounting the r's in "strawberry", fumbling long multiplication, treating `" hello"` and `"hello"` as unrelated. This chapter builds the mechanism (subwords, BPE by hand and in plain Python, the other algorithms, byte-level BPE), then the production half: vocabulary size, special tokens and chat templates, failure modes, and counting and billing. Where a number matters, you measure it yourself.
+
+## Why discrete tokens
+
+A neural network does arithmetic on vectors. The standard design has two stages: a tokenizer turns the string into integer IDs, then the model looks each ID up in an embedding table with one learned row per vocabulary entry (the [one-hot to dense](/03-embeddings-and-vector-space/#one-hot-to-dense) step). On the way out, the last layer scores every vocabulary entry, sampling picks one ID, and the tokenizer turns it back into text.
+
+So the tokenizer has a hard contract:
+
+- **Lossless.** `decode(encode(s)) == s` for any language, emoji, code or stray control character. What cannot round-trip, the model can never see or produce.
+- **Finite vocabulary.** The embedding table and output layer have one row per entry, fixed before training.
+- **Short sequences.** Attention grows roughly with n² ([quadratic context cost](/05-transformer-intuition/#quadratic-context-cost)), the [KV cache](/10-inference-mechanics/#kv-cache-and-memory) grows with n, and decode produces one token per forward pass ([prefill vs decode](/10-inference-mechanics/#prefill-vs-decode)).
+- **Units that recur.** Each entry needs enough training examples for its embedding to learn something.
+
+```python
+class Tokenizer:
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, ids: list[int]) -> str: ...
+
+def check_round_trip(tok: Tokenizer) -> None:     # the one invariant that matters
+    for s in ["Hello", "इस योजना के तहत", "def f(x):\n\treturn x", "🙂"]:
+        assert tok.decode(tok.encode(s)) == s, s
+```
+
+The last two requirements pull against each other: big units give short sequences but a huge, sparse vocabulary; small units give a small vocabulary but long sequences.
+
+## Chars/bytes/words/subwords
+
+Take one question in English and Hindi:
+
+```python
+en = "How many days of work does a rural household get in a year under this scheme?"
+hi = "इस योजना के तहत एक ग्रामीण परिवार को साल में कितने दिन का काम मिलता है?"
+for s in (en, hi):
+    print(len(s.split()), len(s), len(s.encode("utf-8")))
+# en: 16 words, 77 characters,  77 UTF-8 bytes
+# hi: 16 words, 71 characters, 181 UTF-8 bytes
+```
+
+| Unit | Vocabulary | Unknowns | Sequence length | Problem |
+|---|---|---|---|---|
+| Word | open-ended, capped | yes (`[UNK]`) | shortest | every name, typo and inflection (दिन, दिनों) is new |
+| Character | 100K+ possible | possible | long | little meaning per unit |
+| Byte | 256 | never | longest | 3 bytes per Devanagari character |
+| Subword | chosen, 30K to 260K | never (with byte fallback) | medium | learned from a corpus |
+
+Word vocabularies map everything outside a cap to `[UNK]`, and an unknown token is destroyed information: a model that turns a scheme name into `[UNK]` cannot answer about it. Bytes never meet an unknown symbol, but every Devanagari character (block U+0900 to U+097F) is 3 bytes in UTF-8, so the Hindi sentence is 181 units against 77. **Subwords** are what every current LLM uses: frequent strings (" the", " household") become single tokens, rare ones are spelled from smaller pieces, and nothing is ever unknown.
+
+The catch is that the subword vocabulary is *learned from a corpus*. Whatever is frequent there gets cheap tokens; whatever is rare gets spelled out.
+
+## BPE step by step
+
+Byte-pair encoding began as a compression trick (Gage, 1994) and came to neural translation with Sennrich, Haddow and Birch (2016, "Neural Machine Translation of Rare Words with Subword Units"). Training in one sentence: **start from single symbols and repeatedly merge the most frequent adjacent pair into a new symbol until the vocabulary reaches the target size.**
+
+By hand: the corpus is `token` ×4, `tokens` ×3, `spoken` ×2, `broken` ×2, `open` ×1, split into characters, 66 symbols in total.
+
+- **Step 1.** Count adjacent pairs weighted by word frequency. `e n` is in all five words: 4 + 3 + 2 + 2 + 1 = 12. `o k` and `k e` are 11, `t o` is 7. Merge `e n` → `en`.
+- **Step 2.** Recount. `o k` and `k en` tie at 11; a fixed tie-break (first seen) picks `o k` → `ok`.
+- **Steps 3 to 5.** `ok en` (11) → `oken`; `t oken` (7) → `token`; `token s` (3) → `tokens`.
+
+| After | Merge | token | tokens | spoken | broken | open | Symbols |
+|---|---|---|---|---|---|---|---|
+| start | | t o k e n | t o k e n s | s p o k e n | b r o k e n | o p e n | 66 |
+| 1 | `e n` | t o k en | t o k en s | s p o k en | b r o k en | o p en | 54 |
+| 2 | `o k` | t ok en | t ok en s | s p ok en | b r ok en | o p en | 43 |
+| 3 | `ok en` | t oken | t oken s | s p oken | b r oken | o p en | 32 |
+| 4 | `t oken` | token | token s | s p oken | b r oken | o p en | 25 |
+| 5 | `token s` | token | tokens | s p oken | b r oken | o p en | 22 |
+
+Five merges took the corpus from 66 symbols to 22 for five new vocabulary entries. That is the whole trade.
+
+**Training outputs an ordered list of merges.** To encode, split into base symbols and replay merges in learned order: `reopen` → `r e o p en`; the unseen `unbroken` → `u n b r oken`. You apply the earliest-learned possible merge, not the longest match.
+
+Carry three properties forward. BPE is **greedy and frequency-driven** (`oken` is a token because it was frequent, not meaningful). It is **corpus-dependent** (train on English and English gets the merges). And it is **deterministic**, which is what makes local token counting possible. The Hugging Face LLM course chapter 6, in this site's library, is a good second explanation.
+
+## WordPiece/Unigram/SentencePiece
+
+Interviewers like to check that you know which of these is an algorithm and which is a library.
+
+**WordPiece** (Schuster and Nakajima, 2012; later BERT). Training resembles BPE, but merges are chosen by a likelihood-style score, commonly described as `count(ab) / (count(a) × count(b))` (Google did not release its trainer; this is Hugging Face's reconstruction), which prefers pairs whose parts rarely appear apart. Encoding is greedy longest-match-first; continuation pieces carry `##` (`play`, `##ing`); an unmatchable word becomes `[UNK]`. BERT-base has about 30K entries.
+
+**Unigram** (Kudo, 2018, "Subword Regularization") runs the other way: start with a large vocabulary with a probability per token, prune the tokens whose removal hurts corpus likelihood least, and encode with the highest-probability segmentation found by dynamic programming:
+
+```python
+import math
+
+def viterbi(word: str, logp: dict[str, float]) -> list[str]:
+    best = [0.0] + [-math.inf] * len(word)      # best[i]: best score for word[:i]
+    back = [0] * (len(word) + 1)
+    for end in range(1, len(word) + 1):
+        for start in range(max(0, end - 10), end):
+            piece = word[start:end]
+            if piece in logp and best[start] + logp[piece] > best[end]:
+                best[end], back[end] = best[start] + logp[piece], start
+    pieces, i = [], len(word)
+    while i > 0:
+        pieces.append(word[back[i]:i]); i = back[i]
+    return pieces[::-1]
+
+probs = {"un": .05, "break": .04, "able": .05, "unbreak": .001, "breakable": .0005,
+         "u": .01, "n": .02, "b": .01, "r": .01, "e": .02, "a": .02, "k": .01, "l": .01}
+print(viterbi("unbreakable", {t: math.log(p) for t, p in probs.items()}))
+# ['un', 'break', 'able']   log-prob -9.2 beats 'un'+'breakable' (-10.6)
+```
+
+Having probabilities lets training *sample* different segmentations of a word, which makes models robust to spelling noise: the "subword regularization" of the title.
+
+**SentencePiece** (Kudo and Richardson, 2018) is a library implementing BPE and Unigram. It treats input as a raw stream with no language-specific pre-splitting, writes spaces as `▁`, and can fall back to UTF-8 bytes instead of `[UNK]`. T5 used SentencePiece Unigram; Llama 1 and 2 used SentencePiece BPE with 32K entries; Gemma uses SentencePiece with about 256K.
+
+As an application engineer you inherit the algorithm with the model. What you need is to recognise the artifacts (`##`, `▁`, `Ġ`) when debugging, and to know a WordPiece encoder can still emit `[UNK]` while byte-level BPE cannot.
+
+## Byte-level BPE and tiktoken
+
+GPT-2 (Radford et al., 2019) ran BPE over **UTF-8 bytes**: 256 base symbols, so nothing is ever unknown. Its vocabulary of 50,257 is 256 bytes + 50,000 merges + one `<|endoftext|>`. (`Ġ` in GPT-2-style vocabularies is how the library prints a leading space byte.)
+
+Byte-level BPE first runs a **pre-tokenizer**, a regex that cuts text into chunks that merges never cross, so the vocabulary does not fill with `dog.`, `dog!` and `dog?`. The regex is part of the tokenizer's definition. In `tiktoken` (OpenAI's open-source BPE library with a Rust core), `cl100k_base` uses `\p{L}++` for letters and `\p{N}{1,3}+` for digits; the newer `o200k_base` letter classes add `\p{M}`, combining marks. That matters because Devanagari vowel signs (ि, ा, े) are combining marks. Measured with `tiktoken` 0.14.0:
+
+```python
+import regex, tiktoken
+s = "साल में कितने दिन का काम मिलता है?"
+for name in ("cl100k_base", "o200k_base"):
+    enc = tiktoken.get_encoding(name)
+    print(name, regex.findall(enc._pat_str, s))   # _pat_str is internal; fine for a look
+# cl100k_base ['स', 'ाल', ' म', 'ें', ' क', 'ितन', 'े', ' द', 'िन', ' क', 'ा', ' क', 'ाम', ' म', 'िलत', 'ा', ' ह', 'ै?']
+# o200k_base  ['साल', ' में', ' कितने', ' दिन', ' का', ' काम', ' मिलता', ' है', '?']
+
+enc = tiktoken.get_encoding("cl100k_base")
+print([enc.decode_single_token_bytes(t) for t in enc.encode(" मिलता")])
+# [b' \xe0\xa4\xae', b'\xe0\xa4\xbf\xe0\xa4', b'\xb2', b'\xe0\xa4\xa4', b'\xe0\xa4\xbe']
+```
+
+Under `cl100k_base` every word is broken at its vowel signs before BPE starts, so no merge can build a whole Hindi word. ` मिलता` is one token in `o200k_base` and five in `cl100k_base`, and the second of those ends two bytes into the next character. So **a single token does not always decode to valid text.** Streaming code that decodes each token alone shows Hindi users `�`. Keep a byte buffer and emit only complete UTF-8 sequences, as serving engines' streaming detokenizers do.
+
+Other byte-level vocabularies: `o200k_base` for OpenAI's GPT-4o generation onward (`tiktoken.encoding_for_model(...)` tells you which), and Llama 3, which moved from Llama 2's 32K SentencePiece vocabulary to a 128K `tiktoken`-based one.
+
+## Vocab-size trade-offs
+
+A bigger vocabulary means fewer tokens per text: fewer decode steps, a smaller KV cache, more text per context window, a lower per-token bill, and a chance at whole-word tokens for scripts beyond English.
+
+The costs: the input embedding and the output projection are each V × d parameters (unless tied), every decode step scores all V entries, and rare entries get few updates.
+
+```text
+Llama 3 8B:  V = 128,256,  d = 4,096
+  one matrix    = 128,256 × 4,096 ≈ 525M parameters
+  both (untied) ≈ 1.05B  → roughly an eighth of the model
+
+Small model:  V = 200,000,  d = 1,024  → 205M parameters per matrix before any layer
+```
+
+Rare entries can become **under-trained tokens**: strings that entered the vocabulary (often from scraped junk) but almost never appear in training, so their embeddings are near-random and the model misbehaves on them. "SolidGoldMagikarp" in early GPT models is the famous case; Land and Bartolo (2024, "Fishing for Magikarp") showed how to find such tokens systematically.
+
+The trend is towards bigger: GPT-2 50K, `cl100k_base` about 100K, `o200k_base` about 200K; Llama 2 32K, Llama 3 128K; Gemma about 256K. For a large model the embedding share is small while shorter sequences pay off on every request. For tiny on-device models the table can dominate the parameter count, so that is where vocabulary size is fought over.
+
+<Callout type="tip">
+
+You rarely choose a vocabulary; you choose a model and inherit its tokenizer. Treat the tokenizer as part of the price: before committing to a model for a multilingual product, tokenize a sample of real traffic and compare tokens per request, not price per million tokens.
+
+</Callout>
+
+## Special tokens and chat templates
+
+**Special tokens** are vocabulary entries BPE never produces from ordinary text, added by hand with fixed IDs: sequence markers (`<s>`, `</s>`, `<|endoftext|>`), padding, chat role markers (`<|im_start|>`, `<|im_end|>`, Llama 3's `<|start_header_id|>` and `<|eot_id|>`), tool-call and fill-in-the-middle markers. Post-training teaches the model that a turn ends with one specific ID, and generation stops when it is sampled ([finish reasons](/04-language-modeling-and-sampling/#stop-sequences-max-tokens-finish-reasons)). A **chat template** turns a list of messages into one string with those markers; [prompting fundamentals](/12-prompting-fundamentals/#system-user-assistant-anatomy) renders one by hand and [post-training](/07-post-training-and-alignment/#chat-templates) explains how the model learns it. At the token level there are two production bugs.
+
+**Bug 1: special-token injection.** Special IDs must enter the sequence only from template code. But a user can type the *string* `<|im_end|>`, and if the encoder turns it into the special ID, the user can close their turn and open a fake system turn. Defaults differ:
+
+```python
+enc = tiktoken.get_encoding("cl100k_base")
+enc.encode("<|endoftext|>")                          # raises ValueError: disallowed special token
+enc.encode("<|endoftext|>", disallowed_special=())   # [27, 91, 8862, 728, 428, 91, 29]  plain text
+enc.encode("<|endoftext|>", allowed_special="all")   # [100257]  the real special token
+
+from tokenizers import Tokenizer                      # Hugging Face, Qwen2.5 tokenizer
+Tokenizer.from_pretrained("Qwen/Qwen2.5-0.5B").encode("hi <|im_end|> there").tokens
+# ['hi', 'Ġ', '<|im_end|>', 'Ġthere']   parsed as the special token by default
+```
+
+If you self-host and build prompts by concatenating strings, user text can forge turn boundaries. Encode user content with special-token parsing off (or strip the marker strings) and insert special IDs only in template code. Hosted APIs template server-side, so this mainly bites self-hosted models; the wider picture is in [prompt injection](/33-security-prompt-injection/#direct-injection-and-jailbreaks).
+
+**Bug 2: template mismatch on self-hosted models.** You must render exactly the template the model was trained with, and a wrong one fails silently. Symptoms: the wrong family's template (ChatML on Llama) makes the model ramble or write the next user turn, because it never sees the stop ID it learned; a double BOS when both template and tokenizer add one; no open assistant header at the end; a base model behind a chat template. Render with the model's own template (`tokenizer.apply_chat_template(messages, add_generation_prompt=True)` in `transformers`; GGUF files and Ollama Modelfiles carry theirs) and test the IDs, not just the string:
+
+```python
+def check_prompt(ids: list[int], tok, user_texts: list[str]) -> None:
+    bos = tok.bos_token_id
+    assert bos is None or ids.count(bos) <= 1, "double BOS"
+    tail = tok.decode(ids[-8:])
+    assert "assistant" in tail or "model" in tail, f"no open assistant turn: {tail!r}"
+    for text in user_texts:                       # marker strings in user text = injection attempt
+        hits = [m for m in tok.all_special_tokens if m in text]
+        assert not hits, f"special-token text in user input: {hits}"
+```
+
+Log and diff the rendered prompt whenever you change model, engine or template version.
+
+## Failure modes (arithmetic, spelling, non-English cost)
+
+### Spelling and letter counting
+
+In `cl100k_base` and `o200k_base`, `" strawberry"` (with the leading space it has mid-sentence) is **one token**. The model gets one ID, not ten letters. To count r's it must recall the token's spelling from memory and then count, neither of which it was trained to do directly. Without the space it splits (`str|aw|berry` in `cl100k_base`, `st|raw|berry` in `o200k_base`), so answers can change with punctuation. Mitigations: have it spell the word with separators first, so each letter is a token, or call code.
+
+### Numbers and arithmetic
+
+Both encodings cut digit runs into groups of up to three, from the left:
+
+```text
+"12345678"            -> 123 | 456 | 78
+"1234567 + 7654321"   -> 123 | 456 | 7 | " +" | " " | 765 | 432 | 1
+"2024" vs " 2024"     -> 202 | 4   vs   " " | 202 | 4
+```
+
+Place value runs from the right, so the hundreds digit lands in a different token position depending on the number's length, and addition must align chunks that do not line up. Llama 1 and 2 split numbers into single digits for this reason; Singh and Strouse (2024, "Tokenization counts") found right-to-left grouping (for example, writing numbers with commas) improved GPT models' arithmetic. In production, compute money and eligibility in code and let the model explain.
+
+### Whitespace and code
+
+The leading space is part of the token: in `o200k_base`, `"hello"`, `" hello"` and `"Hello"` are unrelated IDs (24912, 40617, 13225). A prompt ending in a trailing space pushes the model towards odd continuations, since in training the space usually belonged to the next word's token. `"def f(x):\n    return x"` is 7 tokens and the tab-indented version 6. Pretty-printed versus minified JSON, deep indentation and whitespace runs all change cost for "the same data".
+
+### Non-English cost
+
+Now the opening question, measured. One English question and its Hindi translation, six public tokenizers, 13 November 2026:
+
+| Tokenizer | Vocab size | English | Hindi | Hindi ÷ English |
+|---|---|---|---|---|
+| GPT-2 (byte BPE) | 50,257 | 17 | 104 | 6.1 |
+| `cl100k_base` | about 100K | 17 | 64 | 3.8 |
+| Qwen2.5 (byte BPE) | about 151K | 17 | 61 | 3.6 |
+| mBERT cased (WordPiece) | about 120K | 17 | 25 | 1.5 |
+| `o200k_base` | about 200K | 17 | 18 | 1.1 |
+| Sarvam-1 (Indic-focused) | about 68K | 17 | 17 | 1.0 |
+
+The romanised version ("Is yojana ke tahat ek gramin parivar ko...") was 26 tokens on both `cl100k_base` and `o200k_base`: Hinglish is cheaper than Devanagari on the older tokenizer and dearer on the newer one.
+
+**This is one sentence pair, not a benchmark.** It shows the shape: the ratio depends more on the tokenizer than on the language, from about 1× to 6× on identical text. Sarvam-1 reaches parity with a third of `o200k_base`'s vocabulary because its tokenizer was built for Indic text, so Indic strings got a large share of its merges. Larger studies found the same pattern across many languages (Petrov et al., 2023, "Language Model Tokenizers Introduce Unfairness Between Languages"; Ahia et al., 2023, "Do All Languages Cost the Same?").
+
+Three mechanisms stack: the **training mix** (merges go to frequent text), **bytes** (3 per Devanagari character before any merge), and **pre-tokenization** (a regex that splits at vowel signs caps what merging can do). You can reproduce the first with the trainer in [Implementing BPE](#implementing-bpe), trained on two toy corpora with opposite mixes:
+
+```python
+en_c = "the scheme gives work to every rural household in the village. "
+hi_c = "योजना के तहत हर ग्रामीण परिवार को गांव में काम मिलता है। "
+a = "the scheme gives work to every household"   # 40 bytes
+b = "हर ग्रामीण परिवार को काम मिलता है"            # 87 bytes
+for name, corpus in [("90% English", en_c * 90 + hi_c * 10), ("90% Hindi", en_c * 10 + hi_c * 90)]:
+    for n in (30, 60):
+        m = train(corpus, 256 + n)
+        print(name, n, len(encode(a, m)), len(encode(b, m)))
+# 90% English 30  15 58  |  90% English 60   8 31
+# 90% Hindi   30  40 30  |  90% Hindi   60  38  9
+```
+
+Same algorithm, same test sentences: the corpus decides who pays. The English-heavy corpus makes the English sentence cheap first; the Hindi-heavy one leaves English at about one token per byte.
+
+<Callout type="warn">
+
+Never quote "Hindi costs N× more" without naming the tokenizer and the text. Measure a sample of your own traffic with the exact tokenizer of the model you call, and re-measure when you change model.
+
+</Callout>
+
+The consequences arrive together: more input tokens raise the bill; more output tokens raise it at the higher output price *and* lengthen generation; the context window holds less Hindi; and any budget in characters means a different token budget per language.
+
+## Token counting and billing
+
+Providers bill what *their* tokenizer counted, reported in usage fields after the call. Before the call you have estimates, and you need them to decide whether a request fits, how many passages or turns to include, and what a feature will cost.
+
+### Three ways to count before you send
+
+1. **The provider's counting endpoint**: Anthropic's `POST /v1/messages/count_tokens`, Gemini's `countTokens`. Send the same payload (system, tools, messages, images) and get the input count for that model, template overhead included. It is a rate-limited network call, so use it for budgeting and calibration, and treat billed usage as ground truth.
+2. **A local tokenizer**, when it is public: `tiktoken` for OpenAI models, `tokenizer.json` for open weights. Fast and offline, but it counts raw text only; add template overhead, tool schemas and image tokens, and check against billed usage on a sample.
+3. **A heuristic** like characters ÷ 4. For the English sentence it gives 19 against a true 17. For the Hindi one it gives 18: right for `o200k_base`, wrong by 3.6× for `cl100k_base`. English only, rough sizing only.
+
+A local tokenizer is only right for its own model. `tiktoken` is not Claude's tokenizer, and Claude's is not published, so use the count endpoint. Google's `google-genai` SDK ships an experimental, text-only `LocalTokenizer` for Gemini models; the endpoint still covers images, tools and template overhead. Tokenizers also change between one vendor's generations: when Claude Opus 4.7 shipped in 2026, Anthropic's migration notes said its new tokenizer produced roughly 1.0 to 1.35 times as many tokens for the same text as earlier models, and independent measurements on some content came out higher. Re-baseline counts whenever you switch model.
+
+### What the bill contains
+
+The meters are input, output, cached input, thinking tokens and tool fees ([pricing](/11-serving-and-model-economics/#pricing-input-output-cached-thinking)). Two token traps sit inside them. **Thinking tokens bill as output** and may be reported separately: Gemini's `thoughtsTokenCount` sits apart from `candidatesTokenCount`. And **thinking can share the output limit**: on Gemini, reasoning counts against `max_output_tokens`, so a limit tuned for the visible answer can cut a JSON object in half. Check the finish reason before parsing ([retry and repair](/13-structured-output/#retry-and-repair-loops)); Hindi output at 3× the tokens hits the same cap three times sooner. Normalising usage fields across providers is in [token budget accounting](/31-cost-and-latency-engineering/#token-budget-accounting).
+
+### Why output tokens dominate latency
+
+Prefill handles all input tokens in parallel; decode emits one per forward pass, so end-to-end ≈ `TTFT + TPOT × (output tokens − 1)` ([TTFT and TPOT](/10-inference-mechanics/#ttft-tpot-itl-throughput)). At an illustrative 20 ms per token, a 300-token answer streams for about 6 s. At a 3.8× ratio the Hindi answer is about 1,140 tokens and about 23 s.
+
+### Estimating monthly spend
+
+```python
+def monthly_cost(samples_by_lang, mix, count, fixed_in, out_tokens_en, ratio_out,
+                 req_per_day, p_in, p_out, days=30):
+    """count: str -> tokens with THIS model's tokenizer (local, or a count endpoint).
+    fixed_in: per-language prompt + template + context tokens; ratio_out: measured per language."""
+    per_req = 0.0
+    for lang, share in mix.items():
+        xs = samples_by_lang[lang]
+        tin = fixed_in[lang] + sum(count(s) for s in xs) / len(xs)
+        tout = out_tokens_en * ratio_out[lang]
+        per_req += share * (tin * p_in + tout * p_out) / 1e6
+    return per_req * req_per_day * days
+```
+
+Worked example at illustrative prices of $1 per million input and $4 per million output (check the current price page): 2,000 requests a day, 4,000 input tokens, a 300-token answer. For simplicity the whole input, retrieved passages included, is taken to be in the user's language; an English system prompt would narrow the gap.
+
+```text
+English:              4,000 × $1/1e6 +   300 × $4/1e6 = $0.0040 + $0.0012 = $0.0052
+Hindi, ratio 3.8:    15,200 × $1/1e6 + 1,140 × $4/1e6 = $0.0152 + $0.00456 = $0.01976
+Hindi, ratio 1.1:     4,400 × $1/1e6 +   330 × $4/1e6 = $0.0044 + $0.00132 = $0.00572
+
+per month (60,000 requests):  English $312   Hindi at 3.8× $1,186   Hindi at 1.1× $343
+```
+
+The price per token was identical in every row; the tokenizer moved the bill almost 4×. Feed the [cost-per-task model](/11-serving-and-model-economics/#cost-per-task-modelling) with per-language counts from your traffic and reconcile monthly against the provider's usage export.
+
+## Implementing BPE
+
+A byte-level BPE trainer, encoder and decoder in plain Python. It uses the `regex` module only because the standard `re` cannot express `\p{M}`, which you now know matters for Devanagari.
+
+```python
+import regex as re                         # pip install regex (supports \p{...})
+from collections import Counter
+
+SPLIT = re.compile(r" ?[\p{L}\p{M}]+| ?\p{N}{1,3}| ?[^\s\p{L}\p{M}\p{N}]+|\s+")
+
+def merge(ids, pair, new_id):
+    out, i = [], 0
+    while i < len(ids):
+        if i + 1 < len(ids) and (ids[i], ids[i + 1]) == pair:
+            out.append(new_id); i += 2
+        else:
+            out.append(ids[i]); i += 1
+    return out
+
+def train(text, vocab_size):
+    chunks = Counter(SPLIT.findall(text))                 # chunk -> frequency
+    seqs = {c: list(c.encode("utf-8")) for c in chunks}   # start from raw bytes
+    merges = {}                                           # (a, b) -> new id, in learned order
+    for new_id in range(256, vocab_size):
+        pairs = Counter()
+        for c, ids in seqs.items():
+            for p in zip(ids, ids[1:]):
+                pairs[p] += chunks[c]
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)                  # most frequent pair wins
+        merges[best] = new_id
+        seqs = {c: merge(ids, best, new_id) for c, ids in seqs.items()}
+    return merges
+
+def encode(text, merges):
+    out = []
+    for chunk in SPLIT.findall(text):
+        ids = list(chunk.encode("utf-8"))
+        while len(ids) > 1:                               # earliest-learned merge first
+            pair = min(zip(ids, ids[1:]), key=lambda p: merges.get(p, float("inf")))
+            if pair not in merges:
+                break
+            ids = merge(ids, pair, merges[pair])
+        out.extend(ids)
+    return out
+
+def decode(ids, merges):
+    vocab = {i: bytes([i]) for i in range(256)}
+    for (a, b), new_id in merges.items():                 # dicts keep insertion order
+        vocab[new_id] = vocab[a] + vocab[b]
+    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+```
+
+- **`SPLIT` is the pre-tokenizer.** Letters plus combining marks stay together. Replace `[\p{L}\p{M}]` with `\p{L}` and you reproduce the `cl100k_base` problem on Hindi.
+- **`train` counts pairs per distinct chunk times its frequency**, much cheaper than rescanning text. Production trainers update counts incrementally with a priority queue.
+- **`encode` replays merges by rank**, as in the hand example; real encoders also cache per chunk.
+- **`decode` uses `errors="replace"`** because a slice of IDs can end mid-character. Whole sequences from `encode` round-trip exactly; assert that on Hindi, digits, emoji and code before anything else.
+
+What production tokenizers add: special tokens with an explicit "allowed" switch, a more careful regex, a Rust implementation (`tiktoken`, Hugging Face `tokenizers`) and a vocabulary trained on terabytes with a chosen language mix. Karpathy's minbpe (https://github.com/karpathy/minbpe) is a clean reference implementation to read after writing your own.
+
+<Production>
+
+**Failure modes.**
+
+- Chat-template mismatch on self-hosted models (wrong family, double BOS, no generation prompt): no error, just worse answers and runaway turns. Diff the rendered prompt on every model or engine change.
+- Truncation mid-JSON: `max_tokens` counts tokens, Hindi and code use more, and thinking may share the limit. Check the finish reason before parsing.
+- Per-token streaming decode shows `�` for Indian scripts; decode with a byte buffer.
+- Character budgets that mean different token budgets per language.
+
+**Cost.** Non-English and code text cost more tokens: about 1× to 6× for the same Hindi sentence across six tokenizers above. Verify per tokenizer, on your traffic, per language. Compare models on cost per task, since tokenizers differ across vendors and generations. Thinking bills as output; template overhead and tool schemas bill as input on every call.
+
+**Latency.** Output tokens dominate: end-to-end ≈ TTFT + TPOT × output tokens, so a 3.8× ratio on the answer is roughly a 3.8× longer stream. Cap answer length and pick a tokenizer that suits your languages.
+
+**Observability.** Log input, output, cached and thinking tokens per call with model id, language and route, stored with the request. Track tokens per request by language; a jump after a model change is a tokenizer change. Compare estimates against billed usage periodically.
+
+**Security.** User text containing `<|im_end|>` or `<|eot_id|>` must never become the special ID: test your tokenizer's default and build special IDs only in template code. Cap input tokens per request and per user per day, in tokens, not characters.
+
+</Production>
+
+<Interview>
+
+<Q q="Why can't LLMs reliably count letters in “strawberry”?">
+
+- The model never sees letters: " strawberry" is one token in `cl100k_base` and `o200k_base`, one ID and one embedding.
+- Counting needs recalling the token's spelling from memory and then counting, neither directly trained.
+- Segmentation varies with context (no leading space gives 3 pieces), so answers change with punctuation.
+- Fixes: spell it out with separators first, or use a code tool.
+- The same cause explains trouble with reversing strings, rhymes and digit-level arithmetic.
+- **The trap:** "the model is bad at maths". The cause is the input representation.
+
+</Q>
+
+<Q q="How does BPE work?">
+
+- Start from base symbols (256 bytes in byte-level BPE), count adjacent pairs weighted by frequency, merge the most frequent into a new token, record it, repeat to the target size.
+- A pre-tokenizer regex chunks text first so merges never cross word or punctuation boundaries.
+- Encode by replaying merges in learned order; byte-level means no unknown tokens.
+- GPT-2: 256 bytes + 50,000 merges + 1 special = 50,257.
+- Contrast: WordPiece merges by likelihood score and encodes longest-match-first; Unigram prunes and encodes with Viterbi; SentencePiece is a library for BPE and Unigram.
+- **The trap:** "BPE finds morphemes". It is pure frequency; the corpus mix decides which languages get cheap tokens.
+
+</Q>
+
+<Q q="Why does the same prompt cost different amounts across providers?">
+
+- Different tokenizers: one Hindi sentence measured 18 tokens on `o200k_base` and 64 on `cl100k_base`, English 17 on both.
+- Different prices for input, output, cached and thinking tokens, plus long-context tiers and batch discounts.
+- Different hidden tokens: template overhead, tool schemas, image formulas, thinking billed as output.
+- Different caching rules and usage-field semantics.
+- One vendor's tokenizer can change between generations, moving the bill at the same per-token price.
+- **The trap:** comparing price pages per million tokens instead of measured cost per task on your traffic.
+
+</Q>
+
+<Q q="How would you estimate monthly token spend for a feature?">
+
+- Scope: requests per day with a peak factor, language mix, what each request contains.
+- Count the fixed part (system prompt, template, tools, typical context) with the target model's tokenizer or count endpoint.
+- Tokenize about 1,000 real user inputs per language; take mean and p95. Measure answer lengths, thinking included, from a pilot.
+- Requests × 30 × (input × input price + output × output price) / 1e6, minus cache savings, plus retries and tool fees.
+- Give a range (mean vs p95, current vs alternative model) and reconcile monthly against billed usage.
+- **The trap:** characters ÷ 4 across all traffic, roughly right for English and several times off for Hindi.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Build the tokenizer, then measure what Hindi costs Scheme Assistant.** Work in `~/scheme-assistant`, in new files `scripts/bpe_toy.py` and `scripts/token_cost.py`. Everything runs offline after a one-time download of public tokenizer files: `tiktoken` (`cl100k_base`, `o200k_base`) and Hugging Face `tokenizers` (for example `Qwen/Qwen2.5-0.5B`). No paid API calls.
+
+1. **Write the trainer** from the [Implementing BPE](#implementing-bpe) section from memory, about 100 lines with tests. Train it on the English and Hindi text of a few scheme documents at 256 + 500 merges.
+2. **Prove the contract**: round-trip Hindi, Hinglish, English, digits, emoji and code. Swap `[\p{L}\p{M}]` for `\p{L}` and record how much the Hindi count grows.
+3. **Collect inputs**: every user turn in `docs/critic-eval/questions/*.json` (177 items, 232 turns: 96 Hindi, 42 Hinglish, 39 English items). If you can export real questions from `query_log` locally, add them up to 1,000, keep them on your machine and strip anything personal.
+4. **Count with two tokenizers**: mean and p95 tokens per input, tokens per character, and the Hindi ÷ English ratio, per tokenizer and language.
+5. **Project monthly cost** with `monthly_cost` from [token counting](#token-counting-and-billing), an assumed daily volume, the prompt's fixed part counted per tokenizer, and the dated prices in `scripts/critic_api.py` (re-read the price page). A local tokenizer is only a proxy for Gemini's.
+6. **Check the proxy**: if you still have `gemini_ledger.jsonl` from a critic run, compare its billed `in` and `out` with your estimates for the same items.
+
+**Done when:** `bpe_toy.py` passes round-trip tests and prints the `\p{M}` comparison; `token_cost.py` prints a tokenizer × language table (mean, p95, tokens per character, ratio) and a monthly estimate with its assumptions; and you can state, with your numbers, what a typical Hindi Scheme Assistant question costs against its English twin.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Chat Insights (yours): usage normalised across two providers.** `backend/src/lc/services/llm/anthropic.js` (`mapUsage`, lines 63 to 71) keeps input, output, `cache_read` and `cache_creation`; `gemini.js` (`mapUsage`, lines 20 to 31) records `thoughts_tokens` separately; `sumUsage` in `chatService.js` (lines 44 to 53) adds the guard retry and counts calls. Gaps: `sumUsage` keeps only input, output and total, so the adapters' `thoughts_tokens` and cache fields are dropped from the summed figure (Gemini's `candidatesTokenCount` excludes thinking, so summed output under-counts); and nothing sends `cache_control`, so `cache_read` stays 0.
+- **Answer Grader (yours): two token traps found the hard way.** `backend/llm.py` lines 357 to 366 add Gemini's `thoughts_token_count` to output, because counting only candidates "under-reported spend on every thinking model". Lines 340 to 346 explain `GEMINI_TOKEN_HEADROOM = 4`: reasoning counts against `max_output_tokens`, so an OpenAI-tuned limit truncated JSON mid-object. And `backend/model_answer.py` (lines 526 to 534) sizes `max_tokens` from a measured 2.3 tokens per word (rounded up to 2.6), because a flat 900-token cap cut long answers mid-JSON: a ratio measured on English answers, which is the kind of number to re-measure per language and per tokenizer.
+- **Scheme Assistant: the Indic angle.** Your `scripts/critic_api.py` prices every Gemini response from `usageMetadata` against a dated price table (lines 27 to 32), writes a ledger and refuses calls past a rupee cap (`_metered_send`, lines 69 to 92). The production prompt caps are a teammate's code you should be able to defend: `src/app/config.py` sets `prompt_passage_chars = 1800` and `prompt_total_chars = 20000`, noting that long sections had pushed prompts to 13k tokens and 17 s. Those are characters, so the token budget differs by language; the audit row stores no token counts.
+- **Gaps.** No repo counts tokens before a call: no `tiktoken`, tokenizer library, `count_tokens` or `countTokens` at the pinned commits; Answer Grader's tokens-per-word ratio is the closest thing. Chat Insights limits messages in characters (`contextBuilder.js`, `LIMITS`: 2,000 characters, 150 code lines). No repo self-hosts a chat model, so you have no template or special-token story yet; the Apply-it gives Scheme Assistant a measured Hindi-vs-English table to talk about.
+
+</YourProject>

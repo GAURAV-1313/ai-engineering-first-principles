@@ -1,0 +1,65 @@
+{
+  "families": {
+    "health-triage": {
+      "name": "Health Triage",
+      "hue": "indigo"
+    },
+    "chat-insights": {
+      "name": "Chat Insights",
+      "hue": "plum"
+    },
+    "edge": {
+      "name": "Agents",
+      "hue": "moss"
+    },
+    "certificate-assistant": {
+      "name": "Certificate Assistant",
+      "hue": "slate"
+    }
+  },
+  "repos": [
+    {
+      "slug": "memory-agent",
+      "file": "memory-agent.json",
+      "chip": "MA",
+      "name": "Memory Agent",
+      "family": "edge",
+      "github": "",
+      "sha": "88b5f1e5fd8ef0159a49fa7b5319c511230de7da",
+      "local": null
+    },
+    {
+      "slug": "chat-insights",
+      "file": "chat-insights.json",
+      "chip": "CI",
+      "name": "Chat Insights / LeetCode Coach",
+      "family": "chat-insights",
+      "github": "",
+      "sha": "5a289f807b7b075d722c666ef048ff8e6ccaaadf",
+      "local": null
+    },
+    {
+      "slug": "health-triage",
+      "file": "health-triage.json",
+      "chip": "HT",
+      "name": "Health Triage",
+      "family": "health-triage",
+      "github": "",
+      "sha": "26f14c574018452cad38318fb072fda6b58df44c",
+      "branchShas": {
+        "frontend": "bcc55a5815586806445e62a801e6590f240be616"
+      },
+      "local": null
+    },
+    {
+      "slug": "certificate-assistant",
+      "file": "certificate-assistant.json",
+      "chip": "CA",
+      "name": "Certificate Assistant",
+      "family": "certificate-assistant",
+      "github": "",
+      "sha": "8cc6e7e245b7e203f404d8c6a8ecaf3a7848a556",
+      "local": null
+    }
+  ]
+}

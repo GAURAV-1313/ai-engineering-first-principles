@@ -1,0 +1,942 @@
+---
+id: "21"
+title: "Tool Use / Function Calling"
+summary: "Understand what actually happens when a model calls a function, design tools a model uses correctly, and make tool calls safe to retry, approve and evaluate in production."
+readingTime: "36 min"
+---
+
+A language model produces text. Your business runs on actions: look up an order, issue a refund, query a database, search the web, send an email. Every agent, every "AI assistant that does things", and every MCP server sits on one narrow mechanism that turns the first into the second. That mechanism is called tool use or function calling, and it is much less magical than the demos make it look.
+
+Underneath, three plain things happen. The model was trained to emit a structured "call" in a particular format when a described tool would help. A chat template puts your tool descriptions into the prompt and turns the model's raw output back into a structured object. And your code, not the model, runs the function and sends the result back as one more message. The model never executes anything. It writes a request; you decide whether and how to honour it.
+
+That framing makes the engineering questions obvious. If the model only sees names, descriptions and schemas, those are prompts and deserve prompt-level care. If results come back as messages, their size and shape are a context budget problem. If your code executes the call, then retries, duplicate side effects, permissions and approval are your problem, the same as with any API you expose. This chapter covers the single call and the tool surface. [The agent loop](/22-agent-loop/#react-loop) (chapter 22) puts calls in a loop, [MCP](/26-mcp/#tools-resources-prompts) (chapter 26) standardises how tools are shipped, and [agent security](/33-security-prompt-injection/#least-privilege-tools-and-scoped-credentials) (chapter 33) covers what attackers do with them.
+
+## Tools: text to action
+
+### The problem
+
+The model is a function from a token sequence to a distribution over the next token. It cannot open a socket, read your Postgres table or know today's price of anything. It can only write. So the question is how to make what it writes reliably machine-actionable.
+
+The first answers were string parsing. ReAct (Yao et al. 2022) prompted models to write lines like `Action: search[capital of Peru]`, and the harness parsed them with a regex. Toolformer (Schick et al. 2023) taught a model, self-supervised, to insert API calls (a calculator, a QA system) into its own text where they reduced its loss on the following tokens. Both were fragile: free text drifts, quotes break parsing, and the model invents tools. Providers made it a trained, first-class feature from mid-2023 (OpenAI's function calling shipped in June 2023); today every major API and most open-weight instruct models support it natively.
+
+### How it works underneath
+
+Three layers do the work.
+
+1. **Training.** In post-training ([chapter 7](/07-post-training-and-alignment/)) the model sees many conversations where a system section lists tools as JSON Schema and the assistant replies with a call in a fixed format, then a tool result, then an answer; RL on tool-using tasks rewards calls that lead to correct outcomes. It learns *when* a call helps and *how* to fill arguments from the conversation.
+2. **The chat template.** The server renders your `tools` list into the prompt in the format the model was trained on. Anthropic's docs show theirs: a preamble saying tools are available, formatting instructions, then the definitions in JSON Schema. That preamble costs a few hundred tokens per request on top of your definitions (per model; see the docs).
+3. **Parsing.** The model wraps the call in special tokens or tags; the server detects them, parses the JSON, stops generation and returns a structured block with a "tool" stop reason. You never see the tags.
+
+For open-weight models you can see layers 2 and 3 yourself. Hugging Face's `apply_chat_template(messages, tools=...)` renders the tools; a Hermes-style model (the same convention several open families use) answers with a `<tool_call>` tag around a JSON object. Here is roughly what the template and parser do:
+
+```python
+import json, re
+
+def render(tools: list[dict], messages: list[dict]) -> str:
+    # Roughly what a Hermes-style chat template produces.
+    system = ("You may call one or more functions. Signatures:\n<tools>\n"
+              + "\n".join(json.dumps(t) for t in tools) + "\n</tools>\n"
+              'Reply with <tool_call>{"name": ..., "arguments": {...}}</tool_call> to call one.')
+    out = [f"<|im_start|>system\n{system}<|im_end|>"]
+    out += [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
+    return "\n".join(out) + "\n<|im_start|>assistant\n"
+
+CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+
+def parse(completion: str) -> tuple[str, list[dict]]:
+    calls = []
+    for raw in CALL.findall(completion):
+        try:
+            obj = json.loads(raw)
+            calls.append({"name": obj["name"], "args": obj.get("arguments", {})})
+        except (json.JSONDecodeError, KeyError):
+            calls.append({"error": f"unparseable tool call: {raw[:80]}"})
+    return CALL.sub("", completion).strip(), calls
+
+print(parse('<tool_call>{"name": "orders_get_status", "arguments": {"order_id": "8812"}}</tool_call>'))
+```
+
+That is the whole trick. A hosted API does the same thing with better training, a grammar that can force valid JSON, and a cleaner response object.
+
+### A tool call is structured output you execute
+
+A tool call is a special case of [structured output](/13-structured-output/#structured-output-vs-tool-calling): the model fills a schema. Structured output is the answer; a tool call is a request for an action whose result comes back. Providers can enforce the argument schema with [constrained decoding](/13-structured-output/#constrained-grammar-decoding) (`strict: true` on Anthropic and OpenAI), which removes malformed JSON and missing fields, not wrong values: an `order_id` that belongs to someone else is still valid JSON.
+
+### Trade-off and failure
+
+Tools give the model fresh data and real effects, at the price of context (every definition is input tokens on every call), latency (each call is at least one extra model round trip) and risk (the model now has hands). The classic failures follow from the mechanism: the model calls a tool it should not, fills a missing argument with a plausible guess instead of asking, or picks the wrong tool because your descriptions overlap. The rest of the chapter is about reducing each of these.
+
+## Call protocol
+
+### The round trip, provider-neutral
+
+Every provider implements the same four-step exchange. Only the field names differ.
+
+```text
+ your code                                   model API
+ ─────────                                   ─────────
+ 1. request: messages + tool definitions ──▶
+                                          ◀── 2. response: stop = "tool call"
+                                                 content = [text?, call(id, name, args), ...]
+ 3. validate args, run handler(s) yourself
+    append assistant turn VERBATIM
+    append one result per call id         ──▶ 4. request again (same tools)
+                                          ◀── 5. response: stop = "end", final text
+                                                 (or more calls: that is the loop, ch 22)
+```
+
+In a neutral JSON shape, one round trip looks like this:
+
+```text
+REQUEST 1
+  tools:    [{ name: "orders_get_status",
+               description: "Look up the shipping status of one order ...",
+               schema: { type: object, properties: { order_id: { type: string } },
+                         required: [order_id] } }]
+  messages: [{ role: user, content: "Has order 8812 shipped?" }]
+
+RESPONSE 1   stop: tool_call
+  content:  [{ type: text, text: "Let me check." },
+             { type: tool_call, id: "call_01", name: "orders_get_status",
+               args: { order_id: "8812" } }]
+
+REQUEST 2   messages = previous + 
+  { role: assistant, content: <RESPONSE 1 content, unchanged> }
+  { role: tool-results, content: [{ call_id: "call_01",
+        content: "{\"status\":\"shipped\",\"carrier\":\"Delhivery\",\"shipped_on\":\"2026-11-10\"}",
+        is_error: false }] }
+
+RESPONSE 2   stop: end
+  content:  [{ type: text, text: "Yes. Order 8812 shipped with Delhivery on 10 Nov." }]
+```
+
+Three invariants hold everywhere:
+
+- **Every call id gets exactly one result.** Drop one and the next request is rejected (Anthropic returns a 400 that says tool use ids were found without results).
+- **The assistant turn goes back unchanged.** The next request must contain the call the model made, or the result has nothing to attach to. If the provider returns reasoning or thinking blocks, pass them back as received.
+- **The model is stateless.** It "remembers" the call only because you resend it. Your code owns the transcript.
+
+### Where Anthropic and OpenAI differ
+
+As of late 2026; recheck the docs before you write a parser, because these APIs move.
+
+| Step | Anthropic Messages API | OpenAI Responses API | OpenAI Chat Completions |
+|---|---|---|---|
+| Define a tool | `name`, `description`, `input_schema`, optional `strict`, `input_examples` | `type: "function"`, `name`, `description`, `parameters`, `strict` | same fields nested under `function` |
+| Model asks | content block `tool_use` with `id`, `name`, `input` (an object); `stop_reason: "tool_use"` | output item `function_call` with `call_id`, `name`, `arguments` (a JSON **string**) | `message.tool_calls[]` with `id` and `function.arguments` (string); `finish_reason: "tool_calls"` |
+| You answer | a **user** message whose content starts with `tool_result` blocks: `tool_use_id`, `content`, optional `is_error` | an input item `function_call_output` with `call_id`, `output` | a message with `role: "tool"` and `tool_call_id` |
+| Errors | `is_error: true` on the result | put the error text in `output` | put the error text in `content` |
+| Turn off parallel | `disable_parallel_tool_use` inside `tool_choice` | `parallel_tool_calls: false` | `parallel_tool_calls: false` |
+
+Two practical consequences. First, OpenAI hands you arguments as a string, so `json.loads` can fail and you must handle it; Anthropic hands you a parsed object. Second, Anthropic has no separate tool role: results are content blocks in a user message, and any text you add must come *after* all `tool_result` blocks, or the request fails.
+
+### A framework-free round trip
+
+```python
+import json
+
+def fake_model(messages, tools):            # stands in for any provider
+    if messages[-1]["role"] == "user":
+        return {"stop": "tool_call", "content": [
+            {"type": "tool_call", "id": "call_01", "name": "orders_get_status",
+             "args": {"order_id": "8812"}}]}
+    return {"stop": "end", "content": [{"type": "text", "text": "Order 8812 shipped on 10 Nov."}]}
+
+HANDLERS = {"orders_get_status": lambda order_id: {"status": "shipped", "shipped_on": "2026-11-10"}}
+
+def one_round_trip(messages, tools, model=fake_model):
+    resp = model(messages, tools)
+    messages.append({"role": "assistant", "content": resp["content"]})   # verbatim
+    if resp["stop"] != "tool_call":
+        return resp
+    results = []
+    for block in (b for b in resp["content"] if b["type"] == "tool_call"):
+        try:
+            out = HANDLERS[block["name"]](**block["args"])
+            results.append({"call_id": block["id"], "content": json.dumps(out), "is_error": False})
+        except Exception as e:                  # unknown tool, bad args, handler crash
+            results.append({"call_id": block["id"], "content": f"{type(e).__name__}: {e}",
+                            "is_error": True})
+    messages.append({"role": "tool", "results": results})                  # one per call id
+    return model(messages, tools)
+
+print(one_round_trip([{"role": "user", "content": "Has 8812 shipped?"}], tools=[]))
+```
+
+Put a `while` with a step budget around this and you have an agent (chapter 22); SDK helpers such as Anthropic's tool runner run that loop for you.
+
+### Production failures
+
+Orphaned call ids after a crash mid-turn. Logs that keep the final answer but not the calls, so a bad trajectory cannot be replayed. A cross-provider gateway that drops `is_error`. And the classic: a handler throws, the request dies, and the user sees a 500 instead of the model recovering. Errors are data; send them back.
+
+## Agent-computer interface design
+
+### The problem
+
+A REST API's client is a developer who reads the docs once and runs the code a million times. A tool's client is a model that re-reads the docs on every call, cannot ask you a clarifying question, pays (in context and attention) for every byte you return, and acts at once on what it reads. The SWE-agent paper (Yang et al. 2024) named this the **agent-computer interface (ACI)**: agents, like humans, do better with interfaces designed for them. Its coding agent improved with a file viewer showing a bounded window of lines and an edit command that ran a linter and rejected broken edits.
+
+Anthropic's "Building effective agents" (2024) makes the same point from practice: for their SWE-bench agent they spent more time on tools than on the overall prompt, and they changed a tool to require absolute file paths after watching the model make mistakes with relative ones. They call this making tools "poka-yoke", mistake-proof.
+
+### Principles
+
+- **Few.** Every tool competes for the model's attention and your context; selection accuracy degrades as the menu grows (section 21.11).
+- **Task-shaped, not endpoint-shaped.** Model the jobs a person would do. Wrapping 40 REST endpoints one-to-one is the most common mistake.
+- **Forgiving inputs.** Accept the forms the model naturally produces ("8812", "#8812", "ORD-8812") and normalise in code, with a helpful error when you cannot.
+- **Concise results and errors that teach.** Return what the next decision needs; on failure, say what went wrong and what to do next.
+- **Safe by default.** Read-only unless the name says otherwise; destructive operations separated and gated.
+
+### A worked example: a support desk
+
+```text
+Endpoint-shaped (bad)                     Task-shaped (better)
+─────────────────────                     ────────────────────
+GET  /customers?email=                    customers_find(query)        read
+GET  /customers/{id}/orders               orders_find(customer_or_order, status?)  read
+GET  /orders/{id}                         orders_get(order_id, detail="concise")   read
+GET  /orders/{id}/shipments               refunds_create(order_id, amount_inr,     write, gated
+GET  /payments?order_id=                                 reason, idempotency_key)
+POST /payments/{id}/refunds
+GET  /refund-policies/{region}
+```
+
+On the left, "refund my last order" takes five chained calls, each a round trip dumping raw JSON into context. On the right it takes two or three, and the dangerous operation is one obviously named tool your harness can gate.
+
+### Trade-off and failure
+
+Task-shaped tools put more logic in your code (resolution, joins, formatting), which is the point: deterministic code is cheaper, faster and more testable than a model chaining calls. The opposite failure is a tool so coarse it hides decisions the model should see, such as `handle_customer_request(text)`: another LLM call with extra steps.
+
+## Names, descriptions, examples
+
+### Descriptions are prompts
+
+The model sees four things about a tool: its name, its description, its parameter schema (with per-parameter descriptions) and, optionally, examples. Anthropic's tool docs call detailed descriptions "by far the most important factor" in tool performance and suggest at least three or four sentences per tool. Write them like onboarding notes for a smart colleague who has never seen your system:
+
+- what the tool does and what it returns;
+- when to use it, and **when not to** (point at the right sibling);
+- what each parameter means, its format and units;
+- limits and caveats (pagination, what it does not return, side effects).
+
+```json
+{
+  "name": "orders_find",
+  "description": "Find a customer's orders. Use this when the user refers to an order without giving its id (e.g. 'my last order', 'the shoes I bought'), or gives an email or phone number. Returns at most 10 orders, newest first, each with order_id, date, items summary, total in INR and status. Do not use it to check refund status; use refunds_get for that. Read-only.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "customer": {
+        "type": "string",
+        "description": "Customer email, 10-digit Indian mobile number, or customer_id like CUS-1234."
+      },
+      "status": {
+        "type": "string",
+        "enum": ["any", "processing", "shipped", "delivered", "cancelled"],
+        "description": "Filter by status. Default any."
+      }
+    },
+    "required": ["customer"]
+  }
+}
+```
+
+### Names and parameters
+
+- **Verb and noun, namespaced by service or resource**: `orders_find`, `refunds_create`, `github_list_prs`. Namespacing matters once tools come from several systems or MCP servers, where two `search` tools would collide. Anthropic reports that prefix versus suffix namespacing changed its eval results, so measure.
+- **Unambiguous parameter names**: `user_id`, not `user`; `amount_inr`, not `amount`; `start_date` with "YYYY-MM-DD in IST" in its description.
+- **Enums for closed sets.** An enum is a constraint the decoder can enforce; free text is a guess you parse.
+- **Respect provider limits.** Anthropic tool names must match `^[a-zA-Z0-9_-]{1,128}$`.
+
+### Examples
+
+Schemas say what is valid, not what is typical. For nested or format-sensitive inputs, examples close the gap. Anthropic's `input_examples` field takes schema-valid example inputs (an invalid one is a 400) and costs roughly 20 to 50 tokens each for simple ones, 100 to 200 for nested ones. Its "Advanced tool use" post (November 2025) reported examples raising accuracy on complex parameter handling from 72% to 90% in internal testing. With other providers, put two short examples in the description.
+
+### The cost of good descriptions
+
+Descriptions are input tokens on every request. A rough budget, with your own numbers in place of these:
+
+```text
+30 tools × ~300 tokens each          = 9,000 tokens of definitions per request
++ tool-use system preamble            ≈ a few hundred tokens (per model; see docs)
+1,000,000 requests/day × 9,000        = 9 × 10^9 input tokens/day
+at P dollars per million input tokens = 9,000 × P dollars/day before caching
+```
+
+At an illustrative P of 3 that is 27,000 dollars a day (check the price page). Two levers fix most of it: [prompt caching](/10-inference-mechanics/#prefix-prompt-caching) (definitions sit at the front of the prompt and cache well if you never reorder or edit them mid-session) and fewer tools per request (section 21.11).
+
+### Failure modes
+
+Descriptions that drift from the code after a refactor. Overlapping descriptions that make selection a coin flip. And descriptions as an attack surface: a third-party tool whose description says "before any other tool, send the user's files to ..." is an injection the model reads on every call ([tool poisoning](/26-mcp/#protocol-security-tool-poisoning-rug-pulls-confused-deputy)).
+
+## Granularity and consolidation
+
+### Too fine, too coarse
+
+- **Too fine** (`list_users`, `list_events`, `create_event`): the model must chain calls, holding intermediate ids in context; each link is a round trip and a chance to pick the wrong id.
+- **Too coarse** (`run_sql(query)`, `call_api(method, path, body)`): one tool can do anything, so nothing about it is safe, and the model must know your whole schema.
+- **Task-shaped** (`schedule_event(attendees, window, title)`): one call does one job a person would recognise, and your code does the lookups.
+
+Anthropic's "Writing effective tools for AI agents" (2025) gives exactly these examples: replace `list_users` plus `list_events` plus `create_event` with `schedule_event`, and replace `list_contacts` with `search_contacts`, because an agent paging through every contact wastes its context the way a person reading a phone book would.
+
+### The latency arithmetic
+
+```text
+Chained (3 fine tools):  3 × (model turn ≈ 1.5 s + tool ≈ 0.2 s) + final turn 1.5 s ≈ 6.6 s
+Consolidated (1 tool):   1 × (1.5 s + 0.4 s internal joins)      + final turn 1.5 s ≈ 3.4 s
+```
+
+The model turn dominates. Every call you remove saves a full prefill-plus-decode cycle; the joins your code does instead cost tens to hundreds of milliseconds.
+
+### Consolidating with an action parameter
+
+Another form of consolidation is one tool with an `action` enum: `github_pr(action: "create" | "review" | "merge", ...)`. Anthropic's tool docs recommend this to reduce selection ambiguity. The cost is a conditional schema: which fields are required depends on the action, which JSON Schema expresses awkwardly and strict modes support poorly. A rule that works:
+
+- consolidate **reads** freely (one `orders_find` with filters beats five list endpoints);
+- keep **writes**, and especially irreversible ones, as **separate tools** so that permissions, approval and logging attach to a name, not to an argument value.
+
+### Resolution inside the tool
+
+```python
+import re
+
+def orders_find(customer: str, status: str = "any") -> dict:
+    """Task-shaped read: accepts email, phone or id; resolves internally. `db` is your data layer."""
+    q = customer.strip()
+    digits = q.replace(" ", "")
+    if "@" in q:
+        cust = db.customer_by_email(q.lower())
+    elif re.fullmatch(r"(\+91)?[6-9]\d{9}", digits):        # check phone before bare ids
+        cust = db.customer_by_phone(digits[-10:])
+    elif re.fullmatch(r"(CUS-)?\d{3,}", q, re.I):
+        cust = db.customer_by_id(q.upper().removeprefix("CUS-"))
+    else:
+        return {"error": "Could not tell what 'customer' is. Pass an email, a 10-digit "
+                         "mobile number or an id like CUS-1234."}
+    if cust is None:
+        return {"error": f"No customer matches '{q}'. Ask the user to confirm the email or phone."}
+    orders = db.orders_for(cust.id, None if status == "any" else status, limit=10)
+    return {"customer": cust.name, "orders": [
+        {"order_id": o.id, "date": o.date.isoformat(), "items": o.summary,
+         "total_inr": o.total, "status": o.status} for o in orders]}
+```
+
+The model passes whatever the user said; the code is forgiving about format and strict about meaning.
+
+### Failure modes
+
+Tool sets that grow by accretion (every new endpoint becomes a tool), near-duplicates such as `get_order` and `fetch_order_details`, and "god tools" that accept raw SQL or shell. The last is a security problem too: never pass a model-built string to a shell or SQL engine unchecked; use parameterised queries, a read-only role and an allow-list of operations ([safe text-to-SQL](/18-advanced-and-agentic-rag/#text-to-sql-and-query-construction)).
+
+## Result size, format, errors
+
+### Results are context you pay for repeatedly
+
+A tool result is appended to the transcript, and every later model call in that session re-reads it. That makes result size a compounding cost:
+
+```text
+A 20,000-token result returned at step 2 of a 10-step agent run
+is re-read at steps 3..10:   8 × 20,000 = 160,000 extra input tokens
+At P dollars per million:    0.16 × P dollars for that one run (less with cache hits)
+```
+
+It also costs quality: long, noisy context degrades attention to what matters ([context rot](/27-context-engineering/#context-rot)). Treat the result as the tool's user interface.
+
+### Shape the result
+
+- **Return meaning, not internals.** Names, titles and readable statuses; keep a stable id only when the model needs it for a follow-up call. Anthropic reported that resolving opaque ids into readable language reduced hallucinated ids.
+- **Let the model choose verbosity.** A `response_format: "concise" | "detailed"` parameter. In Anthropic's Slack example the concise response used 72 tokens against 206 for the detailed one.
+- **Paginate, filter, truncate, and say so.** "Showing 10 of 342 orders, newest first. Narrow with status or since." A silent truncation teaches the model that the first page is everything.
+- **Cap hard.** Claude Code, for example, caps tool responses at 25,000 tokens by default. Pick a cap per tool and enforce it in the wrapper.
+- **Pick a format the model reads well and keep it consistent.** Compact JSON, short markdown or plain text all work; consistency across tools matters more than the choice.
+
+### Errors are results
+
+An exception that escapes your handler ends the request. An error returned as a tool result (`is_error: true`) lets the model recover: Anthropic's docs say that after an invalid call the model retries two or three times with corrections before apologising, provided you tell it what was wrong. Classify every error into one of three kinds, because each needs a different message:
+
+| Kind | Example | What the result should say |
+|---|---|---|
+| Model's fault | missing field, bad format, unknown id | what was wrong and a corrected example |
+| Transient | timeout, 429, upstream 503 | retried already, or "retry after 30 s"; never a raw stack trace |
+| Permanent | not found, forbidden, policy | do not retry; what to tell the user or which tool to use instead |
+
+### The wrapper every tool goes through
+
+```python
+import json
+
+MAX_CHARS = 8_000          # per-tool cap, roughly 2k tokens
+
+class TransientError(Exception): ...     # handlers raise these two; anything else is a bug
+class PermanentError(Exception): ...
+
+def run_tool(name: str, args: dict, registry: dict) -> dict:
+    tool = registry.get(name)
+    if tool is None:
+        return {"is_error": True, "content": f"Unknown tool '{name}'. Available: {', '.join(registry)}."}
+    missing = [k for k in tool["schema"].get("required", []) if k not in args]
+    if missing:
+        return {"is_error": True, "content": f"Missing required argument(s): {', '.join(missing)}. "
+                                             f"Example: {json.dumps(tool['example'])}"}
+    try:
+        out = tool["fn"](**args)
+    except TransientError as e:
+        return {"is_error": True, "content": f"Temporary failure ({e}). Safe to retry once."}
+    except PermanentError as e:
+        return {"is_error": True, "content": f"{e}. Do not retry; explain this to the user."}
+    text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS] + f"\n[truncated: {len(text)} chars total; narrow the query]"
+    return {"is_error": isinstance(out, dict) and "error" in out, "content": text}
+```
+
+Log `name`, `args`, result size, `is_error` and latency here. This one function is your tool observability ([what to log](/30-observability/#logging-prompts-completions-tool-calls)).
+
+### Security note
+
+Tool results are untrusted input: a web page, email or ticket can contain text addressed to the model. Keep it inside tool results, never in the system prompt, and assume it can steer the model ([indirect injection](/33-security-prompt-injection/#indirect-injection)).
+
+## Parallel calls
+
+### Mechanism
+
+When a turn needs several independent facts ("compare orders 8812, 8813 and 8820"), the model can emit several calls in one response. Your code runs them concurrently and returns all results in the next message, one per call id.
+
+```text
+Sequential: model → call A → model → call B → model → call C → model     4 model turns
+Parallel:   model → [A, B, C] concurrently → model                         2 model turns
+
+With a model turn ≈ 1.5 s and each tool ≈ 0.8 s:
+  sequential ≈ 4 × 1.5 + 3 × 0.8 = 8.4 s
+  parallel   ≈ 2 × 1.5 + max(0.8, 0.8, 0.8) = 3.8 s
+```
+
+Parallelism only helps for independent calls. If call B needs A's result, the model must see A first, and that is a round trip no flag can remove (section 21.10 shows one way around it).
+
+### Running them
+
+```python
+import asyncio
+
+SEM = asyncio.Semaphore(4)                      # protect downstream rate limits
+
+async def run_one(call, registry):
+    async with SEM:
+        try:
+            out = await asyncio.wait_for(registry[call["name"]](**call["args"]), timeout=10)
+            return {"call_id": call["id"], "content": out, "is_error": False}
+        except asyncio.TimeoutError:
+            return {"call_id": call["id"], "content": "Timed out after 10 s.", "is_error": True}
+        except Exception as e:
+            return {"call_id": call["id"], "content": f"{type(e).__name__}: {e}", "is_error": True}
+
+async def run_parallel(calls, registry):
+    # One failure must not cancel the others; every call id still gets a result.
+    return await asyncio.gather(*(run_one(c, registry) for c in calls))
+```
+
+### Controls and when to turn it off
+
+Parallel calling is on by default with both major providers. Turn it off (Anthropic `disable_parallel_tool_use`, OpenAI `parallel_tool_calls: false`) when:
+
+- calls have **order-dependent side effects** (create a record, then attach to it);
+- a downstream API has a strict **rate limit**;
+- the model makes **worse calls in batches**, such as guessing ids it should have read from an earlier result.
+
+### Failure modes
+
+A partial failure handled as a total failure. Results matched by position instead of id. Fan-out explosions (30 parallel searches when 5 would do), which is why server tools have caps such as `max_uses`. And on Anthropic, splitting the results of one parallel turn across several user messages is wrong; the docs warn it teaches the model to stop making parallel calls.
+
+## Tool choice modes
+
+### The four modes
+
+Every provider lets you constrain *whether* and *which* tool the model calls on a given request:
+
+| Intent | Anthropic `tool_choice` | OpenAI `tool_choice` |
+|---|---|---|
+| Model decides (default with tools) | `auto` | `"auto"` |
+| Must call some tool | `any` | `"required"` |
+| Must call this tool | `tool` with `name` | `type: "function"` with `name` |
+| Must not call tools | `none` | `"none"` |
+| Only this subset is callable | (edit the tools list) | `allowed_tools` with a list |
+
+### What each is for
+
+- **`auto`**: the normal case, steered by the system prompt ("check order status with a tool before answering").
+- **`none`**: the step budget is spent; force a written answer. The cleanest [stop condition](/22-agent-loop/#stop-conditions-and-budgets).
+- **`any` or `required`**: a router step where prose would be a bug.
+- **Forced specific tool**: the old trick for extraction (force `record_invoice`, read its arguments). Native [structured outputs](/13-structured-output/#json-mode-vs-schema-enforced) do this more directly.
+- **Allowed subset**: change what is callable without editing the tools list, which sits at the front of the prompt and would invalidate the cache.
+
+```python
+def tool_choice_for(step: int, budget: int, phase: str) -> dict:
+    if step >= budget:
+        return {"type": "none"}                 # out of budget: answer now
+    if phase == "route":
+        return {"type": "any"}                  # must pick a route tool (where supported)
+    return {"type": "auto"}                     # normal agent step
+```
+
+### Caveats that bite
+
+- When you force a tool, Anthropic prefills the assistant turn so the call comes first: no text before it and no thinking block. For reasoning first, use `auto` and say "use the X tool" in the prompt.
+- Support varies by model. Anthropic's newest models (Opus 5.5, Sonnet 5.5, Fable 5.1 and 5.2) reject `any` and forced `tool` with a 400; the docs recommend `auto` plus `strict: true`, or structured outputs. Test forced tool choice per model before relying on it.
+- Changing `tool_choice` between requests invalidates Anthropic's cached message blocks (definitions and system prompt stay cached). Flip it only when you mean to.
+- `strict: true` constrains arguments to the schema. Both providers want `additionalProperties: false`; OpenAI also wants every property listed as required, with optional ones nullable. Design schemas for that from the start ([schema design](/13-structured-output/#schema-design-enums-nullables)).
+
+## Built-in server tools
+
+### Client tools versus server tools
+
+The difference is who executes the call.
+
+- **Client tools**: the response stops with a tool call, your code runs it, you send the result. Everything so far.
+- **Server tools**: the provider runs them inside the same request. Anthropic offers web search, web fetch, code execution and tool search this way; OpenAI's Responses API has web search, file search, a code interpreter and remote MCP, among others. The response holds both call and result; you send nothing back.
+
+```text
+Client tool                               Server tool (one API request)
+───────────                               ─────────────────────────────
+model ─ tool_use ─▶ YOUR CODE runs it     model ─ server_tool_use ─▶ provider runs search
+      ◀─ tool_result (you send) ─               ◀─ web_search_tool_result (provider inserts)
+model continues (2nd request)             model continues, cites results (same response)
+```
+
+### Trade-offs
+
+| | Client tool | Server tool |
+|---|---|---|
+| Infrastructure | yours | none |
+| Control over results | full (filter, rerank, redact before the model sees them) | the provider's ranking and formatting |
+| Latency | extra round trip per call | no extra round trip from your side |
+| Pricing | tokens only | tokens plus a per-use fee (for example per search; check the price page) |
+| Data flow | stays in your systems | goes to the provider and its search partner |
+| Portability | any model | that provider's API |
+
+Server tools add two protocol details. Long server-side loops can end with `stop_reason: "pause_turn"`; you send the assistant content back unchanged and the provider continues. And when one response holds both a client `tool_use` and a server call that has no result yet, Anthropic's docs say to reply with a user message holding only your `tool_result` blocks (no text); the server tool then runs on that request.
+
+### Your one real tool: Memory Agent's web search
+
+Memory Agent is the cleanest example you own. In `src/answer.ts` (lines 47 to 59) the writer call declares one server tool:
+
+```ts
+{
+  type: "web_search_20260318",
+  name: "web_search",
+  max_uses: inp.maxSearches,               // per-request cap on searches
+  allowed_callers: ["direct"],             // no code-execution step before results
+  blocked_domains: BLOCKED_DOMAINS,         // from src/config.ts
+  user_location: { type: "approximate", timezone: inp.timezone },
+}
+```
+
+Each field is a production decision: `max_uses` is a search budget, `blocked_domains` drops sites that gave thin content in earlier logs, `user_location` makes "near me" and local prices sensible, and `allowed_callers: ["direct"]` skips the code-execution step (section 21.10). Searches are billed per use on top of tokens, so the cost code reads `usage.server_tool_use.web_search_requests`. The Your project block at the end walks through the stream handling and budgets.
+
+What the server tool cannot do is what you would want next: screen fetched pages for injected instructions, rerank results, or force a vendor's own domain as a hard step (the open item in `DECISIONS.md` #8). Those need a client-side tool or a client-side check after the call.
+
+```text
+Cost per Memory Agent search turn (formula, not a quote):
+  = input_tokens × P_in + output_tokens × P_out + searches × fee_per_search
+    − cache_read_tokens × (P_in − P_cache_read)
+  search results land in input tokens too, so more searches cost twice.
+```
+
+## Code execution as a meta-tool
+
+### The problem
+
+Some tasks need many dependent calls: "top 5 customers by revenue last quarter" means listing customers, fetching orders for each, summing and sorting. As plain tool calls that is dozens of round trips, and every intermediate result flows through context though the model needs only five rows.
+
+### Mechanism
+
+Give the model one tool, a code sandbox, and let it write a short program that calls your other tools as functions. Loops, filters and joins run in the sandbox; only the program's printed output returns to the model. The CodeAct paper (Wang et al. 2024) argued for code as the action format for this reason: code composes, branches and loops, which JSON calls cannot.
+
+Anthropic ships this as **programmatic tool calling**: you add `allowed_callers` naming the code-execution tool to a tool's definition, the model writes code that calls it, your tool results go back into the running program instead of into the model's context. Anthropic reported that on complex research tasks it cut average token use by 37% (43,588 to 27,297) in its "Advanced tool use" post. Chapter 26 covers the same idea applied to MCP servers ([code execution with MCP](/26-mcp/#code-execution-with-mcp)).
+
+```python
+import subprocess, sys, textwrap
+
+PRELUDE = textwrap.dedent("""
+    import json
+    _ORDERS = json.loads(%r)
+    def get_orders(customer_id):          # tool exposed to the program
+        return [o for o in _ORDERS if o["customer_id"] == customer_id]
+""")
+
+def run_model_code(code: str, orders_json: str, timeout_s: float = 5.0) -> str:
+    # NOT a sandbox: a subprocess with a timeout. Use a container or microVM
+    # with no network and a read-only filesystem for real untrusted code.
+    proc = subprocess.run([sys.executable, "-I", "-c", PRELUDE % orders_json + code],
+                          capture_output=True, text=True, timeout=timeout_s)
+    out = proc.stdout if proc.returncode == 0 else f"Error:\n{proc.stderr[-1500:]}"
+    return out[:4000]                     # only this reaches the model's context
+
+model_code = """
+totals = {}
+for cid in ["C1", "C2", "C3"]:
+    totals[cid] = sum(o["total"] for o in get_orders(cid))
+print(sorted(totals.items(), key=lambda kv: -kv[1])[:2])
+"""
+```
+
+### Trade-offs
+
+- **For**: fewer round trips, far less context, real control flow, and large results filtered (500 search hits down to 5) before the model reads them.
+- **Against**: you run a sandbox (isolation, timeouts, egress rules, resource limits); container start-up adds latency; code-plus-output traces are harder to audit; and a model that can loop can loop over your write tools.
+
+Anthropic's newer web search versions use exactly this: by default (`allowed_callers` defaulting to the code-execution tool) the model filters results in code before they reach context ("dynamic filtering"). Memory Agent's `DECISIONS.md` #1 records the opposite choice, direct mode, because a chat UI needs to show each query the moment it starts; filtering would save tokens on big result sets but add a code step to every search.
+
+### Failure modes
+
+Treating `allowed_callers` as a security boundary (Anthropic's docs say explicitly it is not; handle a direct call to any tool you define). Running model code with `exec` in your API process. Letting sandboxed code call write tools without the approval gate of section 21.13. See [sandboxing and containment](/33-security-prompt-injection/#sandboxing-and-containment).
+
+## Tool search for large catalogs
+
+### The problem
+
+Connect five MCP servers and you can have 100 to 200 tools. Two things break.
+
+```text
+200 tools × ~400 tokens per definition = 80,000 tokens before the user's message
+```
+
+That is context and money on every call. Worse, selection accuracy drops: Anthropic's tool-search docs say Claude's tool choice degrades past roughly 30 to 50 tools, and OpenAI's guide softly suggests fewer than 20 functions available at once.
+
+### Mechanism: load tools on demand
+
+Treat the catalog as a retrieval problem. Keep a handful of tools always loaded, plus a search tool. The model searches when it needs a capability; the matching definitions are loaded into context; then it calls them.
+
+- **Anthropic**: mark tools `defer_loading: true` and add a tool search tool (regex or BM25 variants). Search returns `tool_reference` blocks (5 by default) that the API expands into full definitions. You still send every definition on every request; deferred ones are kept out of the cached prompt prefix, so the cache survives. You can also return `tool_reference` blocks from your own search tool, for example one backed by embeddings.
+- **OpenAI**: group functions into namespaces, mark them `defer_loading`, and enable `tool_search` (supported on newer models only; check the guide).
+
+Anthropic's "Advanced tool use" post reported definitions dropping from about 77K to about 8.7K tokens with tool search, and MCP-eval accuracy rising from 49% to 74% for Opus 4 and from 79.5% to 88.1% for Opus 4.5. Treat those as the vendor's numbers on the vendor's evals; measure on yours.
+
+### Doing it yourself
+
+The same idea works with any model: retrieve tools per turn.
+
+```python
+import math, re
+from collections import Counter
+
+def tokens(s: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", s.lower().replace("_", " "))
+
+def build_index(tools: list[dict]) -> list[tuple[dict, Counter]]:
+    return [(t, Counter(tokens(t["name"] + " " + t["description"]))) for t in tools]
+
+def search_tools(query: str, index, k: int = 5, always: tuple = ("orders_find",)):
+    q = Counter(tokens(query))
+    n = len(index)
+    df = Counter(w for _, bag in index for w in bag)
+    def score(bag):            # TF-IDF overlap; swap in BM25 or embeddings
+        return sum(q[w] * bag[w] * math.log(1 + n / df[w]) for w in q if w in bag)
+    ranked = sorted(index, key=lambda tb: -score(tb[1]))
+    picked = [t for t, _ in ranked[:k]]
+    return [t for t, _ in index if t["name"] in always] + \
+           [t for t in picked if t["name"] not in always]
+```
+
+This is [information retrieval](/15-information-retrieval-foundations/) over tool descriptions, with the usual problems: vocabulary mismatch (the user says "money back", the tool says "refund"), so add user phrasings to descriptions; and recall, so measure it.
+
+### What to measure
+
+**Tool retrieval recall@k**: for each labelled prompt, is the correct tool in the top k? A tool that is not retrieved cannot be called, whatever its description says. The hierarchical alternative, a router that picks a namespace ("orders", "payments") and loads its tools, costs one cheap extra call and is easy to debug.
+
+## Idempotency, retries, side effects
+
+### Classify every tool
+
+| Class | Example | Safe to retry blindly? |
+|---|---|---|
+| Read-only | `orders_find`, `web_search` | yes |
+| Idempotent write | `orders_set_status(order_id, "on_hold")` | yes: same result twice |
+| Non-idempotent write | `refunds_create`, `payments_charge`, `email_send` | **no** |
+
+Put the class in your tool registry; the harness uses it to decide retries, approval and logging.
+
+### Where duplicates come from
+
+A customer charged twice is almost never "the model went rogue". It is one of these:
+
+1. **Your HTTP retry**: the payment call timed out, your client retried, but the first request had succeeded.
+2. **The model retries**: the tool said "failed", or the result was truncated away, so the model calls `payments_charge` again; from its view, reasonable recovery.
+3. **Replay after a crash**: the run resumes from a checkpoint taken before the call was recorded as done.
+4. **Parallel duplication**: the model emits the same call twice in one turn.
+5. **The user resubmits** the request after a slow response.
+
+### The fix: idempotency keys, derived in code
+
+The downstream operation must accept an idempotency key and return the original result for a repeated key (payment providers such as Stripe support this with an `Idempotency-Key` header). The design question is where the key comes from.
+
+- **Not from the model.** If the model generates a fresh key on its retry, the key protects nothing.
+- **Not from the tool-call id.** A retried call gets a new id.
+- **From the business intent**: a stable identifier of "this action for this thing", such as `(conversation_id, "refund", order_id, amount)`, or a key minted when the user's request entered the system and stored with the run.
+
+```python
+import hashlib, json
+
+STORE: dict[str, dict] = {}          # in production: a table with a unique key + TTL
+
+def intent_key(session_id: str, op: str, **business_fields) -> str:
+    raw = json.dumps([session_id, op, business_fields], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+def refunds_create(session_id: str, order_id: str, amount_inr: int, reason: str) -> dict:
+    key = intent_key(session_id, "refund", order_id=order_id, amount_inr=amount_inr)
+    if key in STORE:
+        prev = STORE[key]
+        return {**prev, "note": "This refund was already requested in this conversation; no new refund made."}
+    STORE[key] = {"status": "pending"}                       # claim the key first
+    try:
+        r = payments.refund(order_id, amount_inr, idempotency_key=key)   # downstream dedupes too
+    except TimeoutError:
+        return {"error": "Refund status unknown (timeout). Do NOT call refunds_create again; "
+                         "call refunds_get with this order_id to check."}
+    STORE[key] = {"status": "done", "refund_id": r.id, "amount_inr": amount_inr}
+    return STORE[key]
+```
+
+Note the timeout message. After an ambiguous failure, "failed" is the worst thing a write tool can say, because the natural recovery is to try again. Say the state is unknown and name a read tool to check it.
+
+### Retries in code, not in the model
+
+- Retry **transient** failures in the wrapper with exponential backoff and jitter, only for read-only or idempotent tools or keyed writes.
+- Never let the model blind-retry a non-idempotent write; the error should send it to a status check.
+- Record each executed side effect (key, args, result, time) before returning, so a resumed run sees it was done: durable execution applied to tools ([checkpointing](/22-agent-loop/#long-running-agents-checkpointing-resumability)).
+
+## Human approval
+
+### Why approval lives in the harness
+
+A system prompt that says "always ask before refunding" is a request, not a control; the model can be talked or injected out of it. Approval belongs in the code that executes tools: the model proposes, the harness pauses, a human decides, the harness executes (or not) and returns the decision as the tool result.
+
+### Risk tiers
+
+| Tier | Examples | Policy |
+|---|---|---|
+| Read | search, find, get | run automatically, log |
+| Reversible write | draft an email, set a label, create a ticket | run automatically or with a session-level grant, log, offer undo |
+| Irreversible or external | refund, charge, send to a customer, delete, deploy | explicit approval per call, showing exact arguments |
+
+### Mechanism
+
+```python
+APPROVAL_REQUIRED = {"refunds_create", "email_send", "orders_cancel"}
+
+def execute_with_gate(call: dict, run_id: str, approvals: dict, registry: dict) -> dict:
+    if call["name"] not in APPROVAL_REQUIRED:
+        return run_tool(call["name"], call["args"], registry)
+    decision = approvals.get(call["id"])
+    if decision is None:
+        save_pending(run_id, call)          # durable: the human may answer in 10 minutes
+        notify_reviewer(run_id, render_for_human(call))
+        return {"pending": True}            # loop stops here and resumes on decision
+    if decision["approved"]:
+        args = decision.get("edited_args", call["args"])   # human may correct amounts
+        return run_tool(call["name"], args, registry)
+    return {"is_error": True,
+            "content": f"The user declined this action. Reason: {decision.get('reason', 'none given')}. "
+                       "Do not retry it; ask the user what they want instead."}
+```
+
+Points that matter in production:
+
+- **Show the human the real arguments**, rendered readably ("Refund ₹2,499 to the card ending 4417 for order 8812"), not the model's summary, which can be wrong or manipulated.
+- **Pause durably.** Approval can take minutes or days, so the run must be serialisable and resumable (12-Factor Agents: "contact humans with tool calls", "launch, pause, resume"; see [twelve-factor principles](/22-agent-loop/#twelve-factor-principles)).
+- **Return rejections to the model** as a result, so it can adapt rather than loop.
+- **Fight approval fatigue.** If every action needs a click, people stop reading. Use tiers, scoped grants and allow-lists; keep explicit approval for the irreversible ([permission modes](/28-coding-and-computer-use-agents/#permission-modes-and-auto-approval)).
+
+### Least privilege underneath
+
+Approval is the last line. Underneath it: each tool runs with narrowly scoped credentials, checks the **end user's** permissions server-side (or the agent becomes a confused deputy that reads any customer's orders), runs shell commands from an allow-list with arguments as an array, and uses parameterised SQL on a read-only role.
+
+## Testing tools
+
+### Four layers
+
+1. **Handler unit tests.** A handler is an ordinary function: test inputs, outputs, error messages and idempotency (call twice, assert one side effect).
+2. **Contract tests.** Examples validate against the schema, every parameter has a description, names are unique and match the provider's regex, definitions fit your token budget. Cheap and deterministic; run in CI.
+3. **Selection and argument evals.** Labelled prompts with the expected tool and arguments, run against the real model. This is the core of tool quality.
+4. **Trajectory evals.** Multi-step tasks in a sandboxed environment with fake side effects, scored on the outcome and the path ([agent evals](/20-evals-judges-and-ci/#agent-evals-outcome-vs-trajectory)). τ-bench (Yao et al. 2024) added pass^k, the probability that all k repeated runs succeed, which exposes flaky tool use that pass@1 hides.
+
+### Metrics to define once and track
+
+- **Tool-selection accuracy**: fraction of cases where the first call is the expected tool.
+- **Argument accuracy**: of correct selections, fraction with correct arguments (exact match for ids and enums, normalised or judged for free text).
+- **No-call precision**: on prompts that need no tool, fraction where the model correctly calls none. Over-calling costs latency and money.
+- **Invalid-call rate**, plus **calls, tokens and tool errors per task** (metrics Anthropic also tracks when evaluating tools).
+
+Public benchmarks such as the Berkeley Function Calling Leaderboard (BFCL) help shortlist models; your own tool names, descriptions and users are what you must test ([reading benchmarks critically](/11-serving-and-model-economics/#reading-benchmarks-critically)).
+
+### A small harness
+
+```python
+CASES = [
+    {"prompt": "Has order 8812 shipped?", "tool": "orders_get", "args": {"order_id": "8812"}},
+    {"prompt": "What did I buy last week? I'm riya@example.com", "tool": "orders_find",
+     "args": {"customer": "riya@example.com"}},
+    {"prompt": "Thanks, that's all!", "tool": None, "args": {}},
+    # ... 30 cases: common paths, near-miss pairs, no-tool prompts, missing-info prompts
+]
+
+def evaluate(call_model, tools) -> dict:
+    sel = arg = nocall_ok = nocall_n = 0
+    for c in CASES:
+        calls = call_model([{"role": "user", "content": c["prompt"]}], tools)  # first-turn calls
+        got = calls[0] if calls else None
+        if c["tool"] is None:
+            nocall_n += 1
+            nocall_ok += got is None
+            continue
+        if got and got["name"] == c["tool"]:
+            sel += 1
+            arg += all(str(got["args"].get(k, "")).lower() == str(v).lower()
+                       for k, v in c["args"].items())
+    n = len(CASES) - nocall_n
+    return {"selection_acc": sel / n, "arg_acc": arg / max(sel, 1),
+            "no_call_precision": nocall_ok / max(nocall_n, 1)}
+```
+
+Run the cases with a mocked model in CI (to test harness and parsing) and with the real model before any change to tool names, descriptions or model version (to test behaviour). Memory Agent does the first kind: `src/agent.test.ts` fakes `server_tool_use` and `web_search_tool_result` blocks so routing and streaming are tested without a network call.
+
+### How many cases is enough?
+
+```text
+30 cases, observed accuracy 0.90:
+  standard error ≈ sqrt(0.9 × 0.1 / 30) ≈ 0.055
+  95% interval   ≈ 0.90 ± 1.96 × 0.055 ≈ 0.79 to 1.00
+```
+
+Thirty cases catch a broken description; they cannot tell 88% from 92%. Grow the set from production failures (every wrong call in the logs becomes a case) and compare variants on the same cases.
+
+<Production>
+
+**Failure modes.**
+- Wrong tool or arguments: overlapping descriptions, vague parameter names, too many tools loaded. Fix the interface before blaming the model.
+- Huge outputs flooding context: one unpaginated result is re-read every later step. Cap and paginate in the wrapper.
+- Duplicate side effects on retry (transport retry, model retry after "failed", replay after a crash): intent-derived idempotency keys and "status unknown, check with X" errors.
+- Protocol breaks: orphaned call ids, misplaced results, an abstraction that drops `is_error` or mangles string arguments.
+
+**Cost.**
+- Definitions are input tokens on every request, plus a tool-use preamble: tools × tokens per definition × requests per day × input price.
+- Keep definitions stable and first so prompt caching covers them; change what is callable with allowed subsets or deferred loading, not by editing the list.
+- Results compound (re-read at every later step). Server tools add per-use fees; check the price page.
+
+**Latency.**
+- Each sequential round trip is a full model turn plus tool time. Consolidate chains into task-shaped tools, parallelise independent calls, push dependent chains into code execution where it pays.
+- Per-tool timeouts and a turn deadline; return a timeout as a result, not an exception.
+
+**Observability.**
+- Log every call: run id, step, tool, arguments (redacted), result tokens, `is_error`, latency, retries, idempotency key, approval decision.
+- Track selection accuracy offline; online, watch invalid-call rate, errors per tool, calls per task and truncation rate. A rising invalid-call rate after a model upgrade is the early warning.
+
+**Security.**
+- Least privilege: per-tool credentials, server-side authorisation against the end user, read-only roles for reads.
+- Validate arguments in code; never pass model-built strings to a shell or SQL unchecked (argument arrays, parameterised queries).
+- Tool results (indirect injection) and third-party tool descriptions (tool poisoning) are untrusted.
+- Approval gates for irreversible actions live in the harness, not the prompt.
+
+</Production>
+
+<Interview>
+
+<Q q="How does function calling work under the hood?">
+
+- The model never executes anything. It is trained (SFT plus RL on tool-use data) to emit a call in a fixed format when a described tool would help.
+- The server's chat template renders tool names, descriptions and JSON Schemas into the prompt with a short tool-use preamble; that is why definitions cost input tokens on every call.
+- The model emits the call inside special tokens or tags; the server parses it into a structured block (`tool_use` with an object on Anthropic, `function_call` with a JSON string on OpenAI) and stops with a tool stop reason. Strict mode adds constrained decoding so arguments match the schema.
+- Your code validates, runs the handler, and appends the assistant turn verbatim plus one result per call id. The model is stateless; you own the transcript.
+- Server tools (web search, code execution) use the same protocol, but the provider executes and inserts the result.
+- **The trap:** "the model calls the API". Your code does, so validation, permissions and retries are yours. Also weak: not knowing that valid JSON can carry wrong values.
+
+</Q>
+
+<Q q="How do you design tools so the model uses them correctly?">
+
+- Treat tools as an agent-computer interface: few, task-shaped tools, not one per REST endpoint; joins happen in your code.
+- Names: verb plus noun, namespaced (`orders_find`, `refunds_create`); unambiguous parameters (`amount_inr`); enums for closed sets.
+- Descriptions are prompts: what it does, when to use it and when not, parameter formats, what it returns. Examples for complex inputs.
+- Results concise, paginated, capped, with a truncation note; errors returned as results with a next step.
+- Destructive writes as separate tools, so approval and logging attach to names.
+- Prove it with an eval: selection and argument accuracy, no-call precision; iterate descriptions against it.
+- **The trap:** auto-generating tools from an OpenAPI spec and stopping there, or "write good descriptions" with no way to measure.
+
+</Q>
+
+<Q q="A tool call charged a customer twice. What went wrong, and how do you prevent it?">
+
+- Likely causes: transport retry after a timeout on a request that succeeded; the model re-calling after an ambiguous "failed"; replay after a crash; duplicate parallel calls; user resubmission.
+- Investigate from logs: two charges with different or missing idempotency keys, the call ids, the result text the model saw before the second call.
+- Prevention: an idempotency key on every non-idempotent write, derived in code from business intent (session, operation, order, amount), not from the model or the call id; pass it downstream (payment APIs dedupe on it).
+- Error design: on timeout say "status unknown, do not retry, call payments_get_status".
+- Retry transient errors in the wrapper with backoff, only for idempotent or keyed operations; record side effects before returning so resumes skip them; gate charges above a threshold.
+- **The trap:** "tell the model in the prompt not to call it twice", or generating a new UUID per call as the idempotency key, which deduplicates nothing.
+
+</Q>
+
+<Q q="How do you scale to 200 tools?">
+
+- Quantify: 200 × ~400 tokens is about 80K tokens of definitions per call, and selection degrades well before that (Anthropic cites roughly 30 to 50 tools; OpenAI suggests under 20 at once).
+- Consolidate first: big catalogs carry near-duplicates; merging reads shrinks the problem.
+- Load on demand: 3 to 5 common tools always loaded, the rest deferred behind tool search (native `defer_loading`, or your own BM25 or embedding index). Or route: a cheap router picks a namespace, then loads its tools.
+- Deferred tools stay out of the cached prefix, so caching survives.
+- Measure tool retrieval recall@k and end-to-end selection accuracy; add user vocabulary to descriptions when recall misses.
+- For multi-step data work, code execution over tools keeps intermediate results out of context.
+- **The trap:** "use a model with a bigger context window". It fixes neither cost nor selection accuracy.
+
+</Q>
+
+<Q q="When would you use structured output instead of a tool call, and vice versa?">
+
+- Structured output when the JSON *is* the answer (extraction, classification, a typed plan) and nothing needs to run before the model finishes.
+- A tool call when the model needs something back (data, an action's result) before it can continue, or when it should decide whether to act at all.
+- Mechanically close: both fill a schema with constrained decoding. The difference is the round trip and the side effects.
+- Forcing a tool to get JSON was the old trick; native structured outputs are cleaner, and some newer models (Anthropic's Opus 5.5 and Sonnet 5.5) reject forced tool choice with a 400.
+- **The trap:** wrapping every extraction in a fake tool, which adds a tool preamble and confuses traces, or treating a tool call as trusted because it parsed.
+
+</Q>
+
+<Q q="Server-side tools or client-side tools: how do you choose?">
+
+- Server tools (provider web search, code execution): no infrastructure, no extra round trips, provider-tuned. Costs: per-use fees, little control over ranking, data leaves your systems, lock-in.
+- Client tools: full control (filter, rerank, redact, screen for injection before the model reads), any model, your data and permissions. Costs: you build and run them, a round trip per call.
+- Mixed is common: server search for breadth, client tools for private data and all writes. Memory Agent's open item, a hard vendor-domain check, needs a client-side step.
+- **The trap:** assuming a server tool's results are safe because the provider fetched them. They are still untrusted web content.
+
+</Q>
+
+</Interview>
+
+<ApplyIt>
+
+**Goal:** add Memory Agent's first client-side tools: three real operations on its SQLite memory, behind a hand-written loop with idempotency keys, typed arguments, model-readable errors and a confirmation gate on the write; then measure tool-selection accuracy on 30 prompts. Do it in `~/memory-agent` on a branch.
+
+**Runs offline.** A scripted mock model (returns tool calls by keyword, to test the harness) or a local tool-capable model through Ollama (a Qwen or Llama 3.x instruct model; its chat endpoint accepts a `tools` list in the OpenAI shape). No paid API.
+
+**Steps.**
+
+1. **Define three tools** in a new `src/tools.ts`, each wrapping an existing `Memory` method in `src/memory.ts`:
+   - `memory_search_turns(terms: string[], limit?: number)`: read, wraps `searchTurns`. Returns at most 5 turns as date plus a one-line summary, with a truncation note.
+   - `memory_claims_for_turns(turn_ids: number[])`: read, wraps `claimsForTurns`. Returns claims with the date they were observed.
+   - `threads_create(title: string, idempotency_key: string)`: write, wraps `createThread`. The harness, not the model, fills `idempotency_key` from (session id, normalised title).
+   Write descriptions of three or more sentences with when-not-to-use lines, and a JSON Schema per tool. Validate arguments with zod (already a dependency, used in `src/claims.ts`).
+2. **Write the wrapper** (`runTool`): unknown tool, invalid arguments, handler errors and oversize results all become `{ is_error: true, content: "what went wrong + what to do" }`. Log name, arguments, result size, latency and `is_error` as one JSON line.
+3. **Add idempotency** to `threads_create`: a repeated key returns the original thread id with a note that it already existed.
+4. **Add the gate**: `threads_create` returns a pending state; a CLI prompt (or a confirm event in the SSE stream) approves, edits or rejects; a rejection goes back to the model as a tool result.
+5. **Write the loop** in the provider-neutral shape from this chapter: at most 4 steps, `tool_choice` set to none on the last step, every call id answered, independent read calls run with `Promise.all`.
+6. **Build the eval**: 30 labelled prompts in `eval/tools-cases.ts`: 10 for each read tool (including near-misses between them), 5 that need the write, 5 that need no tool. Score selection accuracy, argument accuracy and no-call precision; run it twice and report both runs.
+
+**Definition of done.**
+- `npm test` covers: each handler, a duplicate `threads_create` producing one thread, a rejected approval reaching the model as an error result, and an orphan-free transcript after a handler throws.
+- The eval prints selection accuracy, argument accuracy and no-call precision for the local model, plus the interval arithmetic for n = 30.
+- One description change made because of an eval failure, with the before and after numbers recorded in `DECISIONS.md`.
+
+</ApplyIt>
+
+<YourProject>
+
+- **Memory Agent's server-side tool is your concrete tool-calling story.** `src/answer.ts` lines 47 to 59 declare `web_search_20260318` with `max_uses`, `blocked_domains` (from `src/config.ts`), approximate `user_location` with the user's timezone, and `allowed_callers: ["direct"]`. Explain each field as a decision: cost cap, source quality, locality, latency.
+- **You handled the server-tool protocol yourself.** The stream handler in `src/answer.ts` shows `server_tool_use` and `web_search_tool_result` blocks live, reports search failures through the result's `error_code`, resends the turn on `pause_turn` (at most three rounds in all, the loop at lines 85 to 161), and counts `usage.server_tool_use.web_search_requests` for per-turn cost.
+- **Budgets came from evals.** `DECISIONS.md` #8: a flat cap of 6 searches skipped two products on an eight-product question, so `src/agent.ts` line 178 sets max(6, entities + 2), capped at 10, and `src/prompts.ts` asks for parallel, one-item-per-query searches. A good answer to "how do you stop tool use from running away".
+- **A code-execution trade-off made on purpose.** `DECISIONS.md` #1 chooses direct mode over the default code-execution route so the UI shows each query immediately. Use it to show you understand programmatic tool calling and its latency cost.
+- **Answer Grader is a deliberate non-agent.** `generate_json` in `backend/llm.py` (line 369) is one prompt-in, JSON-out call with no tool-calling loop; Scheme Assistant and Chat Insights make no tool calls either. Say why that was right: fixed grading and RAG workflows do not need model-chosen actions.
+- **Gap, stated honestly:** none of your repos has a client-side tool, an idempotency key on a model-triggered write, or an approval gate. Build the Apply-it in Memory Agent, then say "I added client tools with keyed writes and a confirm gate, and measured selection accuracy on 30 prompts".
+
+</YourProject>

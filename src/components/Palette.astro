@@ -1,0 +1,15 @@
+<dialog class="pal" data-palette aria-label="Search">
+  <div class="pal-box">
+    <div class="pal-field">
+      <input type="text" data-palette-input placeholder="Search concepts, questions, drills, your code" autocomplete="off" spellcheck="false"
+        role="combobox" aria-expanded="true" aria-controls="pal-list" aria-autocomplete="list" />
+      <kbd>esc</kbd>
+    </div>
+    <ul id="pal-list" class="pal-list" role="listbox" data-palette-list></ul>
+    <p class="pal-hint">Narrow with <code>repo:jm</code> <code>layer:eval</code> <code>q:naive</code> <code>mine</code> · ↑↓ to move, enter to open</p>
+  </div>
+</dialog>
+<script>
+  import { initPalette } from '../lib/palette';
+  initPalette();
+</script>
