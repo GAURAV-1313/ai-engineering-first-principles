@@ -2,6 +2,8 @@
 export const SITE_NAME = 'AI Engineering from First Principles';
 export const SITE_DESCRIPTION =
   'A free, open study guide to AI engineering: 34 chapters on LLMs, tokenization, embeddings, RAG, evals, agents, MCP and production LLM systems, built up from the mechanism, with interview questions, system-design drills and real code annotated in the margin.';
+/** Public source of this site. */
+export const REPO_URL = 'https://github.com/GAURAV-1313/ai-engineering-first-principles';
 export const AUTHOR = { '@type': 'Person', name: 'Gaurav Singh' } as const;
 
 export const abs = (site: URL | undefined, path: string) => new URL(path, site ?? 'http://localhost:4321').href;
