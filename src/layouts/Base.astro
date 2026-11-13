@@ -8,7 +8,7 @@ import '../styles/prose.css';
 import '../styles/annotated.css';
 import '../styles/site.css';
 import '../styles/views.css';
-import { SITE_NAME, SITE_DESCRIPTION, abs } from '../lib/seo';
+import { SITE_NAME, SITE_DESCRIPTION, GOOGLE_SITE_VERIFICATION, abs } from '../lib/seo';
 
 interface Props {
   title: string;
@@ -39,6 +39,7 @@ const graph = jsonLd.length ? JSON.stringify({ '@context': 'https://schema.org',
   <meta name="robots" content={robots} />
   <link rel="canonical" href={canonical} />
   <meta name="author" content="Gaurav Singh" />
+  <meta name="google-site-verification" content={GOOGLE_SITE_VERIFICATION} />
   <meta name="theme-color" content="#1e4b8f" />
 
   <meta property="og:site_name" content={SITE_NAME} />
