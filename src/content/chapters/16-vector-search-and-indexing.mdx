@@ -433,7 +433,7 @@ def sweep(search_fn, queries, truth, k=10, efs=(10, 20, 40, 80, 160, 320)):
 
 Benchmark pgvector HNSW against a dedicated store on 1M synthetic vectors: recall versus QPS curves, with and without metadata filters. Everything runs locally; no LLM or paid API.
 
-**Where:** Scheme Assistant (`~/scheme-assistant`), whose `docker-compose.yml` already runs `pgvector/pgvector:pg16`. Add `scripts/bench_ann.py` on a branch, using a separate database so the real `chunks` table is untouched. For the dedicated store, run Qdrant in Docker, or use `hnswlib` or FAISS in-process.
+**Where:** Scheme Assistant, whose `docker-compose.yml` already runs `pgvector/pgvector:pg16`. Add `scripts/bench_ann.py` on a branch, using a separate database so the real `chunks` table is untouched. For the dedicated store, run Qdrant in Docker, or use `hnswlib` or FAISS in-process.
 
 1. Generate 1M unit-normalised 768-dim vectors from about 1,000 Gaussian clusters, with a skewed `tenant` (100 values, largest 20%) and `status` (90% active), plus 1,000 queries from the same mixture that are not stored rows.
 2. Compute exact top 10 per query by batched numpy, unfiltered and per filter (active only; a large, a medium and a tiny tenant).
@@ -446,13 +446,3 @@ Benchmark pgvector HNSW against a dedicated store on 1M synthetic vectors: recal
 
 </ApplyIt>
 
-<YourProject>
-
-- **Scheme Assistant migration 0006 is your strongest story here, and this part is yours** (`migrations/versions/20261014_0006_chunk_retrievable_hnsw.py`). Tell the [case above](#multi-tenancy-and-filtering) as symptom (16 to 40 rows for a top 40; an active clause missing), measurement (45% of indexed chunks unreturnable; found only at `ef_search` ≈ 200), mechanism (post-scan filtering, duplicate pruning) and fix (a trigger-maintained `retrievable` flag and a partial HNSW index).
-- **Scheme Assistant `src/app/core/retrieval.py` lines 195 to 206, also yours:** on pgvector 0.8+ it sets `hnsw.iterative_scan = strict_order` and `hnsw.max_scan_tuples` (40,000) via transaction-local `set_config`, so pooled connections stay clean; older servers get `ef_search` raised to k. Use it for the "too few rows" question.
-- **Scheme Assistant's base schema is a teammate's code you should be able to defend:** one Postgres with `vector`, `pg_trgm`, a GIN `tsvector` index and an HNSW `vector_cosine_ops` index, 1,024-dim vectors with an `embedding_model` column (`migrations/versions/20260927_0001_initial_schema.py`). At about 12k chunks it is a clean "why not a vector DB" answer.
-- **Answer Grader does exact search, correctly for about 1,500 questions:** one matrix-vector product in `backend/retrieval.py`, with the decoded matrix cached behind a row-count and `created_at` fingerprint. The naive part: `v2_answer_embeddings` in `backend/db.py` stores vectors as JSONB with no pgvector column, index or model-id column, and the `backend/embeddings.py` docstring warns a provider swap is undetectable by shape. Say the fix: a `vector` column plus an `embedding_model` column.
-- **Chat Insights has no working vector search** (`embedText` returns null; MySQL JSON columns cannot be indexed): a contrast only.
-- **Gap:** no repo has a recall canary, a quantized index or a measured recall-versus-latency curve. The Apply-it fills the last; a nightly known-item probe for the PMAY-G clause would fill the first.
-
-</YourProject>

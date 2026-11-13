@@ -435,7 +435,7 @@ Missing compared with a production model: RoPE, SwiGLU, GQA, a KV cache for deco
 
 <ApplyIt>
 
-Train a tiny GPT on your own code and look inside it, in **Memory Agent** (`~/memory-agent`), in a new `experiments/tiny-gpt/` folder kept out of the app build. It runs offline on a laptop CPU or Apple GPU; no API calls.
+Train a tiny GPT on your own code and look inside it, in **Memory Agent**, in a new `experiments/tiny-gpt/` folder kept out of the app build. It runs offline on a laptop CPU or Apple GPU; no API calls.
 
 1. Build a corpus: concatenate Memory Agent's `src/*.ts`, `DECISIONS.md` and the README into `input.txt` (about 100 KB at the pinned commit; add `eval/*.ts` for more, and expect validation loss to turn up early on so little text).
 2. Follow nanoGPT's character-level recipe (or Raschka's chapter 4 to 5 code). Start small: 4 layers, 4 heads, width 128, block size 128, dropout 0.1. Print the parameter count and check it against `12·L·d²` plus embeddings.
@@ -449,12 +449,3 @@ Train a tiny GPT on your own code and look inside it, in **Memory Agent** (`~/me
 
 </ApplyIt>
 
-<YourProject>
-
-- **Be honest first.** None of your repos implements transformer internals; this chapter is about understanding the models you call. Answer "how is this relevant to your work?" with the consequences: context limits, cost per call, choosing small models.
-- **Scheme Assistant's local path (our pipeline; Chiman wrote these lines, so present them as a teammate's code you can defend).** `src/app/core/llm.py` lines 203-209 call Ollama with `"num_ctx": 8192`, the default model is `qwen2.5:3b` (`src/app/config.py` line 48), and `claude files/TRACKER.md` line 220 records that 7B "does not fit the 4 GB GPU here". Explain both with arithmetic: about 3.09B parameters is roughly 2 GB at 4-bit, about 7.6B is roughly 4.5 GB before any KV cache, and GQA (2 KV heads for 16 query heads) keeps the 8K cache near 288 MiB.
-- **A gap to name, measured.** `src/app/config.py` lines 43-47 note that long guideline sections pushed single prompts to 13k tokens and 17 s, which is why the character caps exist. The caps do not fit the Ollama path. With the Qwen2.5 tokenizer, 20,000 characters of Hindi Wikipedia text came to about 18,500 tokens (1.1 characters per token), and the system prompt adds about 1,300, so a full-budget prompt is near 20K tokens against a `num_ctx` of 8,192 that must also hold the answer ([non-English cost](/02-tokenization/#failure-modes-arithmetic-spelling-non-english-cost)). Ollama reportedly truncates an over-long prompt with only a log warning (compare its `prompt_eval_count` with your count). The Gemini path has room; the local one needs a cap near 6,000 Hindi characters or a token count that fails loudly.
-- **Chat Insights (your code).** `backend/src/lc/services/contextBuilder.js` lines 19-22 define `LIMITS` (message 2,000 characters, 150 code lines, 10 history turns, 3 anchors): a context budget that bounds prefill cost, TTFT and long-context degradation. The weakness: caps are in characters and lines, not tokens; no repo counts tokens before a call.
-- **Memory Agent (your code).** `src/config.ts` lines 18-27 route turns to Haiku, Sonnet or Opus, chosen from eval runs per the comment. Bigger models do more FLOPs and read more weights per token, so they are slower and cost more; with closed models you cannot see parameter counts, so routing on measured quality and latency is the right method.
-
-</YourProject>

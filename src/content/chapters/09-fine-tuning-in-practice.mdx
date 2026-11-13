@@ -447,7 +447,7 @@ Merged, a LoRA is an ordinary model at full speed on any engine. Unmerged, one b
 
 <ApplyIt>
 
-Distill one narrow Answer Grader task (`~/answer-grader`) into a LoRA on a small open model, offline, and decide honestly whether it should replace the rules doing the job today. Work in a new folder such as `scripts/ft_question_guard/`.
+Distill one narrow Answer Grader task into a LoRA on a small open model, offline, and decide honestly whether it should replace the rules doing the job today. Work in a new folder such as `scripts/ft_question_guard/`.
 
 **Task.** Students sometimes type an instruction into the question box. `backend/question_guard.py` catches this with a regex, and `tests/test_question_guard.py` lists hard cases (real questions starting with "Evaluate" or "Analyse" must survive). Your model labels typed text `QUESTION`, `INSTRUCTION` or `MIXED`.
 
@@ -463,17 +463,7 @@ Distill one narrow Answer Grader task (`~/answer-grader`) into a LoRA on a small
 
 **Done when** you have a four-row table (regex, prompted base, teacher, LoRA student) with those metrics, the learning-curve plot, the adapter saved with its data hash and config, and a paragraph choosing: ship the student, keep the regex, or cascade (regex first, student on the rest). "Keep the regex" is a legitimate result.
 
-Alternative in Scheme Assistant (`~/scheme-assistant`): small talk versus scheme questions in Hindi and Hinglish, with the rule-based `src/app/core/smalltalk.py` (a teammate's code) as the baseline.
+Alternative in Scheme Assistant: small talk versus scheme questions in Hindi and Hinglish, with the rule-based `src/app/core/smalltalk.py` (a teammate's code) as the baseline.
 
 </ApplyIt>
 
-<YourProject>
-
-- **Say the gap plainly.** None of your repos fine-tunes an LLM: no LoRA, PEFT or training jobs. Say so, then show you know when you would, with the decision procedure and the exercise above.
-- **Answer Grader `backend/question_guard.py`** (yours) is step 4 of the procedure in real life: a behaviour failure (a typed instruction became the question the pipeline built on) fixed by a cheap rule, with `tests/test_question_guard.py` pinning the false positives. It is the baseline any tuned classifier must beat.
-- **Answer Grader `backend/annotation.py`** (yours) has the default chat model (GPT-4o unless `backend/llm.py` is configured otherwise) draft annotations "for human review": the front half of a distillation pipeline, teacher labels plus a human gate. Be ready to say what you would hold out as gold.
-- **Answer Grader `backend/calibration.py`** (yours) fixed inflated rubric scores by mapping them onto anchors from 143 real marksheets instead of retraining the evaluator: the "cheaper lever first" story.
-- **Certificate Assistant `app/backend/learning.py`** (yours): `fit()` is a ridge-regularised logistic regression shrunk toward the EM weights, so a few hundred officer labels cannot swing the model. Same idea as LoRA's low rank or DPO's reference model: learn from little data without forgetting the prior. `app/backend/evaluate.py` scores held-out lineages by slice.
-- **Scheme Assistant `src/app/core/providers.py`** (mostly a teammate's code) chooses Gemini or Ollama: where a fine-tuned local model would plug in for residency. Call it "our pipeline".
-
-</YourProject>

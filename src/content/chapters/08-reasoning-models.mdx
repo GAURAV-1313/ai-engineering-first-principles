@@ -156,7 +156,7 @@ Every major API lets you set how much a model thinks, in one of two shapes. A **
 
 As of November 2026 (these change with nearly every model generation):
 
-- **Anthropic.** `thinking: {type: "adaptive"}` with `output_config.effort` from `low` through `medium`, `high`, `xhigh` to `max` (the set varies by model). Fixed `budget_tokens` is deprecated on the 4.6 models and rejected on newer ones such as Opus 5.5. On Opus 5.5 thinking cannot be disabled; effort is the only control, defaulting to `medium` there and on Haiku 5.5, `high` on most other current models. Thinking text is omitted by default (a summary is opt-in) and billed in full either way. Older models such as Haiku 4.5 reject the effort field, as Chat Insights found (see Your project).
+- **Anthropic.** `thinking: {type: "adaptive"}` with `output_config.effort` from `low` through `medium`, `high`, `xhigh` to `max` (the set varies by model). Fixed `budget_tokens` is deprecated on the 4.6 models and rejected on newer ones such as Opus 5.5. On Opus 5.5 thinking cannot be disabled; effort is the only control, defaulting to `medium` there and on Haiku 5.5, `high` on most other current models. Thinking text is omitted by default (a summary is opt-in) and billed in full either way. Older models such as Haiku 4.5 reject the effort field, as Chat Insights found.
 - **OpenAI.** `reasoning.effort` in the Responses API, from `none` or `minimal` up to `high`, `xhigh` or `max` depending on the model; several current models default to `medium`. Reasoning tokens are never returned, are billed as output and appear in `output_tokens_details.reasoning_tokens`. `max_output_tokens` caps reasoning plus answer; the docs suggest reserving about 25,000 to start.
 - **Google Gemini.** Gemini 3 and later take `thinking_level` (`minimal` to `high`, `xhigh` on some; the set and default differ per model). The 2.5 generation took a `thinking_budget` token count, where 0 turned thinking off on Flash (not on Pro); Google marks `thinking_budget` deprecated from Gemini 3 on, and its Vertex docs warn it can cause intermittent 400s there. Thought tokens are billed, reported beside the answer tokens, and count against `max_output_tokens`.
 
@@ -470,7 +470,7 @@ Reasoning benchmarks (AIME, MATH, competitive programming) are small, public and
 
 <ApplyIt>
 
-**Goal:** pick an effort policy for one route from measurements. Do it in **Memory Agent** (`~/memory-agent`): its planner labels each turn (`smalltalk`, `memory_only`, `clarify`, `search`, `recheck`), so grading is exact match and needs no web search.
+**Goal:** pick an effort policy for one route from measurements. Do it in **Memory Agent**: its planner labels each turn (`smalltalk`, `memory_only`, `clarify`, `search`, `recheck`), so grading is exact match and needs no web search.
 
 **Model (no paid API):** Ollama with a local thinking model (a Qwen3 or DeepSeek-R1 distill tag). Emulate effort levels as thinking off plus three thinking caps (256, 1,024, 4,096 tokens) using budget forcing: stop at the cap, close the thinking tag, let it answer. Test the plumbing first against a mock LLM whose thinking tokens and accuracy depend on the level.
 
@@ -487,12 +487,3 @@ Reasoning benchmarks (AIME, MATH, competitive programming) are small, public and
 
 </ApplyIt>
 
-<YourProject>
-
-- **Answer Grader: thinking tokens made the cheaper model dearer (lines blamed to you in a team repo).** `backend/llm.py` lines 348 to 354 turn `GEMINI_THINKING_BUDGET` into a `ThinkingConfig`; the comment records about 10,300 output tokens per model answer plus evaluation against gpt-4o's about 2,400, "making Gemini dearer per evaluation despite its lower price". Lines 341 to 346 add headroom because reasoning counts against `max_output_tokens`. A gap: it still sends `thinking_budget` to a Gemini 3 model, where Google now wants `thinking_level`. `ENGINEERING_FINDINGS.md` 5.5 adds latency (model answer 12 to 18 s down to 4 to 9 s at low thinking); production runs the budget at 1,024. Admit that the quality comparison in 5.7 lists its own confounds.
-- **Chat Insights: the unsupported-parameter incident.** Commit `5a289f8`: on Haiku 4.5 every reply became the canned template, because the provider sent `effort: low`, Haiku 4.5 answered 400, and the fallback only listened for `output_config` errors. `backend/src/lc/services/llm/anthropic.js` lines 80 to 83 now withhold effort from Haiku and drop it on a 400. The comment also records Haiku 5.5 at effort low tripping the guard on 2 of 4 replayed turns (lower effort, more retries); call it an anecdote, not an eval. `gemini.js` lines 62 to 73 set `thinkingBudget: 0`.
-- **Memory Agent: routing by turn type.** `src/config.ts` lines 18 to 25 choose Haiku, Sonnet or Opus per turn type from eval runs; `src/agent.ts` lines 173 to 175 set effort `medium` only for re-checks. `DECISIONS.md` decision 2 has the table (routed 7 to 8 of 10 at 6.6 to 6.9 s against Opus everywhere at 7 of 10 and 10.5 s) and rejects best-of-N at runtime; decision 3 explains why `src/answer.ts` lines 90 to 93 run Haiku with thinking off (thinking models buffered after a search).
-- **Scheme Assistant: a teammate's measurement to defend.** `src/app/config.py` lines 35 to 39 (Chiman's code) default the Gemini thinking budget to 0 for grounded extraction (on `gemini-3.8-flash`, so the same deprecated field): 8.2 s to 5.8 s, and one call spent 25 s on 2,870 thought tokens.
-- **Gaps.** No repo runs self-consistency or best-of-n, none has a committed effort sweep of accuracy against cost and p95, none probes faithfulness. The Apply-it sweep in Memory Agent closes the first two.
-
-</YourProject>

@@ -114,7 +114,7 @@ Warehouse cost can exceed LLM cost if queries scan large tables, which is why th
 
 ## How to bring in your own work
 
-You have not built a text-to-SQL system, and none of your repos has an LLM generating SQL, a SQL parser in the loop, or a semantic layer. Say so, then point to the pieces that transfer.
+You have not built a text-to-SQL system, and none of the example projects has an LLM generating SQL, a SQL parser in the loop, or a semantic layer. Say so, then point to the pieces that transfer.
 
 - **Dates resolved in code.** Memory Agent parses date phrases with chrono-node and code decides past versus future, week and month ranges and alternatives for "last Tuesday", so the model never does calendar arithmetic (`src/dates.ts` lines 61 to 70). A guard stops "Monday.com" becoming a date (lines 57 to 59). That is exactly the "last quarter" step above.
 - **SQL as the retrieval layer.** Memory Agent's memory recall is SQL over SQLite FTS5 ordered by bm25 (`src/memory.ts` lines 133 to 147). Certificate Assistant's record-linkage comparison levels are reproduced one-to-one in DuckDB SQL for Splink training (`app/backend/matcher.py` lines 9 to 10, `app/backend/train_model.py`). Neither is text-to-SQL, but both show you think in queries.

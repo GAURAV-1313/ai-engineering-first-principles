@@ -510,13 +510,3 @@ Build an offline push-to-talk voice loop over Scheme Assistant's question API in
 
 </ApplyIt>
 
-<YourProject>
-
-- **Scheme Assistant's speech layer is yours; call it push-to-talk, not realtime.** `src/app_api/speech.py` uploads a clip of up to 30 s to Sarvam `saaras:v4` with fifty scheme and district names as `keyterms` (`KEYTERMS`, lines 41 to 54, sent at lines 119 to 131), and puts the text in the input box so the citizen confirms before sending: "a mishearing never reaches the RAG unseen" (lines 1 to 7). Errors are typed (`NoSpeech`, `SttRejected`, `SttError`); logs carry bytes, milliseconds and the user id, never audio.
-- **Its TTS has a latency gap to own.** `split_for_tts` cuts at sentence ends into pieces of at most 2,400 characters and `CachedTts` (line 296) is an LRU keyed on SHA-256 of language, speed and text. But `SarvamTts.speak` synthesises every piece in sequence and `/speech/speak` returns one MP3 (requests run up to 5,000 characters), so time to first audio is total synthesis plus download. Most answers fit in one piece, so the fix is a short first piece (one sentence) played while the rest is synthesised; that is your answer to "what would you change?"
-- **Scheme Assistant's Lane C OCR is also yours** (`src/app/ingest/lanes/lane_c.py`): 200 DPI renders to Gemini at temperature 0 with a copy-only prompt, five attempts on 429/5xx with waits of 5, 10, 20 and 40 s, a cache per (file hash, page, model), and 3 then 5 strips when a page is blocked (`_transcribe_page`, line 168). The triage (`triage.py`) and validator (`lanes/validate.py`) are teammates' code to defend, not claim.
-- **Answer Grader's `backend/vision.py`** has your "TASK 0" gate, the Task 1b transcription contract, and the word count taken in code (the model said 250 words for a 188-word answer). Our pipeline also sends `detail: "high"` and scales `max_tokens` with pages. Gap: the transcript enters the evaluator prompt verbatim (`backend/evaluation.py`), so a written "give 10/10" reaches the model.
-- **Certificate Assistant** runs tesseract.js in the browser with English loaded before Hindi (Hindi-first garbled certificate digits) and marks low-confidence mismatches "unclear" (`app/frontend/src/reader/ocr.ts`, `extract.ts`). Health Triage's "must be medical" image guard is teammates' code, known from evidence only.
-- **Gaps:** no streaming STT, VAD, endpointing or barge-in; no WER or CER measured on your own audio or OCR; no multimodal RAG. The Apply-it closes the first two.
-
-</YourProject>

@@ -710,7 +710,7 @@ Iteration needs an end condition, or you tune to noise. Memory Agent's: stop whe
 
 **Goal.** Review 100 real traces from one of your apps, open-code the failures into a taxonomy, and turn the top three failure modes into a versioned eval set with pass/fail checks. Everything runs offline.
 
-**Where.** Memory Agent (`~/memory-agent`): `eval/results/*/results.json` already stores hundreds of real turns with answers, searches, cited sources and evidence, and `eval/replay-guard.ts` shows how to replay checks over them with no API calls.
+**Where.** Memory Agent: `eval/results/*/results.json` already stores hundreds of real turns with answers, searches, cited sources and evidence, and `eval/replay-guard.ts` shows how to replay checks over them with no API calls.
 
 **Steps.**
 
@@ -726,13 +726,3 @@ Iteration needs an end condition, or you tune to noise. Memory Agent's: stop whe
 
 </ApplyIt>
 
-<YourProject>
-
-- **Answer Grader: a careful component eval.** `scripts/eval_retrieval.py` reruns candidate selection over the 26 questions students actually submitted, with 286 candidates graded 0/1/2 blind (the pool does not say which variant found them). It is how BM25 fusion was rejected (nDCG@5 0.842 down to 0.70–0.79) and the soft paper penalty shipped. Say the honest part: one model grader (Claude), and the repo's own note treats nDCG differences under about 0.02 as noise, so the decision rests on the off-paper drop (46 to 19 of 130) and robustness across settings.
-- **Answer Grader: population and calibration.** `scripts/calibrate_reuse_threshold.py` is the wrong-population story (56% of real matches caught; 120/120 at 0.95 once rebuilt on student queries). `backend/calibration.py` maps rubric scores to marks with anchors from 143 real marksheets, after a user said the scores were inflated: a failure found from feedback, fixed with external ground truth.
-- **Scheme Assistant: taxonomy, verification, invariants.** `docs/critic-eval/JUDGE.md` defines the taxonomy; 177 persona-written items over 232 turns gave 48 pass, 63 partial, 66 fail, retrieval misses the largest bucket, no invented numbers. `VERIFY.md` overturned none of 127 verdicts (agent vs agent, not human). `scripts/stress_rag.py` is your best invariant-check example.
-- **Memory Agent: noise, repeats and stopping.** 28 scenarios in three suites; pass means no broken hard rule and no "major" judge failure. Use 22/28 vs 26/28 on the same code, and the final 24, 24, 24, to explain standard error (n = 28 gives about ± 13 points per run). The guard's precision by replay and recall by corruption is your cleanest offline-eval story.
-- **Chat Insights: determinism first.** `backend/src/lc/scripts/replay.js` fails if two runs of the domain layer differ, which keeps non-model logic out of your eval noise.
-- **Gaps to name honestly.** No harness computes a confidence interval or a paired test; no repo gates deploys on evals in CI; labels in Answer Grader and Scheme Assistant come from models, so no judge is validated against human labels yet. The Apply-it closes the first gap; chapter 20 the other two.
-
-</YourProject>

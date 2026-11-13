@@ -17,10 +17,10 @@ const chips = (list: Evidence[]) =>
   repos.filter((r) => list.some((e) => e.repo === r.slug));
 const total = items.length;
 ---
-<aside class="iyc" aria-label="In your code" data-iyc>
+<aside class="iyc" aria-label="In real code" data-iyc>
   <div class="iyc-inner">
     <header class="iyc-head">
-      <p class="iyc-kicker">In your code</p>
+      <p class="iyc-kicker">In real code</p>
       <button class="iyc-close" type="button" data-iyc-close aria-label="Close">×</button>
     </header>
     <p class="iyc-empty-chapter" hidden={total > 0}>No repo maps to this chapter yet.</p>
@@ -40,7 +40,7 @@ const total = items.length;
           ) : g.n === '00' ? (
             <p class="iyc-gstat">{total} examples · scroll, or jump to a section</p>
           ) : (
-            <p class="iyc-gstat is-gap">None of your repos demonstrates this section.</p>
+            <p class="iyc-gstat is-gap">None of the example projects shows this section yet.</p>
           )}
           {g.n === '00' && (
             <ol class="iyc-index">

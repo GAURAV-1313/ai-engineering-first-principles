@@ -424,7 +424,7 @@ In production, trace every run as one tree, orchestrator at the root and each su
 
 <ApplyIt>
 
-**Goal:** split the "ask my repos" research agent from [Chapter 18's Apply-it](/18-advanced-and-agentic-rag/#deep-research-iterative-search) (`src/askrepos/agent.ts` in Memory Agent) into an orchestrator plus 3 parallel sub-agents, and compare quality, cost and wall-clock time with the single agent. Work in **Memory Agent** (`~/memory-agent`) on a branch; build the Chapter 18 agent first if you have not.
+**Goal:** split the "ask the repos" research agent from [Chapter 18's Apply-it](/18-advanced-and-agentic-rag/#deep-research-iterative-search) (`src/askrepos/agent.ts` in Memory Agent) into an orchestrator plus 3 parallel sub-agents, and compare quality, cost and wall-clock time with the single agent. Work in **Memory Agent** on a branch; build the Chapter 18 agent first if you have not.
 
 **Runs offline.** Ollama with a 7B to 8B tool-capable instruct model for every agent, or a scripted mock model for deterministic tests. Count tokens with a tokenizer and apply a price table you set, so cost is comparable although nothing is billed.
 
@@ -446,13 +446,3 @@ In production, trace every run as one tree, orchestrator at the root and each su
 
 </ApplyIt>
 
-<YourProject>
-
-- **Say it plainly: none of your repos runs a multi-agent system.** No product path spawns sub-agents, hands off between agents or shares agent state. You have parallel model calls, a speculative call and an offline multi-agent eval workflow, and you can explain why each design stopped where it did.
-- **Memory Agent rejected sub-agents on purpose.** `DECISIONS.md` #2 chooses one writer call per turn that runs several searches in parallel inside the call: "No sub-agents". Its context line says research sub-agents in your own past work took a median of 8.6 minutes, too slow for a chat agent. Present that as the earlier observation behind the decision, not a benchmark: Memory Agent never measured a sub-agent version.
-- **Memory Agent's speculative writer is parallelism with a gate, not a second agent.** `src/agent.ts` (lines 105 to 137) can start the search writer alongside the planner, holding its events in a `Gate` (`src/gate.ts`); line 181 keeps it only if the planner chose a plain search with the same budget, otherwise it is cancelled unseen. It is off by default because it writes without the planner's notes and a discarded call still costs tokens: this chapter's two costs in miniature.
-- **Answer Grader runs the fact-check alongside the judge.** `backend/pipeline.py` lines 265 to 283 (yours per blame) run `check_claims` and `evaluate_answer` in a two-worker `ThreadPoolExecutor`, submit the Hindi translation while evaluation runs, and use `contextvars.copy_context()` so both threads write the same cost ledger. Fixed calls, not agents, but the ledger is per-branch cost attribution.
-- **Scheme Assistant's persona-critic eval is your one real multi-agent workflow, with a coordination failure to tell.** Your briefs in `docs/critic-eval/` (`BRIEF.md`, `JUDGE.md`, `VERIFY.md`) set critic agents writing persona questions per scheme area, judges grading transcripts against sources, and independent verifiers re-checking fails and partials, each agent writing only its own JSON file. Verifiers checked 127 items, overturned none and relabelled 7 failure types. Then `verified/deliverables_check.md` found the report claimed every fail and partial was independently re-checked, while 20 of the 24 small-talk non-passes were never re-checked and the other 4 got only an orchestrator spot-check: the telephone game, caught by your own fact-check and corrected in the report. Zero overturns stays ambiguous until you seed known errors. The chatbot graded is mostly Chiman's code; the eval workflow is yours.
-- **Build the gap in Memory Agent** with the Apply-it: an orchestrator, parallel sub-agents, a tree budget, a trace tree and an equal-budget baseline.
-
-</YourProject>

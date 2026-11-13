@@ -728,7 +728,7 @@ Plot counts per label for every eval run. HyDE or an agent loop should lower `re
 
 <ApplyIt>
 
-**Turn your Chapter 17 "ask my repos" RAG into an agent with `search_docs`, `grep_repo` and `read_file` tools, then measure it against single-shot RAG on multi-hop questions for accuracy, cost and latency.** Build it in `~/memory-agent` next to the Chapter 17 entry point (for example `src/askrepos/agent.ts`). It runs offline with Ollama, a 7B to 8B model that Ollama lists as supporting tools, and your local embedding model. Index `~/scheme-assistant`, `~/answer-grader` and `~/chat-insights` read-only, never reading `.env` files.
+**Turn your Chapter 17 "ask the repos" RAG into an agent with `search_docs`, `grep_repo` and `read_file` tools, then measure it against single-shot RAG on multi-hop questions for accuracy, cost and latency.** Build it in `~/memory-agent` next to the Chapter 17 entry point (for example `src/askrepos/agent.ts`). It runs offline with Ollama, a 7B to 8B model that Ollama lists as supporting tools, and your local embedding model. Index `~/scheme-assistant`, `~/answer-grader` and `~/chat-insights` read-only, never reading `.env` files.
 
 1. **Tools.** `search_docs(query, k)` is your Chapter 17 hybrid search returning only `{id, path, symbol, snippet, score}`. `grep_repo(pattern, repo, glob?)` is ripgrep capped at 50 hits with a "narrow the pattern" note. `read_file(path, start, end)` returns at most 200 lines and refuses paths outside the three repos and any `.env*`.
 2. **Loop.** Hand-written (as in [Chapter 22](/22-agent-loop/#react-loop)): max 8 steps, max 5 searches, a 60 s deadline, stuck detection, and a final answer citing `path:line` ranges. Reject any citation outside the set the agent read.
@@ -757,20 +757,3 @@ Plot counts per label for every eval run. HyDE or an agent loop should lower `re
 
 </ApplyIt>
 
-<YourProject>
-
-- **Scheme Assistant is a team project: say "we" for the pipeline and "I" only for your parts.** Its core RAG (`retrieval.py`, `generate.py`, `answer_query.py`, `chat.py`) is mostly your teammate's code. By line authorship at the pinned commit, yours are the synonym groups and the section lookup below, plus the critic-eval judge guide.
-  - *Expansion (yours):* symmetric cross-script synonym groups (बकरी / goat, चक्रीय निधि / revolving fund / RF) are OR-ed into the lexical query, and the expanded text is what gets embedded (`src/app/core/query_expansion.py`).
-  - *Query construction without an LLM (yours):* "धारा 16" or "section 21A" triggers a SQL lookup on `clause_path` that pins that Act section ahead of the fused hits (`section_hits` in `core/retrieval.py`).
-  - *Multi-hop by fan-out (teammate's):* a question naming two or more schemes runs every retrieval leg again with each scheme's name prefixed, and `interleave_schemes` shares the top-n so one scheme cannot crowd out the other (`core/retrieval.py`, around lines 1127 to 1135).
-- **The team's corrective branch is CRAG-shaped.** When the first RAG pass abstains on a Devanagari question, `_answer_with_english_retry` in `src/app_api/chat.py` gets an English search query and runs the RAG once more, because some documents exist only in English. It skips the retry when the first pass already used its time budget. With `_vet_summary` in `core/generate.py`, which rebuilds the reply from verified claims when the prose fails the check, that is a "grade, retry, verify" story you can explain, credited to the team.
-- **Be honest about Scheme Assistant's gaps.**
-  - Retrieval is not a tool: `answer_query.py` calls `retrieve()` once for every question that passes the scope and small-talk gates, so the model cannot search again or read a neighbouring clause.
-  - Permissions are tenant-level: `tenant_id` and document status sit inside each leg's SQL `WHERE` clause, which is the right pre-filter pattern, but there is no per-user ACL.
-  - Caching is an in-process LRU for query embeddings only.
-  - Your critic-eval judge guide (`docs/critic-eval/JUDGE.md`) labels non-passes with `retrieval_miss`, `wrong_source`, `hallucination`, `over_refusal`, `context_lost` and more. That is a failure taxonomy already in use.
-- **Memory Agent is your agentic-retrieval example, with a caveat.** The writer gets the provider's server-side `web_search` tool and the model chooses its own queries (`src/answer.ts`). The search budget is `max(6, entities + 2)` capped at 10, with a 45 s deadline (`src/agent.ts`, `src/config.ts`). `DECISIONS.md` #8 records `site:` steering (10 of 10 vendor results with it, 0 of 10 without), and #2 rules out sub-agents because past research sub-agents took a median of 8.6 minutes. Answers leave dated entity/attribute/value claims with source URLs for re-checks (`src/memory.ts`). The caveat: the loop runs provider-side, and search results reach the model with no injection screening.
-- **Answer Grader shows decomposition done in code.** `backend/answer_plan.py` splits a question into its asks before generation, from a study of 624 labelled topper answers (toppers give each ask its own block 90% of the time), with no model call. `backend/retrieval.py` records a measured weak-match failure (46 of 130 references off-paper) and BM25 + RRF being rejected after it lowered nDCG@5.
-- **Gaps to close.** None of your repos has a client-side retrieval tool loop, text-to-SQL, GraphRAG, per-user ACLs or a deep-research job. The Apply-it above closes the first in Memory Agent. A text-to-SQL assistant over Scheme Assistant's Postgres tables under a read-only role would be a strong second.
-
-</YourProject>

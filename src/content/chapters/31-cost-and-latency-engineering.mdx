@@ -733,7 +733,7 @@ None of Gaurav's repos has this yet. Chat Insights's `backend/src/lc/scripts/llm
 
 **Goal:** a before/after cost and latency report for one real pipeline, with quality held constant on its eval set, entirely offline.
 
-**Where:** Answer Grader (`~/answer-grader`), which already has a per-run cost ledger (`record_usage` and `ledger_summary` in `backend/llm.py`) and a parallel step in `backend/pipeline.py`. Memory Agent (`~/memory-agent`) works too if you prefer TypeScript.
+**Where:** Answer Grader, which already has a per-run cost ledger (`record_usage` and `ledger_summary` in `backend/llm.py`) and a parallel step in `backend/pipeline.py`. Memory Agent works too if you prefer TypeScript.
 
 **Model (no paid API):** Ollama's OpenAI-compatible endpoint (`qwen2.5:3b` as the cheap tier, `qwen2.5:7b` as the strong one), or a mock LLM that returns canned outputs with realistic usage fields (cached and thinking tokens included) and a delay per output token. Illustrative prices live in config with a "last checked" date.
 
@@ -751,13 +751,3 @@ None of Gaurav's repos has this yet. Chat Insights's `backend/src/lc/scripts/llm
 
 </ApplyIt>
 
-<YourProject>
-
-- **Memory Agent is your routing and latency story, with numbers.** `DECISIONS.md` decision 2 picks the writer per turn type from an eval table (routed 7 to 8/10 at 6.6 to 6.9 s against Opus everywhere at 7/10 and 10.5 s); `src/agent.ts` lines 173 to 175 route by the Haiku planner's intent and set effort to medium only for re-checks; `src/fastpath.ts` skips the planner for small talk; the speculative writer behind `src/gate.ts` is built, tested and off until a paid eval justifies its discarded-call cost. Decision 3 is your streaming story: thinking models buffered after a search, so you streamed search progress instead.
-- **Memory Agent also has a cost bug you can explain.** `src/answer.ts` line 95 caches `ANSWER_SYSTEM` with `cache_control`, but `src/agent.ts` line 232 prices the writer as `input − 0.9 × cacheRead`. Anthropic's `input_tokens` already excludes cache reads, so the right form is `input + cacheRead × (that model's read rate: 0.1× by default, 0.05× on the 5.5 models per the current docs) + cacheCreation × write premium`; as written, warm turns are underpriced (clamped to zero by `Math.max(0, inTok)` in `cost$` when reads are large), cache writes are not recorded, and the planner is a fixed 600/150-token guess. Fixing it, and adding a hit-rate metric, is a concrete "how do you know caching worked?" answer.
-- **Answer Grader is your unit-economics and effort story.** `backend/llm.py` writes one ledger row per call (provider-reported cost preferred, price table as fallback, `cost_source` and unpriced calls counted), and `backend/pipeline.py` saves the per-step total on every evaluation and runs the claim check and evaluation in parallel threads that share the ledger. The `GEMINI_THINKING_BUDGET` comment (about 10,300 vs 2,400 output tokens) is a real case of thinking tokens making a cheaper model dearer. Gaps: no cached-token accounting and no response cache, so a question already evaluated for one student regenerates its model answer for the next.
-- **Chat Insights is your caching and abuse-control story.** The prompt builder keeps the system text static per language "so providers can cache it", yet the Anthropic body has no `cache_control`: a one-line fix you can name. `chatService.js` enforces an atomic per-user daily hint cap (60 by default, 429 past it); there is no semantic cache (sensible for personalised hints) and no cascade, one model per deployment from config.
-- **Scheme Assistant: claim only what is yours.** Yours: the critic harness's metered ledger with a rupee cap (`scripts/critic_api.py`) and the TTS exact cache (`src/app_api/speech.py`). Teammates': the query-vector LRU cache, the embedding-overlaps-SQL trick and the prompt character caps.
-- **Honest gaps:** no batch API, semantic cache, pre-call token counting, hourly cost dashboard or spend alert anywhere, and no rate limit on Memory Agent's paid endpoint. The Apply it closes most of these.
-
-</YourProject>

@@ -786,7 +786,7 @@ The judge reads production text, which includes whatever users typed. A user who
 
 **Goal.** Build an LLM judge for Scheme Assistant's top judgeable failure mode, validate it against 100 human labels with TPR and TNR, gate pull requests on it in GitHub Actions, and add trajectory assertions to one agent flow in Memory Agent. Everything runs offline with a local model through Ollama or a mocked LLM function.
 
-**Where.** Scheme Assistant (`~/scheme-assistant`): the persona-critic transcripts you produced (`artifacts/critic_eval/main.jsonl`, local and uncommitted) and the committed verdicts in `docs/critic-eval/verdicts/`. Memory Agent (`~/memory-agent`): stored transcripts in `eval/results/*/results.json`.
+**Where.** Scheme Assistant: the persona-critic transcripts you produced (`artifacts/critic_eval/main.jsonl`, local and uncommitted) and the committed verdicts in `docs/critic-eval/verdicts/`. Memory Agent: stored transcripts in `eval/results/*/results.json`.
 
 **Steps.**
 
@@ -801,12 +801,3 @@ The judge reads production text, which includes whatever users typed. A user who
 
 </ApplyIt>
 
-<YourProject>
-
-- **Answer Grader: a judge checked against reality.** `backend/evaluation.py` computes rubric weights in code and caps presentation by counted words after Gemini called a 52%-over answer "slightly exceeding". `backend/calibration.py` maps inflated /10 scores onto anchors from 143 real marksheets. `tests/test_eval_consistency.py` pins a rule after one answer got opposite verdicts on two days. `backend/verify.py` is a claim-level judge running in parallel in `backend/pipeline.py`. Gap: no TPR or TNR against human graders on the same answers.
-- **Scheme Assistant: your critic eval, honestly attributed.** You wrote `scripts/critic_run.py`, `scripts/critic_api.py`, `docs/critic-eval/JUDGE.md` and `VERIFY.md`: 177 persona items, 232 turns through the real `/v1/chat`, 48 pass, 63 partial, 66 fail, and a verifier that confirmed all 127 verdicts it re-checked. The RAG under test, `eval_retrieval.py`, `stress_rag.py` and the scripted-model tests are mostly Chiman's. Limit: agents graded agents.
-- **Memory Agent: judge design and noise.** `eval/run.ts` gives the judge uncited results and its own searches, fails scenarios on trajectory rules, and re-grades with `--rejudge`. The same code scored 22/28 and 26/28, inside the ± 13-point band, so decisions use repeats. `eval/guard-recall.ts` measures recall by corrupting stored numbers (508 of 1,630 behind complete excerpts). Risks: a Claude judge grading Claude writers, and no CI.
-- **Certificate Assistant: calibration on human labels.** `app/backend/learning.py` fits Platt calibration and ridge-shrunk weights to officers' "same family" labels and measures precision and recall before and after on a held-out slice. A classical scorer with simulated demo labels (300, 3% error rate), but the right shape.
-- **Gaps.** No repo gates merges on evals, no judge reports TPR and TNR, and nothing samples production traces. The Apply-it closes the first two in Scheme Assistant.
-
-</YourProject>

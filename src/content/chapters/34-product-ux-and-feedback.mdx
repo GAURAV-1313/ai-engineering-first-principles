@@ -417,7 +417,7 @@ Before reading results, run an A/A test (same version both arms) and check **sam
 
 **Goal:** turn one feature into a full loop: thumbs plus reason, checkable citations, undo and approval, progress, feedback joined to traces, and a week of reviewed feedback turned into eval cases.
 
-**Where:** Memory Agent (`~/memory-agent`), which already streams progress and numbered citations but captures no feedback (the `done` handler in `public/app.js` is the place). Use a mock LLM or Ollama (`qwen2.5:3b` via its OpenAI-compatible endpoint) and replace web search with 30 canned results, so nothing calls a paid API.
+**Where:** Memory Agent, which already streams progress and numbered citations but captures no feedback (the `done` handler in `public/app.js` is the place). Use a mock LLM or Ollama (`qwen2.5:3b` via its OpenAI-compatible endpoint) and replace web search with 30 canned results, so nothing calls a paid API.
 
 **Steps**
 
@@ -433,13 +433,3 @@ Before reading results, run an A/A test (same version both arms) and check **sam
 
 </ApplyIt>
 
-<YourProject>
-
-- **Answer Grader (your code): expectation and precision.** `backend/calibration.py` anchors scores on 143 real marksheets and prints topper and cut-off context; `critLevel` in `evaluation.html` replaced "4/5" with a band word and five-dot meter; the waiting page shows four real stages, polls every 2 s and gives up after about 8 minutes. Gap: ratings (one row per rater, 30 per hour per IP) are averaged in analytics but never become eval cases.
-- **Chat Insights: the most complete explicit-feedback design.** "hint missed?" banks a thumbs-down at once; reason and note sit on the message row with rung, model, usage, guard and `degraded`; `pilot_report.js` reports feedback share. Also `chatErrorCopy`, the "fallback" depth meter and `unreviewed` findings.
-- **Memory Agent: sources and uncertainty, plus an honest gap.** DOMPurify-sanitised numbered citations, the number guard's "Check before relying on" line, streamed search steps (decision 3), cost under each answer, honesty under pushback (decision 6). No feedback capture, and pushback is handled but not logged.
-- **Scheme Assistant: claim the mobile UX, credit the core.** Yours: confirm-before-send push-to-talk, the mobile side of stop (Chiman designed the server cancel), `JmRevealText`, the out-of-scope copy, and the critic eval (48 pass, 63 partial, 66 fail of 177) that found English refusals for Hinglish users. Teammates': `AnswerStatus` and the core RAG. Gap: no feedback control or endpoint.
-- **Certificate Assistant: human in the loop.** `VerdictCard.tsx` never pre-selects; `clear-match` undoes until signing; feedback only after the decision, once, "not an officer metric"; only family confirmations become labels; `PILOT_TARGETS` has stop rules.
-- **Health Triage (evidence only):** your Flutter screen falls back from SSE to 3-second polling; the versioned `SSEEvent` schema is a teammate's.
-
-</YourProject>

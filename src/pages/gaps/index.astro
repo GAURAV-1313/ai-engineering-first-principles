@@ -53,15 +53,15 @@ const BUILD = [
 <Page title="What to Build Next: AI Engineering Project Ideas · AI Engineering from First Principles" description="AI-engineering skills interviewers probe that a typical portfolio does not show yet, each with a concrete project to build: tracing, MCP, batch evals, reranking and more." crumb="Gaps" current="gaps" wide>
   <header class="view-head">
     <p class="home-kicker">What to build next</p>
-    <h1 class="view-title">What your code hasn't taught you yet</h1>
+    <h1 class="view-title">What the example projects don't cover yet</h1>
     <p class="view-lede">{evidence.length
-      ? `${nSolid} of the book's ${all.length} sections have a solid example somewhere in your repos. ${nNever} hands-on sections have none, and ${nNaive} only have a naive one. Interviewers probe exactly these, so they are the best next things to build.`
-      : 'Examples from your repos are still being collected. The build list below comes from the repo inventory.'}</p>
+      ? `${nSolid} of the book's ${all.length} sections have a solid real-code example. ${nNever} hands-on sections have none, and ${nNaive} only have a naive one. Interviewers probe exactly these, so they are the best next things to build.`
+      : 'Examples are still being collected. The build list below comes from the repo inventory.'}</p>
   </header>
 
   <section class="iv-sec" aria-labelledby="build-h">
     <h2 class="sec-h" id="build-h">The build list</h2>
-    <p class="sec-note">No repo of yours does these yet, and each one is a standard interview topic. Ordered by learning value.</p>
+    <p class="sec-note">None of the example projects does these yet, and each is a standard interview topic: a good portfolio project. Ordered by learning value.</p>
     <ol class="build-list">
       {BUILD.map(([t, d, s], i) => (
         <li><span class="iv-id">{String(i + 1).padStart(2, '0')}</span><span><b>{t}</b><span class="build-d">{d}</span></span><a class="iv-k" href={`${chapterHref(s.slice(0, 2))}#${chapterById[s.slice(0, 2)].sections.find((x) => x.id === s)?.slug}`}>{s}</a></li>
@@ -96,7 +96,7 @@ const BUILD = [
     <div class="gaplists">
       <section aria-labelledby="never-h">
         <h2 class="sec-h" id="never-h">Never demonstrated <span class="sec-count">{nNever}</span></h2>
-        <p class="sec-note">Core chapters first. Theory sections are left out. The chip is the repo that already does the most in that chapter: the natural place to build it.</p>
+        <p class="sec-note">Core chapters first. Theory sections are left out. The chip is the project that already does the most in that chapter.</p>
         {never.map(({ c, list, secs }) => (
           <div class="gapgroup">
             <h3><a href={chapterHref(c)}><span class="iv-id">{c.id}</span> {c.title}</a> <span>{list.length} of {secs.length}</span></h3>
@@ -110,7 +110,7 @@ const BUILD = [
       </section>
       <section aria-labelledby="naive-h">
         <h2 class="sec-h" id="naive-h">Only done naively <span class="sec-count">{nNaive}</span></h2>
-        <p class="sec-note">Your code touches these, but every example is naive or missing. The margin card says what to fix.</p>
+        <p class="sec-note">The example projects touch these, but every example is naive or missing. The margin card says what to fix.</p>
         {naive.map(({ c, list }) => (
           <div class="gapgroup">
             <h3><a href={chapterHref(c)}><span class="iv-id">{c.id}</span> {c.title}</a></h3>

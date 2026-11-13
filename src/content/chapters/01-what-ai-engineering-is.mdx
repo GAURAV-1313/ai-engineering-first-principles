@@ -77,7 +77,7 @@ Six parts, each with its own chapter:
 
 Part I (chapters 01 to 09) covers how models work, from [tokenization](/02-tokenization/#why-discrete-tokens) to [fine-tuning](/09-fine-tuning-in-practice/#prompt-vs-rag-vs-fine-tune-decision). Part II (10 and 11) is [inference](/10-inference-mechanics/#prefill-vs-decode) and [serving economics](/11-serving-and-model-economics/#api-vs-self-hosted-open-weights). Part III (12 to 14) is talking to models: [prompting](/12-prompting-fundamentals/#system-user-assistant-anatomy), [structured output](/13-structured-output/#llm-as-a-typed-function), [multimodal and voice](/14-multimodal-and-realtime-voice/#vision-inputs-images-screenshots). Part IV (15 to 18) is retrieval, from [BM25](/15-information-retrieval-foundations/#bm25) to [agentic RAG](/18-advanced-and-agentic-rag/#retrieval-as-a-tool-agentic-rag). Part V (19 and 20) is [evaluation](/19-evals-methodology/#trace-review). Part VI (21 to 28) is agents: tools, the loop, memory, planning, multi-agent systems, [MCP](/26-mcp/#the-n-m-integration-problem), context engineering and [coding agents](/28-coding-and-computer-use-agents/#why-coding-is-the-flagship-domain). Part VII (29 to 34) is production: guardrails, observability, cost, deployment, security and [product UX](/34-product-ux-and-feedback/#designing-for-probabilistic-output).
 
-Every chapter ends with production notes, interview answer outlines, an offline exercise, and how the topic shows up in your repos.
+Every chapter ends with production notes, interview answer outlines, an offline exercise, and how the topic shows up in the example projects.
 
 ## AI eng vs ML eng vs full-stack
 
@@ -174,7 +174,7 @@ Most LLM products fall into a handful of shapes. What separates them is how chea
 
 The rule that falls out of the table: **the more checkable the output, the more autonomy you can afford.** Coding became the flagship agent domain because tests give a cheap, objective verdict on every attempt. Support answers have no compiler, so they need citations, abstention and evals built from human judgement.
 
-Your repos cover most rows. Answer Grader extracts the question from a photographed answer and grades it. Scheme Assistant is citizen Q&A over government documents (core RAG mostly a teammate's; Gaurav built the vision OCR lane and the persona-critic eval). Memory Agent is search: a web-search writer with a code guard on cited numbers. LeetCode Coach is tutoring, a sixth shape: the model must help without giving the answer away, so a policy function sets how much help each turn may give. None is a coding agent or a write-capable automation agent yet.
+The example projects cover most rows. Answer Grader extracts the question from a photographed answer and grades it. Scheme Assistant is citizen Q&A over government documents (core RAG mostly a teammate's; Gaurav built the vision OCR lane and the persona-critic eval). Memory Agent is search: a web-search writer with a code guard on cited numbers. LeetCode Coach is tutoring, a sixth shape: the model must help without giving the answer away, so a policy function sets how much help each turn may give. None is a coding agent or a write-capable automation agent yet.
 
 ## Evaluating a use case; setting expectations
 
@@ -187,7 +187,7 @@ Before writing a prompt, answer six questions. They take an hour and save weeks.
 5. **Do you have 30 to 100 real inputs to start an eval set?** If you cannot get them, you cannot tell whether the feature works.
 6. **May the data leave your infrastructure?** Student answers, citizen questions and medical notes all raise this.
 
-**When not to use an LLM.** When the logic is exact and known (tax, permissions, pricing). When a rule or lookup is about as good. When the latency budget is tens of milliseconds. When there is no tolerance for error and no human review. When the output must be identical on every run for an audit. Your repos make this call often, and correctly. Chat Insights decides how much help a student gets with `decideRung`, a pure function over stored facts, not a model. Certificate Assistant drafts citizen messages from reviewed templates and checks every number and name against the source record. Memory Agent checks prices and percentages with plain string matching; the header of `src/guard.ts` says its earlier research agents' LLM judges "missed every wrong number; plain string matching does not."
+**When not to use an LLM.** When the logic is exact and known (tax, permissions, pricing). When a rule or lookup is about as good. When the latency budget is tens of milliseconds. When there is no tolerance for error and no human review. When the output must be identical on every run for an audit. The example projects make this call often, and correctly. Chat Insights decides how much help a student gets with `decideRung`, a pure function over stored facts, not a model. Certificate Assistant drafts citizen messages from reviewed templates and checks every number and name against the source record. Memory Agent checks prices and percentages with plain string matching; the header of `src/guard.ts` says its earlier research agents' LLM judges "missed every wrong number; plain string matching does not."
 
 **Setting expectations.** State quality as a measured rate with known failure modes, not as "it's accurate". Then design the product for the misses: show sources, abstain when evidence is thin, and keep a human on decisions that matter. Answer Grader's calibration is an expectation-setting fix as much as a scoring fix: under each score the page shows what real toppers score on that paper and where the Mains cut-off sits, so a 5/10 is not read as failure. Certificate Assistant's trace UI always ends on a step that waits for the officer. [Product UX](/34-product-ux-and-feedback/#expectation-setting) covers the patterns.
 
@@ -195,7 +195,7 @@ Before writing a prompt, answer six questions. They take an hour and save weeks.
 
 A demo works on the ten inputs its builder chose, judged by eye. Production gets the long tail: other languages, small talk, empty messages, pasted essays, hostile input, provider rate limits, cold starts and a bill that scales with users. The gap between the two is where most of an AI engineer's time goes.
 
-Four examples from your repos show what the gap looks like.
+Four examples from the example projects show what the gap looks like.
 
 - **Fallbacks that look like success.** In Answer Grader, a failed model-answer generation returned `None`, the run was still written as "completed", and the result page fell back to its hardcoded demo answer, which a student saw as their own. The fix in `backend/pipeline.py` raises so the run is marked failed. Make failure louder than the happy path.
 - **The users do something else first.** Gaurav's persona-critic eval of Scheme Assistant had critic agents write 177 questions as villagers, self-help-group members and sarpanches, in Devanagari Hindi, Hinglish and English, and ran them through the real API. The bot invented no amount, date or phone number in 232 turns. But 48 passed, 63 were incomplete and 66 failed, mostly on everyday things: greetings got the out-of-scope list (4 pass, 7 partial, 17 fail on the small-talk items), users typing Hindi in Roman letters got refusals in English, and it claimed "the documents don't say" when they did. A teammate then shipped a small-talk path. The RAG was good at the task it was built for and weak at what real users did first.
@@ -342,7 +342,7 @@ Answer Grader learned this the hard way. The docstring of `backend/llm.py` says 
 
 **Goal:** write a one-page design doc for one LLM feature in your own repo, and back its two riskiest claims with numbers. It becomes the running project for later chapters.
 
-**Where:** Chat Insights (`~/chat-insights`), which you own outright. A good candidate is a weekly review that tells a student which habits are costing them, built on what `computeHabits` (`backend/src/lc/domain/habits.js`) already derives. Answer Grader or Memory Agent work too.
+**Where:** Chat Insights, which you own outright. A good candidate is a weekly review that tells a student which habits are costing them, built on what `computeHabits` (`backend/src/lc/domain/habits.js`) already derives. Answer Grader or Memory Agent work too.
 
 **Model:** offline only. Use a mock function for the first pass and Ollama with a small instruct model (for example a 3B to 8B Llama or Qwen) for the second. No paid API.
 
@@ -361,13 +361,3 @@ Answer Grader learned this the hard way. The docstring of `backend/llm.py` says 
 
 </ApplyIt>
 
-<YourProject>
-
-- **"Most of the work is around the call."** In Answer Grader (your code, team repo): `backend/calibration.py` (rubric scores mapped to realistic marks from 143 real marksheets), `backend/facts.py` (a verified register that overrides model memory) and `backend/verify.py` (a second call lists named claims; code removes the wrong ones).
-- **Non-determinism, handled structurally.** Answer Grader `backend/model_answer.py` (lines 544 to 550) and the completeness threshold; Chat Insights's bounded generate-guard-retry-template path in `chatService.js` and the determinism check in `backend/src/lc/scripts/replay.js`.
-- **The demo-to-production gap, with numbers.** Answer Grader `backend/pipeline.py` (lines 231 to 241) is the demo-answer bug and fix. In Scheme Assistant the persona-critic eval is yours (`scripts/critic_run.py`, `scripts/critic_api.py`, `docs/critic-eval/`); the core RAG and the deploy script are mostly Chiman's, so say "our pipeline" and "my eval found".
-- **Build vs buy.** Answer Grader `backend/llm.py`: the `LLM_PROVIDER` switch and the cost-per-task note on reasoning tokens (around lines 348 to 351). Memory Agent `DECISIONS.md` #2: a routed writer chosen from a measured table.
-- **Knowing when not to use a model.** Certificate Assistant has no LLM by design; Memory Agent's `src/guard.ts` and Chat Insights's `decideRung` (`backend/src/lc/domain/policy.js`) keep exact decisions in code.
-- **Gaps to name honestly:** none of your repos fine-tunes or self-hosts a model in production, none uses an LLM tracing tool, and none has a write-capable agent. Say so, and say which chapter's exercise is closing each one.
-
-</YourProject>

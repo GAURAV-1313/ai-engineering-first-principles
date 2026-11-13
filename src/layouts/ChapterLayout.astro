@@ -21,8 +21,7 @@ const orphans = items.filter((e) => e.section !== chapter.id && !chapter.section
 if (orphans.length) console.warn(`[ch ${chapter.id}] ${orphans.length} evidence ids match no section: ${[...new Set(orphans.map((e) => e.conceptId))].join(', ')}`);
 const closing = [
   { id: 'in-production', label: 'In production' }, { id: 'interview', label: 'Interview questions' },
-  { id: 'apply-it', label: 'Apply it' }, { id: 'your-project', label: 'Explain it through your projects' },
-  { id: 'read-alongside', label: 'Read alongside' },
+  { id: 'apply-it', label: 'Apply it' }, { id: 'read-alongside', label: 'Read alongside' },
 ];
 const site = Astro.site;
 const url = abs(site, chapterHref(chapter));
@@ -70,7 +69,7 @@ const jsonLd: object[] = [
         <p class="chapter-meta">
           <span title={`Interview and industry weight: ${weightWord(chapter.weight)}`}><span class="chapter-stars" aria-hidden="true">{stars(chapter.weight)}</span> {weightWord(chapter.weight)}</span>
           {readingTime && <span>{readingTime} read</span>}
-          <span>{items.length} examples from your repos</span>
+          {items.length > 0 && <span>{items.length} real-code examples</span>}
         </p>
         {!written && <p class="stub" style="margin-top: 20px">This chapter is not written yet. Below is its outline from the syllabus: sections, production concerns, interview questions and the exercise. Your code already shows in the margin.</p>}
       </header>

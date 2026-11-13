@@ -33,14 +33,14 @@ const firstFast = FAST_TRACK.find((id) => written.has(id)) ?? FAST_TRACK[0];
 ---
 <Page title="AI Engineering from First Principles: LLMs, RAG, Evals and Agents, annotated" description={SITE_DESCRIPTION} current="book" jsonLd={jsonLd}>
   <section class="home-hero">
-    <p class="home-kicker">Study edition</p>
+    <p class="home-kicker">Free guide</p>
     <h1 class="home-title">AI Engineering from First Principles</h1>
-    <p class="home-lede">LLM basics, retrieval, evals, agents and production LLM systems, built up from the mechanism, with real code from {repos.map((r) => r.name).join(', ')} in the margin. Written for shipping, and for the interview after it.</p>
+    <p class="home-lede">LLM basics, retrieval, evals, agents and production LLM systems, built up from the mechanism, with annotated code from {repos.length} real production projects in the margin. Written for shipping, and for the interview after it.</p>
     <p class="home-stats">
-      <span><b>{written.size}</b> of {total} chapters written</span>
+      <span><b>{total}</b> chapters</span>
       <span><b>{sections}</b> sections</span>
-      <span><b>{evidence.length}</b> examples from {repos.length} repos</span>
-      <span><b>{covered.size}</b> sections shown in your code</span>
+      <span><b>{evidence.length}</b> real-code examples from {repos.length} projects</span>
+      <span><b>{covered.size}</b> sections shown in real code</span>
       <span><b>{libraryDocs.length}</b> open-licence readings</span>
     </p>
     <p class="home-start">

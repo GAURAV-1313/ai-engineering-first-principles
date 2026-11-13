@@ -649,12 +649,3 @@ Both paths run the same handler with the same user, so validation, authorisation
 
 </ApplyIt>
 
-<YourProject>
-
-- **No repo has MCP yet; say so.** A grep of Answer Grader, Scheme Assistant, Memory Agent, Chat Insights and Certificate Assistant finds no MCP server or client in source. Memory Agent's `DECISIONS.md` #1 records the deliberate opposite (one hosted web-search tool called directly through the Messages API, no framework), a defensible protocol-vs-direct-API answer for one host and one tool. The Apply-it turns it into "and here is the MCP server I built over the same memory".
-- **Memory Agent's memory is a natural first server.** `src/memory.ts` has `searchTurns` (lines 134 to 147, SQLite FTS5 ranked by `bm25()`) and `claimsForTurns`, read-only and typed: exactly what a good MCP read tool wraps.
-- **A security gap in your own code to name.** `src/server.ts` line 106 calls `server.listen(config.port, ...)` with no host, so Node listens on all interfaces, and the API routes do not check `Origin`. Fine for a demo; an MCP HTTP endpoint must bind 127.0.0.1 and validate `Origin`. Naming this and the fix answers "how would you secure a local MCP server".
-- **Scheme Assistant, attributed carefully.** `src/app_api/wrapper.py` exposes the RAG `answer_query` function, otherwise called in-process, as an internal REST endpoint (`POST /v1/answer`, checked against an `X-Internal-Token` header only when `APP_API_INTERNAL_TOKEN` is set, open in dev): one function, two transports, like the registry-with-adapters pattern. The evidence marks it your teammate's code (`mine: false`), so present it as a team design you can explain, not your work, and note that "open when the env var is unset" is exactly the fail-open default an MCP endpoint must not have.
-- **Gaps before you claim them:** a remote server with real OAuth, an MCP client inside an agent loop, definition fingerprinting, and A2A. The first three fit Memory Agent; A2A only makes sense with two independently owned agents.
-
-</YourProject>

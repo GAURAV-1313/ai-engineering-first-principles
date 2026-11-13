@@ -1,4 +1,4 @@
-// Client behaviour for the "In your code" margin: follow the section being read,
+// Client behaviour for the "In real code" margin: follow the section being read,
 // mark the outline, inline openers + bottom sheet on narrow screens, repo filter, compare.
 const GLYPH: Record<string, string> = { solid: '●', naive: '◐' };
 
@@ -83,7 +83,7 @@ export function initInYourCode() {
     if (!count) return;
     const btn = document.createElement('button');
     btn.type = 'button'; btn.className = 'iyc-inline';
-    btn.innerHTML = `<span class="iyc-kicker">In your code</span><span>${count} example${count === 1 ? '' : 's'} · ${repos} repo${repos === 1 ? '' : 's'}</span>`;
+    btn.innerHTML = `<span class="iyc-kicker">In real code</span><span>${count} example${count === 1 ? '' : 's'} · ${repos} repo${repos === 1 ? '' : 's'}</span>`;
     btn.addEventListener('click', () => openSheet(sn));
     h.insertAdjacentElement('afterend', btn);
   });

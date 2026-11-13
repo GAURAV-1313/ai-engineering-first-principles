@@ -526,7 +526,7 @@ Memory Agent is the cleanest example you own. In `src/answer.ts` (lines 47 to 59
 }
 ```
 
-Each field is a production decision: `max_uses` is a search budget, `blocked_domains` drops sites that gave thin content in earlier logs, `user_location` makes "near me" and local prices sensible, and `allowed_callers: ["direct"]` skips the code-execution step (section 21.10). Searches are billed per use on top of tokens, so the cost code reads `usage.server_tool_use.web_search_requests`. The Your project block at the end walks through the stream handling and budgets.
+Each field is a production decision: `max_uses` is a search budget, `blocked_domains` drops sites that gave thin content in earlier logs, `user_location` makes "near me" and local prices sensible, and `allowed_callers: ["direct"]` skips the code-execution step (section 21.10). Searches are billed per use on top of tokens, so the cost code reads `usage.server_tool_use.web_search_requests`.
 
 What the server tool cannot do is what you would want next: screen fetched pages for injected instructions, rerank results, or force a vendor's own domain as a hard step (the open item in `DECISIONS.md` #8). Those need a client-side tool or a client-side check after the call.
 
@@ -930,13 +930,3 @@ Thirty cases catch a broken description; they cannot tell 88% from 92%. Grow the
 
 </ApplyIt>
 
-<YourProject>
-
-- **Memory Agent's server-side tool is your concrete tool-calling story.** `src/answer.ts` lines 47 to 59 declare `web_search_20260318` with `max_uses`, `blocked_domains` (from `src/config.ts`), approximate `user_location` with the user's timezone, and `allowed_callers: ["direct"]`. Explain each field as a decision: cost cap, source quality, locality, latency.
-- **You handled the server-tool protocol yourself.** The stream handler in `src/answer.ts` shows `server_tool_use` and `web_search_tool_result` blocks live, reports search failures through the result's `error_code`, resends the turn on `pause_turn` (at most three rounds in all, the loop at lines 85 to 161), and counts `usage.server_tool_use.web_search_requests` for per-turn cost.
-- **Budgets came from evals.** `DECISIONS.md` #8: a flat cap of 6 searches skipped two products on an eight-product question, so `src/agent.ts` line 178 sets max(6, entities + 2), capped at 10, and `src/prompts.ts` asks for parallel, one-item-per-query searches. A good answer to "how do you stop tool use from running away".
-- **A code-execution trade-off made on purpose.** `DECISIONS.md` #1 chooses direct mode over the default code-execution route so the UI shows each query immediately. Use it to show you understand programmatic tool calling and its latency cost.
-- **Answer Grader is a deliberate non-agent.** `generate_json` in `backend/llm.py` (line 369) is one prompt-in, JSON-out call with no tool-calling loop; Scheme Assistant and Chat Insights make no tool calls either. Say why that was right: fixed grading and RAG workflows do not need model-chosen actions.
-- **Gap, stated honestly:** none of your repos has a client-side tool, an idempotency key on a model-triggered write, or an approval gate. Build the Apply-it in Memory Agent, then say "I added client tools with keyed writes and a confirm gate, and measured selection accuracy on 30 prompts".
-
-</YourProject>

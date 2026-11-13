@@ -114,11 +114,11 @@ per day  = 5 × that, at 5,000 PRs/day
 
 ## How to bring in your own work
 
-Be direct: you have not built a coding agent or a PR reviewer, and none of your repos has a sandbox, a repo-navigation tool or a test-running loop. What you can bring is adjacent and real.
+Be direct: you have not built a coding agent or a PR reviewer, and none of the example projects has a sandbox, a repo-navigation tool or a test-running loop. What you can bring is adjacent and real.
 
 - **Reviewing code without leaking the answer.** LeetCode Coach reads a student's LeetCode code and gives hints, not solutions. Its guard scans replies for any 8-word window copied from the problem's official hints (`backend/src/lc/domain/guard.js` lines 308 to 321) and deletes overclaims such as "that's the only bug" (the `RE_COMPLETION` pattern on line 13, applied at lines 337 to 346). That is the verifier stage: code checks on model comments about code.
 - **Context limits for code.** `backend/src/lc/domain/promptBuilder.js` caps code at 150 lines (line 10) and marks truncation explicitly ("N more lines omitted", `clampLines`, lines 95 to 99) so the model knows content is missing.
 - **Untrusted text in prompts.** The same file's `fenceData` (lines 80 to 87) defangs delimiter strings in student code so it cannot break out of its data fence: the PR-injection point at small scale.
 - **Testing an LLM pipeline offline.** Memory Agent's `src/agent.test.ts` (lines 29 to 41) uses a hand-written fake client so whole turns run with no key and no cost, the same harness you would use for a reviewer.
 - **Before/after evals.** Answer Grader's `scripts/eval_retrieval.py` scores several retrieval variants on the same blind-labelled questions (the `SYSTEMS` table, lines 51 to 55) and kept the plain dense ranking when BM25 fusion lowered nDCG@5: the shape of the seeded-bug regression run, where every reviewer change is scored against the same labelled set.
-- **Gap to close.** Build a small reviewer over your own repos' history with a seeded-bug set and report precision and recall; that turns this drill from theory into a project.
+- **Gap to close.** Build a small reviewer over the example projects' history with a seeded-bug set and report precision and recall; that turns this drill from theory into a project.

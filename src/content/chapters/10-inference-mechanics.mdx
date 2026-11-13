@@ -336,7 +336,7 @@ bits = 4 + 16 / 128          # 4.125 bits per weight including scales
 
 ### The trade-off and the trap
 
-Memory arithmetic is easy: Llama 3.3 70B is about 141 GB in bf16, 71 GB in fp8 and around 40 GB at roughly 4.5 bits, which turns "two or more 80 GB GPUs" into "one, with room for cache". Quality is the hard part. 8-bit is usually within noise. 4-bit is usually close on general chat but can lose noticeably on math, code, long-context retrieval and non-English text; small models lose more than large ones, and perplexity hides task-level regressions. The trap is quantizing to fit a GPU, checking perplexity, and shipping. Run your own eval set ([evals methodology](/19-evals-methodology/)) before and after, on the slice you care about (for your projects, Hindi and Hinglish). Second trap: a 4-bit weight-only kernel can be slower than bf16 at large batch, once unpacking overhead shows. Benchmark at real concurrency.
+Memory arithmetic is easy: Llama 3.3 70B is about 141 GB in bf16, 71 GB in fp8 and around 40 GB at roughly 4.5 bits, which turns "two or more 80 GB GPUs" into "one, with room for cache". Quality is the hard part. 8-bit is usually within noise. 4-bit is usually close on general chat but can lose noticeably on math, code, long-context retrieval and non-English text; small models lose more than large ones, and perplexity hides task-level regressions. The trap is quantizing to fit a GPU, checking perplexity, and shipping. Run your own eval set ([evals methodology](/19-evals-methodology/)) before and after, on the slice you care about (for the example projects, Hindi and Hinglish). Second trap: a 4-bit weight-only kernel can be slower than bf16 at large batch, once unpacking overhead shows. Benchmark at real concurrency.
 
 ## Speculative decoding
 
@@ -597,7 +597,7 @@ Before any deployment discussion, compute three numbers: weight bytes, KV bytes 
 
 **Goal:** see every curve in this chapter on your own machine. Serve a small model locally, load-test it from 1 to 64 concurrent users, plot TTFT, ITL and throughput, then turn on prefix caching and quantization and record the deltas.
 
-**Where:** Scheme Assistant (`~/scheme-assistant`). It already has a local provider path (`OllamaClient` in `src/app/core/llm.py`) and a long static system prompt, which makes the prefix-caching result meaningful. Put the script in `scripts/loadtest_llm.py`.
+**Where:** Scheme Assistant. It already has a local provider path (`OllamaClient` in `src/app/core/llm.py`) and a long static system prompt, which makes the prefix-caching result meaningful. Put the script in `scripts/loadtest_llm.py`.
 
 **Model and server (offline, no paid API):** with an NVIDIA GPU, vLLM serving `Qwen/Qwen2.5-0.5B-Instruct` or `Qwen2.5-1.5B-Instruct` on localhost. Without one, llama.cpp's `llama-server` with a GGUF build and `--parallel 8`, or Ollama with `OLLAMA_NUM_PARALLEL` set. Laptop curves are smaller but the same shape.
 
@@ -614,12 +614,3 @@ Before any deployment discussion, compute three numbers: weight bytes, KV bytes 
 
 </ApplyIt>
 
-<YourProject>
-
-- **Scheme Assistant is your concrete prefix-caching story.** In `src/app/core/generate.py` (around line 3035) the editor-on-failure prompt `REPAIR_SYSTEM` is commented "static text first so a provider's prompt cache can reuse it; the per-query material is all in the user message". That is exactly the prefix rule from this chapter; explain it as "a cache only matches an exact prefix, so I ordered static before dynamic".
-- **Scheme Assistant also has the local-inference knobs.** `OllamaClient` in `src/app/core/llm.py` defaults to `qwen2.5:3b` and sets `num_ctx` 8192 at temperature 0 with a JSON-schema `format` (constrained decoding). Use it to walk Example 5: Qwen2.5-3B's KV is 36 KiB per token, so 8K costs about 288 MiB, and on a laptop bandwidth, not memory, caps speed.
-- **Memory Agent uses a provider cache and counts it.** `src/answer.ts` line 95 puts `cache_control: { type: "ephemeral" }` on the static `ANSWER_SYSTEM` block, and `answer.ts` (line 156) sums `cache_read_input_tokens` next to `input_tokens`. Then look closely at `src/agent.ts` line 232: it prices the turn as `input − cacheRead × 0.9`. Anthropic's `input_tokens` already excludes cached tokens, so the right sum is `input + cacheRead × 0.1 + cacheCreation × write premium`; as written the estimate undercounts every warm turn and ignores cache-write cost (`cache_creation_input_tokens` is not recorded). Fixing that formula and adding a hit-rate metric (cacheRead ÷ all input) per turn is a strong, concrete answer to "how do you cut LLM cost, and how do you know it worked?".
-- **Chat Insights reads cache usage but never writes the cache.** `mapUsage` in `backend/src/lc/services/llm/anthropic.js` records `cache_read_input_tokens` and `cache_creation_input_tokens`, but a search of `backend/src` at the pinned commit finds no `cache_control`, so the hint-ladder system prompt is likely re-prefilled every call. That is a cheap, honest fix to name in an interview.
-- **The honest gap:** none of your repos self-hosts a model behind a batching engine or measures TTFT, ITL and throughput under load. Answer Grader and Chat Insights do not stream tokens at all; Memory Agent streams but does not record per-token timing. The Apply it above, done in Scheme Assistant, closes that gap and gives you your own numbers for the system-design question.
-
-</YourProject>

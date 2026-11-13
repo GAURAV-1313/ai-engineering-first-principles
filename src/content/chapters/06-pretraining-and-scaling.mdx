@@ -268,7 +268,7 @@ For you the choice is operational: residency, cost at your volume, latency, fine
 
 <ApplyIt>
 
-Build a small pretraining-style data pipeline, offline and with no model, in Answer Grader (`~/answer-grader`) over `data/pyq/pyq.jsonl` plus any scraped page text you have. Reuse it in chapter 09 (cleaning a fine-tuning set) and chapter 17 (deduplicating chunks).
+Build a small pretraining-style data pipeline, offline and with no model, in Answer Grader over `data/pyq/pyq.jsonl` plus any scraped page text you have. Reuse it in chapter 09 (cleaning a fine-tuning set) and chapter 17 (deduplicating chunks).
 
 1. `scripts/dedup_filter.py` loads `(id, text)` pairs from JSONL.
 2. Heuristic filters: under 20 words, over 30% non-alphanumeric characters, or over 30% repeated lines. Log drops per rule.
@@ -282,12 +282,3 @@ Build a small pretraining-style data pipeline, offline and with no model, in Ans
 
 </ApplyIt>
 
-<YourProject>
-
-- **Cutoff, handled in your code.** Answer Grader `backend/llm.py` lines 244 to 269 (yours): a `KNOWLEDGE_CUTOFF` table per model id (`gemini-3.6-flash` March 2026, `gpt-4o-mini` October 2023) and `dates_block()`, which puts today's IST date, the Indian fiscal year and the model's cutoff into the prompt and says a newer fact is not an error. The comment records why: Gemini called a student's FY27 figure "chronologically incorrect" and models "corrected" 2025 MSME limits to 2020 ones. The evaluator, model-answer writer and claim verifier call it.
-- **The gap you logged.** `ENGINEERING_FINDINGS.md` item 6.17: the vision step does not get `dates_block()` and transcribed a student's "2026" as "2024"; the fix is proposed, not applied at the pin. It shows cutoff handling must reach every step that reads facts, OCR included.
-- **Small local models.** Scheme Assistant's local path is a teammate's code (Chiman's `src/app/config.py` and `OllamaClient` in `src/app/core/llm.py`), defaulting to Ollama `qwen2.5:3b`. The team tracker says 7B did not fit the 4 GB dev GPU, that the 3B model mis-wrote a Hindi number (which led to a number-fidelity check), and records the 2 October 2026 switch to hosted Gemini. Use it to explain over-trained small models: good at following a schema over given passages, weak on precise detail. Call it our pipeline, not yours.
-- **Contamination risk.** `data/pyq/pyq.jsonl` (your import: 1,066 UPSC Mains questions, 2013 to 2025, from a public coaching site) holds questions with model answers all over the web. Quality measured on PYQs may be recall and will look better than on new questions. The retrieval eval uses real student questions (`tests/retrieval_eval_queries.json`), which is better, but nothing checks eval-versus-prompt overlap.
-- **Gap.** No repo trains a model or has a dedup or quality-filter pipeline; the Apply-it script is the first.
-
-</YourProject>

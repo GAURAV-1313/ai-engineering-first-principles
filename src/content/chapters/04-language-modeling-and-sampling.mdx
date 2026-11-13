@@ -568,7 +568,7 @@ function buildParams(provider: string, want: { temperature?: number; seed?: numb
 
 <ApplyIt>
 
-Two parts, both offline, in **Memory Agent** (`~/memory-agent`), whose planner in `src/planner.ts` is a five-way intent classifier (smalltalk, memory_only, recheck, search, clarify) with no confidence signal, because the Claude API returns no log-probs.
+Two parts, both offline, in **Memory Agent**, whose planner in `src/planner.ts` is a five-way intent classifier (smalltalk, memory_only, recheck, search, clarify) with no confidence signal, because the Claude API returns no log-probs.
 
 **Part 1: sampling playground (Python, Hugging Face transformers, CPU is fine).**
 
@@ -590,13 +590,3 @@ Two parts, both offline, in **Memory Agent** (`~/memory-agent`), whose planner i
 
 </ApplyIt>
 
-<YourProject>
-
-- **Chat Insights shows the provider-capability trap, in your own code.** `backend/src/lc/services/chatService.js` sets `REPEAT_RETRY_TEMPERATURE = 0.9` (line 55) and applies it on the repeat retry (lines 103 to 109). The Gemini provider (`services/llm/gemini.js`, lines 66 to 72) clamps it to 0 to 1.2, default 0.3; the Anthropic provider's header (`services/llm/anthropic.js`, lines 1 to 12) says temperature, top_p and top_k are never sent because they 400, and its `generate()` does not accept the field. In an interview: the retry's real fix is showing the model its previous text; the temperature bump exists only on Gemini, and Gemini 3.6 Flash and newer would ignore it too. Gap: no capability table, no log line when a parameter is dropped.
-- **Chat Insights also handles finish reasons and isolates randomness.** The Anthropic provider maps `stop_reason === 'refusal'` to a typed `LlmError` and puts `stop_reason` in parse-failure messages (lines 143 to 153). `MAX_TOKENS = 4000` is generous for a reply capped near 260 words, though thinking tokens draw from the same cap on a model that thinks by default, so measure before shrinking it. `scripts/replay.js` hashes the deterministic pipeline and fails if two runs differ.
-- **Answer Grader chooses decoding per call site and sizes caps from data.** `backend/verify.py` runs the fact-checker at 0.0; `backend/evaluation.py` runs the evaluator at 0.3 with `max_tokens=3500` derived from measured outputs; the model-answer call in `backend/model_answer.py` runs at 0.7 (a team file; defend the choice, do not claim the line). Your `backend/llm.py` sets `GEMINI_TOKEN_HEADROOM = 4` because Gemini counts reasoning tokens against `max_output_tokens`, and your `answer_plan.py` uses a hash-seeded weighted choice so the same question always gets the same plan.
-- **Answer Grader has your best non-determinism and hallucination stories:** `tests/test_eval_consistency.py` (same answer, two verdicts, rule moved into code) and `backend/facts.py` (Gemini contradicting a correct 2025 fact; fixed with a verified fact register plus a code guard).
-- **Scheme Assistant: be precise about who wrote what.** Generation at temperature 0.0 with a response schema, and the `finishReason` in the no-content error, are in `src/app/core/llm.py`, Chiman's code you should be able to defend; it sets no output-token cap. Your part is `ingest/lanes/lane_c.py`, which caches non-deterministic VLM OCR per (file hash, page, model) so re-ingests keep chunk text and citations stable.
-- **Memory Agent sends no sampling parameters at all.** It controls behaviour with model routing (`src/config.ts`) and effort (`src/agent.ts`), caps output per call (8000 for the writer, 1500 for the planner, 2000 for claim extraction) and loops on `pause_turn` up to three rounds (`src/answer.ts`, lines 159 to 160). The gap: the planner classifies intent with no confidence signal. The Apply it task builds one with a local model.
-
-</YourProject>

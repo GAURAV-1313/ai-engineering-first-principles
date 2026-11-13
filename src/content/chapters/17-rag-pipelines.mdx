@@ -715,7 +715,7 @@ There are a hundred knobs. The order follows from the multiplication at the top 
 
 <ApplyIt>
 
-**Build "ask my repos": cited Q&A over your own code and READMEs, with incremental re-indexing on push and a "why this answer" trace view.** Build it in `~/memory-agent` as a separate entry point (for example `src/askrepos/`). Memory Agent already does SQLite FTS5 with BM25 in `src/memory.ts`, so you reuse that for the lexical leg. Index `~/scheme-assistant`, `~/answer-grader` and `~/chat-insights` read-only. It runs fully offline: Ollama for embeddings (`nomic-embed-text` or similar) and a 3B to 8B instruct model for generation. No paid API.
+**Build "ask the repos": cited Q&A over your own code and READMEs, with incremental re-indexing on push and a "why this answer" trace view.** Build it in `~/memory-agent` as a separate entry point (for example `src/askrepos/`). Memory Agent already does SQLite FTS5 with BM25 in `src/memory.ts`, so you reuse that for the lexical leg. Index `~/scheme-assistant`, `~/answer-grader` and `~/chat-insights` read-only. It runs fully offline: Ollama for embeddings (`nomic-embed-text` or similar) and a 3B to 8B instruct model for generation. No paid API.
 
 1. **Ingest.** Walk `git ls-files`, skipping lockfiles, build output and binaries. Never read `.env` files. Hash each file, skip unchanged ones, and store the indexed commit SHA.
 2. **Chunk by structure.** Markdown by heading path; Python and TypeScript by top-level function or class, with the module docstring as parent. Keep path, line range, parent key and a content-hash id.
@@ -736,23 +736,3 @@ There are a hundred knobs. The order follows from the multiplication at the top 
 
 </ApplyIt>
 
-<YourProject>
-
-- **Scheme Assistant is your end-to-end RAG story; tell it in pipeline order.**
-  - *Ingestion:* page triage into parser lanes, including VLM OCR (`src/app/ingest/triage.py`, `ingest/lanes/lane_c.py`).
-  - *Chunking:* a 2,058-line clause-level chunker that detects structure from legal numbering "never from token counts". It keeps a `clause_path` and parent link so retrieval can index small, read big and cite small (`ingest/chunker.py`).
-  - *Embeddings:* model id pinned per chunk, so a provider switch re-embeds visibly. It embeds heading plus body, a structural form of contextual enrichment (`ingest/embed.py`).
-  - *Hybrid retrieval:* a tsvector leg and a pgvector HNSW leg fused by `rrf_fuse` with `RRF_K = 60`. Defaults are 20 per leg, rerank 20, keep 8 (`core/retrieval.py`).
-  - *Reranking:* scores feed the abstain gate and are never blended with retrieval scores (`core/rerank.py`).
-  - *Generation:* an abstain gate before generation; claims whose `chunk_ids` must be in the retrieved set; an authority order (Act over scheme over circular over FAQ) with a structured `conflicts` field (`core/answer_query.py`, `core/generate.py`).
-- **Migration 0006 is a measured production-failure story.** About 45% of indexed chunks were superseded or draft. Post-filtering after the HNSW scan returned 16 to 40 rows for a top-40, and byte-identical superseded copies made an active clause unreachable. The fix was a trigger-maintained `retrievable` flag plus a partial HNSW index (`migrations/versions/20261014_0006_chunk_retrievable_hnsw.py`). Use it for freshness and filtered-search questions.
-- **Freshness and abstention in Scheme Assistant.** Ingest skips unchanged SHA-256 files and creates a new version on reparse (`ingest/pipeline.py`). The per-tenant `abstain_score_floor` is 0.35 (`db/tenants.py`). Every answer writes a `query_log` row with retrieved, scored and cited sets. Be honest that `scripts/eval_retrieval.py` reports hit@1, hit@3 and hit@k with and without the reranker, and that its docstring says the full golden set of 50 or more questions is still to come.
-- **Answer Grader is the contrast. Frame it as a measured choice.** It has no chunking: one embedding per question or reference, built from a composite "retrieval representation" (`backend/embeddings.py`). Search is an in-memory numpy cosine, and `_rerank` is a small lexical-overlap boost whose docstring says to swap in a cross-encoder for production (`backend/retrieval.py`). Its comments record BM25 + RRF lowering nDCG@5 from 0.842 to 0.70 to 0.79, and a small off-paper penalty raising it to about 0.86. The story: a small bank of self-contained units makes exact cosine and no chunking the right call until scale or measured recall says otherwise.
-- **Honest gaps.**
-  - No LLM-written context blurbs (Scheme Assistant has a heading prefix only).
-  - No cross-encoder in Answer Grader.
-  - No semantic answer cache anywhere.
-  - Thin indirect-injection defence: only Scheme Assistant's `scripts/stress_rag.py` probes for leaked instructions.
-  - No re-index-on-push or trace UI, which the Apply-it above builds.
-
-</YourProject>

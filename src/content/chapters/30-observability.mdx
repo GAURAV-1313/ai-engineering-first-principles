@@ -720,7 +720,7 @@ Three numbers tell you whether the loop works: **time from a flagged trace to a 
 
 <ApplyIt>
 
-Instrument **Memory Agent** (`~/memory-agent`), which has hand-measured timings and `console.warn` but no trace ids or spans, with OTel GenAI spans; view them locally; build one dashboard and one alert; write a mock postmortem. Everything runs offline behind a mock model (or a small Ollama model), so no paid API is called.
+Instrument **Memory Agent**, which has hand-measured timings and `console.warn` but no trace ids or spans, with OTel GenAI spans; view them locally; build one dashboard and one alert; write a mock postmortem. Everything runs offline behind a mock model (or a small Ollama model), so no paid API is called.
 
 1. **Backend.** Run a local Jaeger all-in-one container exposing OTLP (4317, 4318) and the UI (16686); check the Jaeger docs for the current image name. Self-hosted Langfuse via docker compose is the alternative.
 2. **Mock model.** Add `MOCK_LLM=1`, returning canned plans and answers with Anthropic-shaped `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`) and a 300 to 2,000 ms delay. Make 10% of calls throw a 429 and 5% stop on `max_tokens`.
@@ -734,13 +734,3 @@ Instrument **Memory Agent** (`~/memory-agent`), which has hand-measured timings 
 
 </ApplyIt>
 
-<YourProject>
-
-- **Chat Insights: a good per-call log line with nothing to join it to.** `backend/src/lc/services/llm/index.js` logs `{evt: 'lc.llm', provider, model, latency_ms, usage, attempts}` and an `lc.llm.error` line on failure, never prompt or reply; `chatService.js` stores usage, guard verdict, provider, model and a `degraded` flag per assistant row and accepts thumb, reason and note per message. But the request logger in `backend/src/lc/app.js` has no request id, so `lc.req`, `lc.chat` and `lc.llm` lines cannot be joined. Name the fix: a request id in AsyncLocalStorage on every line, then spans.
-- **Answer Grader: cost per run saved on the result.** `backend/llm.py` keeps a per-run ledger in a `ContextVar` (the same mechanism a tracer uses); `record_usage` stores step, provider, model, tokens, cost and `cost_source`, and `backend/pipeline.py` saves the summary as `evaluation["cost"]` in INR and USD. Gaps: logs keyed by `submission_id[:8]`, no trace id, no per-call latency or cached tokens. The same file keeps raw provider errors out of student-facing data. Your trace-to-fix story: a comment in `backend/evaluation.py` records that on 5 of 8 re-marked copies the feedback asked for content already on the page, which led to a transcript-based check in code.
-- **Memory Agent: per-turn metrics, no traces.** `src/agent.ts` returns `planMs`, `firstTokenMs`, `totalMs`, searches, guard counts and `costUsd` in `done.meta`, but no spans wrap planner, writer and extractor, and `public/app.js` has no feedback control. Its cost line subtracts `0.9 × cacheRead` from Anthropic's `input_tokens`, which already excludes cache reads; the Apply-it is where to fix both.
-- **Scheme Assistant: be precise about ownership.** `src/app/core/answer_query.py` (a teammate's code) creates a UUID `trace_id` per question and writes an audit row with status, abstain reason, provider, timings and raw model output, and the API returns `traceId`; there is no feedback endpoint, no per-call tokens or cost, and a trace id is not a span tree. Yours: the critic spend meter in `scripts/critic_api.py` that prices every Gemini response into a ledger and refuses calls past a rupee cap, the `fix_hint` in `docs/critic-eval/JUDGE.md` that closed one trace-to-fix loop, and speech logging in `src/app_api/speech.py` that records sizes and timings, never the text.
-- **Health Triage (teammates' code).** A request id is accepted or generated and copied into Celery task headers so API and worker logs share it (`app/core/request_id.py`, `app/workers/celery_app.py`), and a recursive scrubber redacts sensitive keys before Sentry events leave. The same code sets the user's email on the Sentry scope: the "scrubber in one path, leak in another" failure.
-- **The honest gap:** none of your repos emits OpenTelemetry spans or uses an LLM observability backend. Instrumenting Memory Agent is the smallest change that makes "I trace my agent" true.
-
-</YourProject>

@@ -158,7 +158,7 @@ def refine(task, generate, evaluate, max_rounds=3):
     return draft, {"rounds": max_rounds, "status": "unresolved", "last_issues": feedback}
 ```
 
-The evaluator does not have to be a model. A deterministic checker (a schema validator, a test suite, a regex for banned content) is cheaper, faster and does not share the generator's blind spots. Chat Insights's tutor is an evaluator-optimizer with a code evaluator and `max_rounds = 1`, which the Your project block at the end returns to.
+The evaluator does not have to be a model. A deterministic checker (a schema validator, a test suite, a regex for banned content) is cheaper, faster and does not share the generator's blind spots. Chat Insights's tutor is an evaluator-optimizer with a code evaluator and `max_rounds = 1`.
 
 Cost arithmetic: with g tokens per generation and e per evaluation, the worst case is `max_rounds × (g + e)`. With max_rounds = 3, budget for 3 drafts plus 3 evaluations on the hard inputs; every draft returned has been evaluated. Log the round count: if most requests need 3 rounds, fix the generator prompt instead.
 
@@ -720,7 +720,7 @@ Factor 12 ties the chapter together. `step(state, model, tools)` in the checkpoi
 
 <ApplyIt>
 
-**Goal:** hand-roll an agent loop of about 200 lines with no framework, with step, token and dollar limits, error feedback, checkpointing to disk and resume, and use it on one real workflow. Do it in **Memory Agent** (`~/memory-agent`), in TypeScript next to `src/agent.ts`, because Memory Agent already has the pieces a loop needs (a planner, a memory store, a cost formula) but no client-side tool loop.
+**Goal:** hand-roll an agent loop of about 200 lines with no framework, with step, token and dollar limits, error feedback, checkpointing to disk and resume, and use it on one real workflow. Do it in **Memory Agent**, in TypeScript next to `src/agent.ts`, because Memory Agent already has the pieces a loop needs (a planner, a memory store, a cost formula) but no client-side tool loop.
 
 **Model:** run offline. Either a mock model that replays a scripted list of replies (as in this chapter), or Ollama with a tool-calling model (for example a Qwen 2.5 or Llama 3.1 instruct model) through its local chat API with a `tools` field. No paid API.
 
@@ -738,12 +738,3 @@ Factor 12 ties the chapter together. `step(state, model, tools)` in the checkpoi
 
 </ApplyIt>
 
-<YourProject>
-
-- **Say it plainly: none of your repos has an open-ended tool loop.** Every "agent" you have shipped is a bounded pipeline. That is the right call for those products and a good interview answer to "workflow or agent?", but it is a gap for agent roles, and Memory Agent is where to close it (Apply it above).
-- **Memory Agent is a routed workflow with a speculative branch.** The header of `src/agent.ts` spells out the pipeline: deterministic date and memory prep, a Haiku planner, a streamed search-and-write call, a code number guard, then claim extraction after the reply. The planner's intent routes to a model per turn type (`config.models.chat`, `search`, `recheck` in `src/config.ts`), and if the planner throws, `fallbackPlan` in `src/planner.ts` keeps the turn alive. The speculative writer (`src/gate.ts`) runs alongside the planner and is kept or discarded once the plan arrives; it is off by default in `src/config.ts` until its quality effect is measured.
-- **Memory Agent already has budgets, just not a loop.** The search budget scales with the entity count and is capped (`maxSearchesPerTurn` 6, `maxSearchesCap` 10), each writer call is aborted at a 45 s deadline (`turnDeadlineMs`), and per-turn cost discounts cache reads. The closest thing to a loop is in `src/answer.ts` at line 85: at most 3 rounds, re-sending the turn when the server-side `web_search` returns `pause_turn`. That is a bounded continuation of a provider-run tool, not your own tool loop.
-- **Chat Insights is an evaluator-optimizer with a code evaluator and one round.** `produceReply` in `backend/src/lc/services/chatService.js` (line 66) generates, runs `guardReply` (`backend/src/lc/domain/guard.js`, line 180), retries once with the violations appended as "REVISION REQUIRED" (hotter sampling when the problem was a repeated reply), and falls back to a rung-aware template otherwise. A kill switch (`LC_KILL_LLM`) short-circuits to the template, and an atomic daily hint cap (around line 152) bounds spend. Use it to explain grounded reflection and why the evaluator is code, not a model.
-- **The story:** "I chose bounded pipelines because the steps were known and I needed predictable latency and cost; Memory Agent bounds itself with a search cap and a deadline, Chat Insights with one retry and a template fallback. For open-ended tasks I hand-rolled a loop in Memory Agent with budgets, checkpoints and an approval gate." Say the last sentence only once it is built.
-
-</YourProject>

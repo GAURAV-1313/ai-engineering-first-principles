@@ -426,7 +426,7 @@ Git is the agent's undo button, its memory and the unit a human reviews.
 
 <ApplyIt>
 
-**Goal:** a small offline coding agent that fixes a failing test in a toy repo, inside a sandbox with no network, with a harness that refuses edited tests as a fix; then the PR-review bot from the outline on the same sandbox. Build both in **Memory Agent** (`~/memory-agent`), on a branch, in `labs/coding-agent/`, reusing the loop from [chapter 22](/22-agent-loop/#long-running-agents-checkpointing-resumability)'s Apply-it if you built it.
+**Goal:** a small offline coding agent that fixes a failing test in a toy repo, inside a sandbox with no network, with a harness that refuses edited tests as a fix; then the PR-review bot from the outline on the same sandbox. Build both in **Memory Agent**, on a branch, in `labs/coding-agent/`, reusing the loop from [chapter 22](/22-agent-loop/#long-running-agents-checkpointing-resumability)'s Apply-it if you built it.
 
 **Runs offline.** Two backends behind one interface: a scripted mock that replays fixed tool calls (to test the harness deterministically), and Ollama with a small code model (a 7B Qwen coder or similar). No paid API.
 
@@ -438,7 +438,7 @@ Git is the agent's undo button, its memory and the unit a human reviews.
 4. **Done check.** Fingerprint test files at start; finish only when target tests and the full suite pass with no test file changed, or when the budget (15 steps, 60K tokens, 5 minutes) runs out.
 5. **Adversarial mocks.** Script one run that edits the assertion, one that adds a `conftest.py` skipping the failing tests, and one that special-cases the test input.
 6. **Real runs.** Five Ollama runs, each step logged to `runs/<id>.jsonl` (command, exit code, edit hashes, tokens, decision).
-7. **PR-review bot.** Same sandbox, read-only mount. For 30 historical PRs from your repos, feed the diff to the model, require file, line, failing scenario and a quoted line per comment, drop comments whose quote is not at that line, and cap at 5 per PR. Label every posted comment useful, wrong or noise yourself.
+7. **PR-review bot.** Same sandbox, read-only mount. For 30 historical PRs from the example projects, feed the diff to the model, require file, line, failing scenario and a quoted line per comment, drop comments whose quote is not at that line, and cap at 5 per PR. Label every posted comment useful, wrong or noise yourself.
 
 **Definition of done.**
 - The assertion-editing and `conftest.py` mocks are rejected by the fingerprint check; the special-casing mock fails the hidden tests.
@@ -449,13 +449,3 @@ Git is the agent's undo button, its memory and the unit a human reviews.
 
 </ApplyIt>
 
-<YourProject>
-
-- **Be direct: none of your repos contains a coding or computer-use agent** (no sandbox, edit applier, test loop or screen control). Say so, then talk about what you have observed as a heavy *user* of coding agents, which is real and checkable.
-- **Chat Insights's agent-assisted commits carry tests and reasons.** At the pin, Chat Insights has 95 commits: 12 authored as "Claude" (the LeetCode Coach landing page and demo video, September 2026) and 43 with a `Co-Authored-By: Claude` trailer (September 14 to November 3, 2026), 13 of which touch a test file. The pinned commit `5a289f8` changes `backend/src/lc/services/llm/anthropic.js`, adds 49 lines to `backend/tests/lc/llm.anthropic.test.js`, and its message explains the failure and the replay evidence. That is this chapter's pattern: a test with the fix, a reason in the commit, and you as the reviewing committer.
-- **Chat Insights's `.opencode/AGENTS.md` is guidance, not enforcement.** It routes an agent through spec, plan, and incremental test-driven work, but at the pin there is no CI workflow, so only your own session runs `npm test` (the `jest` script in `backend/package.json`). A CI job or stop hook that runs it is a cheap fix and a good story.
-- **Answer Grader shows parallel worktrees and their collision.** Your lines in `.claude/launch.json` (commit `a71fdb7`) run the API from `.claude/worktrees/practice-exp` (port 8012) and `.claude/worktrees/telegram-bot` (port 8020). The same file gives 8020 to both `design-static` (line 38) and `telegram-bot-api` (line 76), and 8021 to `design-practice` (line 48) and `telegram-bot-api-lan` (line 92): the runtime clash the version-control section warns about.
-- **A team-repo lesson from Scheme Assistant.** At the pin a teammate's commit records an agent worktree, `.claude/worktrees/agent-aeca10331ac48b773`, as a gitlink, and `.gitignore` has no `.claude` entry. Not your code, but a fair example of why agent working directories belong in `.gitignore`.
-- **Gap to close.** Build the Apply-it in Memory Agent, then the D03 reviewer over your own history, so "have you built a coding agent?" gets "yes, here is its eval".
-
-</YourProject>
